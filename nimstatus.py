@@ -175,6 +175,12 @@ def build_renderable(d, stats):
                        style="dim"))
     oc = d.get("opencode") or {}
     oc_models = list(oc.get("models") or [])
+    costs = {}
+    for mid, t in ((d.get("usage") or {}).get("by_model") or {}).items():
+        c = t.get("cost_usd", 0) if isinstance(t, dict) else 0
+        r = t.get("requests", 0) if isinstance(t, dict) else 0
+        if r:
+            costs[mid] = c
     fp = d.get("freepi") or {}
     fp_models, fp_rows = [], []
     for acct in fp.get("accounts") or []:
@@ -205,11 +211,18 @@ def build_renderable(d, stats):
                   pad_edge=False)
         for name, _ in cols:
             t.add_column(name, style=PROVIDER_STYLES.get(name, "dim"))
-        for row in zip(*[ms + [""] * (max(len(ms) for _, ms in cols) - len(ms))
-                         for _, ms in cols]):
+            t.add_column("cost", justify="right", style="dim")
+        widest = max(len(ms) for _, ms in cols)
+        for row in zip(*[ms + [""] * (widest - len(ms)) for _, ms in cols]):
             cells = []
             for (name, _), val in zip(cols, row):
                 cells.append(Text(val, style=PROVIDER_STYLES.get(name, "dim")))
+                if val:
+                    full = val if "/" in val else name + "/" + val
+                    c = costs.get(full, 0)
+                    cells.append(Text("$%.4f" % c if c else "·", style="dim"))
+                else:
+                    cells.append(Text(""))
             t.add_row(*cells)
         parts.append(t)
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:

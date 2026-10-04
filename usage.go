@@ -33,14 +33,16 @@ type UsageRecord struct {
 	CooldownSecs     int               `json:"cooldown_secs,omitempty"`
 	Error            string            `json:"error,omitempty"`
 	ContentBytes     int64             `json:"content_bytes"`
+	CostUSD          float64           `json:"cost_usd,omitempty"`
 	Headers          map[string]string `json:"headers,omitempty"`
 }
 
 type usageTotals struct {
-	Requests   int `json:"requests"`
-	Prompt     int `json:"prompt_tokens"`
-	Completion int `json:"completion_tokens"`
-	Errors     int `json:"errors"`
+	Requests   int     `json:"requests"`
+	Prompt     int     `json:"prompt_tokens"`
+	Completion int     `json:"completion_tokens"`
+	Errors     int     `json:"errors"`
+	Cost       float64 `json:"cost_usd,omitempty"`
 }
 
 var (
@@ -72,6 +74,7 @@ func logUsage(r UsageRecord) {
 	if r.StatusCode >= 400 {
 		t.Errors++
 	}
+	t.Cost += r.CostUSD
 	if r.KeyName != "" {
 		kt := totalsByKey[r.KeyName]
 		if kt == nil {
@@ -84,6 +87,7 @@ func logUsage(r UsageRecord) {
 		if r.StatusCode >= 400 {
 			kt.Errors++
 		}
+		kt.Cost += r.CostUSD
 	}
 	totalsMu.Unlock()
 }

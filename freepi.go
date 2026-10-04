@@ -333,14 +333,15 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "freepi: "+acct)
 		return
 	}
-	prompT, compT, totalT := respTokens(rb)
+	u := respUsage(rb)
+	prompT, compT, totalT := u.prompt, u.completion, u.total
 	logReq := func(stream bool, contentBytes int64) {
 		logUsage(UsageRecord{
 			Ts:    time.Now().UTC().Format(time.RFC3339Nano),
 			Model: upstreamModel, KeyName: "freepi:" + acct, Method: r.Method,
 			Path: r.URL.Path, StatusCode: 200,
 			DurationMs:   time.Since(start).Milliseconds(),
-			PromptTokens: prompT, CompletionTokens: compT, TotalTokens: totalT,
+			PromptTokens: prompT, CompletionTokens: compT, TotalTokens: totalT, CostUSD: u.cost,
 			Stream: stream, ContentBytes: contentBytes,
 		})
 	}
@@ -510,7 +511,8 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 		http.Error(w, fmt.Sprintf(`{"error":"freepi: %s"}`, acct), http.StatusBadGateway)
 		return
 	}
-	prompT, compT, totalT := respTokens(rb)
+	u := respUsage(rb)
+	prompT, compT, totalT := u.prompt, u.completion, u.total
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
@@ -524,7 +526,7 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 		Model: model, KeyName: "freepi:" + acct, Method: r.Method,
 		Path: r.URL.Path, StatusCode: 200,
 		DurationMs:   time.Since(start).Milliseconds(),
-		PromptTokens: prompT, CompletionTokens: compT, TotalTokens: totalT,
+		PromptTokens: prompT, CompletionTokens: compT, TotalTokens: totalT, CostUSD: u.cost,
 		Stream: isStream, ContentBytes: int64(len(body)),
 	})
 	acclog.Printf("<- 200 %s %s %v [freepi:%s] model=%s %s",

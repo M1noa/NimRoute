@@ -2513,17 +2513,32 @@ func guardrailMatchNorm(norm string, words []string, gn string) bool {
 }
 
 func respTokens(body []byte) (prompt, completion, total int) {
+	u := respUsage(body)
+	return u.prompt, u.completion, u.total
+}
+
+// usageVals holds parsed upstream usage + cost (freepi only).
+type usageVals struct {
+	prompt, completion, total int
+	cost                      float64
+}
+
+// respUsage parses usage + cost from an upstream body. freepi completions
+// carry cost/cost_details in dollars; other backends omit them (0).
+func respUsage(body []byte) (u usageVals) {
 	var j struct {
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
+			PromptTokens     int     `json:"prompt_tokens"`
+			CompletionTokens int     `json:"completion_tokens"`
+			TotalTokens      int     `json:"total_tokens"`
+			Cost             float64 `json:"cost"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &j) == nil && j.Usage.TotalTokens > 0 {
-		return j.Usage.PromptTokens, j.Usage.CompletionTokens, j.Usage.TotalTokens
+		u.prompt, u.completion, u.total, u.cost =
+			j.Usage.PromptTokens, j.Usage.CompletionTokens, j.Usage.TotalTokens, j.Usage.Cost
 	}
-	return
+	return u
 }
 
 func rlHeaders(h http.Header) map[string]string {
