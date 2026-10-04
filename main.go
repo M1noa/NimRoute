@@ -485,7 +485,7 @@ type freepiAcctStatus struct {
 	Inflight   bool     `json:"inflight"`
 	Tier       string   `json:"tier,omitempty"`
 	Credits    float64  `json:"credits,omitempty"`
-	SpentPct   int      `json:"spent_pct,omitempty"`
+	SpentPct   float64   `json:"spent_pct,omitempty"`
 	ReqToday   int      `json:"req_today,omitempty"`
 }
 

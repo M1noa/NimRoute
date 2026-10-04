@@ -133,6 +133,16 @@ def merged_table(d):
     return t
 
 
+def fmt_pct(pct):
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        pct = 0
+    if pct < 10:
+        return "%.1f%%" % pct
+    return "%d%%" % round(pct)
+
+
 def usage_bar(pct, width=10):
     """Colored block bar for daily spend %: green → yellow → red."""
     filled = min(width, max(0, int(round(pct / 100 * width))))
@@ -209,7 +219,7 @@ def build_renderable(d, stats):
         line.append("%d req · %s tok · %s · %g credits · " % (
             req, fmt_tok(tok), tier or "?", cred))
         line.append(usage_bar(pct))
-        line.append(" %d%% day · %d today" % (pct, rtoday), style="dim")
+        line.append(" %s day · %d today" % (fmt_pct(pct), rtoday), style="dim")
         parts.append(line)
     p = d.get("pool") or {}
     pool_t = Text()

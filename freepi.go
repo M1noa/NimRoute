@@ -70,7 +70,7 @@ type freepiAcct struct {
 type freepiStats struct {
 	Tier      string
 	Credits   float64
-	SpentPct  int
+	SpentPct  float64
 	ReqToday  int
 	PromptToday int
 	CompToday   int
@@ -104,7 +104,7 @@ func (fa *freepiAcct) refreshStats() freepiStats {
 			st.PromptToday = ms.PromptToday
 			st.CompToday = ms.CompToday
 			if ms.CapToday > 0 {
-				st.SpentPct = int(ms.SpentToday / ms.CapToday * 100)
+				st.SpentPct = ms.SpentToday / ms.CapToday * 100
 				if st.SpentPct > 100 {
 					st.SpentPct = 100
 				}
