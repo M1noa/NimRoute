@@ -220,7 +220,7 @@ def build_renderable(d, stats):
                 if val:
                     full = val if "/" in val else name + "/" + val
                     c = costs.get(full, 0)
-                    cells.append(Text("$%.4f" % c if c else "·", style="dim"))
+                    cells.append(Text("$%.2g" % c if c else "·", style="dim"))
                 else:
                     cells.append(Text(""))
             t.add_row(*cells)
