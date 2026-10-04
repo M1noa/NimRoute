@@ -483,6 +483,10 @@ type freepiAcctStatus struct {
 	Prompt     int      `json:"prompt_tokens"`
 	Completion int      `json:"completion_tokens"`
 	Inflight   bool     `json:"inflight"`
+	Tier       string   `json:"tier,omitempty"`
+	Credits    float64  `json:"credits,omitempty"`
+	SpentPct   int      `json:"spent_pct,omitempty"`
+	ReqToday   int      `json:"req_today,omitempty"`
 }
 
 // freepiSummary groups per-account freepi state, separate from zen.

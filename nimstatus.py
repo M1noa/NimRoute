@@ -158,7 +158,9 @@ def build_renderable(d, stats):
         req = acct.get("requests", 0)
         tok = acct.get("prompt_tokens", 0) + acct.get("completion_tokens", 0)
         mark = "◆" if acct.get("inflight") else "◇"
-        fp_rows.append((mark, acct.get("name", "?"), req, tok, ms))
+        fp_rows.append((mark, acct.get("name", "?"), req, tok, ms,
+                        acct.get("tier", ""), acct.get("credits", 0),
+                        acct.get("spent_pct", 0), acct.get("req_today", 0)))
     nv_keys = [k.get("name", "?") for k in (d.get("keys") or [])]
     cols = []
     if oc_models:
@@ -182,8 +184,9 @@ def build_renderable(d, stats):
                          for _, ms in cols]):
             t.add_row(*row)
         parts.append(t)
-    for mark, name, req, tok, ms in fp_rows:
-        line = "%s freepi:%s  %d req · %s tok" % (mark, name, req, fmt_tok(tok))
+    for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
+        line = "%s freepi:%s  %d req · %s tok · %s · %g credits · %d%% day · %d today" % (
+            mark, name, req, fmt_tok(tok), tier or "?", cred, pct, rtoday)
         parts.append(Text(line, style="yellow" if mark == "◆" else "dim"))
     p = d.get("pool") or {}
     parts.append(Text("pool  %d verified · %d dropped · refresh %s ago" % (

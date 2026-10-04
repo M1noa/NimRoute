@@ -61,6 +61,60 @@ type freepiAcct struct {
 	lastAd    time.Time
 	claimedAt time.Time // when inflight went 0->1
 	models    []string
+	stats     freepiStats
+	statsAt   time.Time
+}
+
+// freepiStats mirrors the /me/stats fields we display. cached 60s:
+// stable enough for status, cheap enough to stay fresh.
+type freepiStats struct {
+	Tier      string
+	Credits   float64
+	SpentPct  int
+	ReqToday  int
+	PromptToday int
+	CompToday   int
+}
+
+// refreshStats pulls /me/stats, cached for a minute.
+func (fa *freepiAcct) refreshStats() freepiStats {
+	fa.mu.Lock()
+	if time.Since(fa.statsAt) < time.Minute && fa.stats.Tier != "" {
+		st := fa.stats
+		fa.mu.Unlock()
+		return st
+	}
+	fa.mu.Unlock()
+	code, body := freepiGet(fa, "/me/stats", 5*time.Second)
+	st := freepiStats{}
+	if code == 200 {
+		var ms struct {
+			Tier         string  `json:"tier"`
+			Credits      float64 `json:"credit_credits"`
+			CapToday     float64 `json:"cap_usd_today"`
+			SpentToday   float64 `json:"spent_usd_today"`
+			ReqToday     int     `json:"request_count_today"`
+			PromptToday  int     `json:"prompt_tokens_today"`
+			CompToday    int     `json:"completion_tokens_today"`
+		}
+		if json.Unmarshal(body, &ms) == nil {
+			st.Tier = ms.Tier
+			st.Credits = ms.Credits
+			st.ReqToday = ms.ReqToday
+			st.PromptToday = ms.PromptToday
+			st.CompToday = ms.CompToday
+			if ms.CapToday > 0 {
+				st.SpentPct = int(ms.SpentToday / ms.CapToday * 100)
+				if st.SpentPct > 100 {
+					st.SpentPct = 100
+				}
+			}
+		}
+	}
+	fa.mu.Lock()
+	fa.stats, fa.statsAt = st, time.Now()
+	fa.mu.Unlock()
+	return st
 }
 
 var (
@@ -242,6 +296,9 @@ func freepiSnapshot() *freepiSummary {
 	sum := &freepiSummary{Enabled: true}
 	for _, fa := range freepiAccounts() {
 		st := freepiAcctStatus{Name: fa.name, Models: freepiModels(fa)}
+		fst := fa.refreshStats()
+		st.Tier, st.Credits, st.SpentPct, st.ReqToday =
+			fst.Tier, fst.Credits, fst.SpentPct, fst.ReqToday
 		fa.mu.Lock()
 		st.Inflight = fa.inflight > 0
 		fa.mu.Unlock()
