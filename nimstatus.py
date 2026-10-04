@@ -133,6 +133,21 @@ def merged_table(d):
     return t
 
 
+def usage_bar(pct, width=10):
+    """Colored block bar for daily spend %: green → yellow → red."""
+    filled = min(width, max(0, int(round(pct / 100 * width))))
+    bar = Text()
+    for i in range(filled):
+        frac = i / max(width - 1, 1)
+        bar.append("█", style="red" if frac >= 0.8 else
+                   "yellow" if frac >= 0.5 else "green")
+    bar.append("░" * (width - filled), style="dim")
+    return bar
+
+
+PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "nvidia": "green"}
+
+
 def build_renderable(d, stats):
     parts = []
     hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold cyan")
@@ -179,23 +194,43 @@ def build_renderable(d, stats):
         t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
                   pad_edge=False)
         for name, _ in cols:
-            t.add_column(name, style="dim")
+            t.add_column(name, style=PROVIDER_STYLES.get(name, "dim"))
         for row in zip(*[ms + [""] * (max(len(ms) for _, ms in cols) - len(ms))
                          for _, ms in cols]):
-            t.add_row(*row)
+            cells = []
+            for (name, _), val in zip(cols, row):
+                cells.append(Text(val, style=PROVIDER_STYLES.get(name, "dim")))
+            t.add_row(*cells)
         parts.append(t)
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
-        line = "%s freepi:%s  %d req · %s tok · %s · %g credits · %d%% day · %d today" % (
-            mark, name, req, fmt_tok(tok), tier or "?", cred, pct, rtoday)
-        parts.append(Text(line, style="yellow" if mark == "◆" else "dim"))
+        line = Text()
+        line.append("%s freepi:%s  " % (mark, name),
+                    style="yellow" if mark == "◆" else "magenta")
+        line.append("%d req · %s tok · %s · %g credits · " % (
+            req, fmt_tok(tok), tier or "?", cred))
+        line.append(usage_bar(pct))
+        line.append(" %d%% day · %d today" % (pct, rtoday), style="dim")
+        parts.append(line)
     p = d.get("pool") or {}
-    parts.append(Text("pool  %d verified · %d dropped · refresh %s ago" % (
-        p.get("verified", 0), p.get("dropped_total", 0),
-        p.get("last_refresh_ago", "?")), style="dim"))
-    since = " since " + stats["since"] if stats["since"] else ""
-    parts.append(Text("today %s req · %s tok   │   all-time %s req · %s tok%s" % (
-        fmt_int(stats["today"]["req"]), fmt_tok(stats["today"]["tok"]),
-        fmt_int(stats["all"]["req"]), fmt_tok(stats["all"]["tok"]), since), style="dim"))
+    pool_t = Text()
+    pool_t.append("pool  ", style="dim")
+    pool_t.append("%d verified" % p.get("verified", 0), style="green")
+    pool_t.append(" · ", style="dim")
+    pool_t.append("%d dropped" % p.get("dropped_total", 0),
+                  style="red" if p.get("dropped_total", 0) else "dim")
+    pool_t.append(" · refresh %s ago" % p.get("last_refresh_ago", "?"),
+                  style="dim")
+    parts.append(pool_t)
+    use_t = Text()
+    use_t.append("today ", style="dim")
+    use_t.append("%s req" % fmt_int(stats["today"]["req"]), style="bold white")
+    use_t.append(" · %s tok" % fmt_tok(stats["today"]["tok"]), style="cyan")
+    use_t.append("   │   all-time ", style="dim")
+    use_t.append("%s req" % fmt_int(stats["all"]["req"]), style="bold white")
+    use_t.append(" · %s tok" % fmt_tok(stats["all"]["tok"]), style="cyan")
+    if stats["since"]:
+        use_t.append(" since %s" % stats["since"], style="dim")
+    parts.append(use_t)
     return Group(*parts)
 
 
