@@ -157,6 +157,19 @@ def usage_bar(pct, width=10):
 
 PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "nvidia": "green"}
 
+# relative usage multipliers from FREEPI-DOCS.md §5 live bench (vs
+# deepseek-v4-flash 1x). benchmarked, approximate — real spend is measured
+# per request in the cost column.
+FREEPI_MULT = {
+    "deepseek-v4-flash": "1x",
+    "deepseek-v4.1-flash": "~0.1x",
+    "glm-5.3-flash": "~0.7x",
+    "gpt-oss-120b-speed": "~1.6x",
+    "mimo-v2.6-flash": "~0.4x",
+    "muse-spark-1.3-contributor": "~0.5x",
+    "solar-pro-4": "~1.6x",
+}
+
 
 def build_renderable(d, stats):
     parts = []
@@ -212,6 +225,8 @@ def build_renderable(d, stats):
         for name, _ in cols:
             t.add_column(name, style=PROVIDER_STYLES.get(name, "dim"))
             t.add_column("cost", justify="right", style="dim")
+            if name == "freepi":
+                t.add_column("mult", justify="right", style="dim")
         widest = max(len(ms) for _, ms in cols)
         for row in zip(*[ms + [""] * (widest - len(ms)) for _, ms in cols]):
             cells = []
@@ -221,8 +236,13 @@ def build_renderable(d, stats):
                     full = val if "/" in val else name + "/" + val
                     c = costs.get(full, 0)
                     cells.append(Text("$%.2g" % c if c else "·", style="dim"))
+                    if name == "freepi":
+                        bare = full.split("/", 1)[-1]
+                        cells.append(Text(FREEPI_MULT.get(bare, "·"), style="dim"))
                 else:
                     cells.append(Text(""))
+                    if name == "freepi":
+                        cells.append(Text(""))
             t.add_row(*cells)
         parts.append(t)
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
