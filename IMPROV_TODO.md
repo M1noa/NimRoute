@@ -98,8 +98,18 @@ one line per item, checkbox marks state. ordered by priority.
       flag and `StatusFor` redaction, no new flag needed. in-memory, resets
       on restart, as asked. `nimstatus.py` shows a tok column (top model
       appended when a lane served more than one) and a `tok served` line.
-      verified live: one turn reported 930 tokens (184 prompt / 746
-      completion) attributed to the exact lane and model.
+- [x] found and fixed why the counters read zero: `initUsageLog()` ran
+      before `applyConfig`, so `usage.path` / `usage.enabled` came from an
+      unloaded config and the jsonl opened at the wrong path (or not at
+      all). moved after `applyConfig` in `serverMain`, and after the config
+      load in `runProbe`.
+- [x] found and fixed why anthropic streams reported zero tokens:
+      `streamAnthropic` returns on `finish_reason`, but zen sends usage in a
+      chunk *after* it. the body is now scanned up front via the existing
+      `sseUsageTee`, so both the usage record and the per-lane totals carry
+      real counts. the non-stream fold was already correct. verified live:
+      two turns recorded 1040 and 1298 tokens, 2338 total on one lane with
+      the per-model breakdown.
 - [ ] live restart of the primary (:5419). deliberately left to the user.
 
 ## notes
@@ -118,4 +128,14 @@ one line per item, checkbox marks state. ordered by priority.
 - per-lane token totals read 0 for turns that hit `max_tokens` before
   upstream emitted a usage chunk. that is upstream behaviour, not a counter
   bug: a prompt short enough to reason briefly reports nothing. check
-  `usage` totals alongside the lane numbers before chasing it.
+  `usage` totals alongside the lane numbers before chasing it. the real
+  zero-token bug (usage after finish_reason) is fixed and listed above —
+  distinguish the two before spending time on it.
+- `models.params` was refactored out of config.yml into `model_info.jsonc`
+  + `modelinfo.go` while this work was in flight, committed alongside mine.
+  checked: it is deliberate and documented (AGENTS.md line ~69 says
+  `injectParams` only folds camelCase and no sampling defaults are injected
+  any more). `nudge_no_tools`, `context_length` and the thinking→effort
+  mapping all read model_info now. no action needed. noting it only because
+  the change landed in the same commits as the lane work and is easy to miss
+  when reading the log.
