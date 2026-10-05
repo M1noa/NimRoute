@@ -57,6 +57,11 @@ var (
 	// api-reported proxy -> reliability 0..1, rebuilt on each refresh.
 	zenReliMu sync.RWMutex
 	zenReli   = map[string]float64{}
+	// live first-byte rtt per exit (ewma ms), from real zen sends. refines
+	// the api-reported latency in proxyWeight: exits that answer fast win
+	// more draws, stalled ones sink without waiting for a slow strike.
+	zenLiveMu sync.RWMutex
+	zenLive   = map[string]float64{}
 	// geo/user blocks per country, for hardcoding bad regions.
 	zenCountryBlockMu sync.Mutex
 	zenCountryBlocks  = map[string]int{}
@@ -230,6 +235,11 @@ func refreshZenProxies() {
 	// a fresh pool means every lane's pinned exit is suspect: revalidate
 	// against the new verified set so lanes stop burning stale exits.
 	lanesRevalidate(verified)
+	// pre-open the shared lanes now that exits exist: cold starts spread
+	// from the first request instead of serializing on lane creation.
+	// also pre-build transports so the first send skips tls/dial setup.
+	ensureSharedLanes()
+	warmZenTransports(verified)
 	log.Printf("  zen proxies: %d verified of %d candidates", len(verified), len(cands))
 }
 
@@ -292,14 +302,39 @@ func proxyReliability(proxyURL string) float64 {
 }
 
 // proxyWeight scores an exit for sampling: faster + more reliable wins.
-// weight = reliability / response_ms, so a 100ms/0.9 exit beats a
-// 400ms/0.9 exit 4:1 and a flaky 100ms/0.2 exit 4.5:1.
+// live first-byte rtt halves the api-reported latency in the mix, so exits
+// that answer fast in practice win more draws while the whole pool stays
+// in play. weight = reliability / effective_ms.
 func proxyWeight(proxyURL string) float64 {
-	ms := proxyLatency(proxyURL)
+	ms := float64(proxyLatency(proxyURL))
 	if ms <= 0 {
 		ms = 10000
 	}
-	return (proxyReliability(proxyURL) + 0.1) / float64(ms)
+	zenLiveMu.RLock()
+	live, ok := zenLive[proxyURL]
+	zenLiveMu.RUnlock()
+	if ok && live > 0 {
+		ms = (float64(ms) + live) / 2
+	}
+	return (proxyReliability(proxyURL) + 0.1) / ms
+}
+
+// noteExitRTT folds a first-byte sample (ms) into the exit's live ewma.
+func noteExitRTT(proxy string, ms float64) {
+	if proxy == "" || ms <= 0 {
+		return
+	}
+	if ms > 60000 {
+		ms = 60000
+	}
+	zenLiveMu.Lock()
+	prev, ok := zenLive[proxy]
+	if !ok {
+		zenLive[proxy] = ms
+	} else {
+		zenLive[proxy] = prev*0.7 + ms*0.3
+	}
+	zenLiveMu.Unlock()
 }
 
 // sampleWeighted draws up to n distinct proxies, weighted by proxyWeight.
@@ -334,9 +369,9 @@ func sampleWeighted(pool []string, n int) []string {
 }
 
 // probeProxyFull verifies the full path to zen's front door through the
-// proxy with a short timeout: socks dials opencode.ai:443 via the proxy,
-// http issues a CONNECT for it. beats a tcp ping: dead egress fails here,
-// not 30s into the real request.
+// proxy: socks dials opencode.ai:443, http issues a CONNECT. used only by
+// the pool verifier, never on the request hot path (verified-on-success +
+// live rtt weights keep the pool fresh without per-request probes).
 func probeProxyFull(proxyURL string, timeout time.Duration) bool {
 	if proxyURL == "" {
 		return true
@@ -397,42 +432,9 @@ func probeHTTPConnect(ctx context.Context, pu *url.URL, target string) bool {
 	return strings.Contains(line, " 200")
 }
 
-// raceProbe probes proxies in parallel, first full-path winner wins.
-// "" when none passes within timeout.
-func raceProbe(proxies []string, timeout time.Duration) string {
-	win := make(chan string, 1)
-	var wg sync.WaitGroup
-	for _, u := range proxies {
-		if u == "" {
-			continue
-		}
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			if probeProxyFull(u, timeout) {
-				select {
-				case win <- u:
-				default:
-				}
-			}
-		}(u)
-	}
-	go func() {
-		wg.Wait()
-		close(win)
-	}()
-	t := time.NewTimer(timeout + 500*time.Millisecond)
-	defer t.Stop()
-	select {
-	case w := <-win:
-		return w
-	case <-t.C:
-		return ""
-	}
-}
-
 // sampleProxies returns up to n distinct pool proxies, weighted toward low
-// api-reported latency: the fastest quartile wins ~3/4 of draws.
+// api-reported latency: the fastest quartile wins ~3/4 of draws. kept for
+// tests; the lane picker uses sampleWeighted (live rtt aware).
 func sampleProxies(n int) []string {
 	zenProxiesMu.RLock()
 	pool := append([]string(nil), zenProxies...)
@@ -509,6 +511,12 @@ func zenErrorThreshold() int {
 
 // zenBackoff sleeps step*retry capped at max: defaults 0, 150ms, 300ms.
 func zenBackoff(retry int) {
+	zenBackoffCtx(context.Background(), retry)
+}
+
+// zenBackoffCtx is zenBackoff abortable on client disconnect: no point
+// sleeping between retries when nobody waits for the answer.
+func zenBackoffCtx(ctx context.Context, retry int) {
 	step := 150 * time.Millisecond
 	if ms := cfg().Zen.RetryBackoffMs; ms > 0 {
 		step = time.Duration(ms) * time.Millisecond
@@ -522,7 +530,10 @@ func zenBackoff(retry int) {
 		d = max
 	}
 	if d > 0 {
-		time.Sleep(d)
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
 	}
 }
 
@@ -778,6 +789,22 @@ func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
 	}
 	zenTransports[proxyURL] = tr
 	return tr
+}
+
+// warmZenTransports pre-builds cached transports for verified exits so
+// the first real send skips transport setup. cheap: no connections open
+// until first use. capped at the fastest 25 to bound fd churn.
+func warmZenTransports(verified []string) {
+	pool := append([]string(nil), verified...)
+	sort.Slice(pool, func(i, j int) bool { return proxyWeight(pool[i]) > proxyWeight(pool[j]) })
+	if len(pool) > 25 {
+		pool = pool[:25]
+	}
+	for _, p := range pool {
+		if pu, err := url.Parse(p); err == nil {
+			zenTransport(p, pu)
+		}
+	}
 }
 
 // closeZenTransport drops a proxy's cached transport and its idle conns.

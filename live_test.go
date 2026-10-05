@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // handleAnthropic end to end minus the network hop, which is the only part
@@ -117,6 +120,82 @@ data: [DONE]
 	}
 }
 
+// full zen round trip through p.ServeHTTP for both client protocols,
+// against a fake zen upstream. regression: hedgedDo cancelled the winning
+// response's context on return, so every opencode stream came back empty
+// and clients saw the session end with no output. the upstream streams its
+// second chunk 150ms in, so the body must stay readable after zenPost and
+// hedgedDo have returned.
+func TestZenProxyE2EStreams(t *testing.T) {
+	zsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.Error(w, `{"error":"unexpected path"}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"}}]}\n\n")
+		fl.Flush()
+		time.Sleep(150 * time.Millisecond)
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\"}}]}\n\n")
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer zsrv.Close()
+	oldBase := OpencodeBase
+	OpencodeBase = zsrv.URL
+	t.Cleanup(func() { OpencodeBase = oldBase })
+
+	c := loadSuiteConfig()
+	c.Zen.Enabled = true
+	c.Zen.AlwaysProxy = false // empty pool -> direct send to the fake upstream
+	c.Zen.HedgeAfterMs = 2000
+	c.Usage.Path = filepath.Join(t.TempDir(), "usage.jsonl")
+	useConfig(t, c)
+
+	p := newPool(nil)
+	psrv := httptest.NewServer(http.HandlerFunc(p.ServeHTTP))
+	defer psrv.Close()
+	post := func(path, body, session string) string {
+		t.Helper()
+		req, err := http.NewRequest("POST", psrv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-session-id", session)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		defer res.Body.Close()
+		out, _ := io.ReadAll(res.Body)
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("%s status %d: %s", path, res.StatusCode, out)
+		}
+		return string(out)
+	}
+
+	// openai protocol: /v1/chat/completions passthrough stream
+	oaiSSE := post("/v1/chat/completions",
+		`{"model":"opencode/test-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}`, "e2e-oai")
+	for _, want := range []string{"hello ", "world", `"finish_reason":"stop"`, "data: [DONE]"} {
+		if !strings.Contains(oaiSSE, want) {
+			t.Errorf("openai stream missing %q, got: %s", want, oaiSSE)
+		}
+	}
+
+	// anthropic protocol: /v1/messages, what claude code sends
+	aSSE := post("/v1/messages",
+		`{"model":"opencode/test-chat","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}`, "e2e-ant")
+	for _, want := range []string{"message_start", "content_block_delta", "hello ", "world", "message_stop", "data: [DONE]"} {
+		if !strings.Contains(aSSE, want) {
+			t.Errorf("anthropic stream missing %q, got: %s", want, aSSE)
+		}
+	}
+}
+
 // real HTTP round trip through callUpstream, the nvidia branch of
 // handleAnthropic, against a local upstream. this is the path a /v1/messages
 // request takes when the model is not opencode/*: request translation, real
@@ -160,7 +239,7 @@ func TestLiveToolCallRoundTrip(t *testing.T) {
 	}
 
 	p := newPool(c.NvidiaKeys)
-	res, err := p.callUpstream("POST", up.URL, oai,
+	res, err := p.callUpstream(context.Background(), "POST", up.URL, oai,
 		http.Header{"Content-Type": {"application/json"}}, "test-model", "1.2.3.4")
 	if err != nil || res == nil {
 		t.Fatalf("callUpstream: %v", err)

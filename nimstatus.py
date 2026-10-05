@@ -82,8 +82,7 @@ def plain_status(d):
         d.get("version", "?"), d.get("uptime", "?"),
         d.get("concurrent", 0), d.get("sem_limit", 0)))
     lanes = d.get("zen_lanes") or []
-    live = sum(1 for l in lanes if not l.get("cooldown_remaining"))
-    c.append("lanes %d/%d live" % (live, len(lanes)))
+    c.append("lanes %d live" % len(lanes))
     p = d.get("pool") or {}
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
@@ -116,10 +115,8 @@ def merged_table(d):
     t.add_column("req", justify="right")
     t.add_column("state")
     for l in lanes:
-        cool = l.get("cooldown_remaining")
-        mark = Text("○", style="red") if cool else Text("●", style="green")
-        state = Text("cool " + cool, style="red") if cool else Text(
-            "live", style="dim")
+        mark = Text("●", style="green")
+        state = Text("live", style="dim")
         proxy = l.get("proxy") or ""
         e = exits.get(proxy, {})
         if proxy:

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,33 +225,43 @@ func TestSampleWeightedPrefersFast(t *testing.T) {
 	}
 }
 
-// stale refresh fires only when all lanes cool 15s+ with no success.
+// stale refresh fires only when a lane's limit run lasts 15s+ with no
+// global success: the pool/sessions are stale, not just busy.
 func TestMaybeRefreshStalePool(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
-	if maybeRefreshStalePool() {
-		t.Fatal("must not fire with no lanes")
-	}
+	c := testConfig()
+	c.Zen.StalePoolSecs = 15
+	useConfig(t, c)
+	old := lanes["a"]
+	_ = old
+	l := &zenLane{id: "a", session: zenSession(), lastUsed: time.Now()}
 	lanesMu.Lock()
-	lanes["a"] = &zenLane{id: "a", session: zenSession(), lastUsed: time.Now(), cooldown: time.Now().Add(time.Minute)}
+	lanes["a"] = l
 	lanesMu.Unlock()
+	if maybeRefreshStalePool(l) {
+		t.Fatal("must not fire with no limit run")
+	}
 	zenSuccessMu.Lock()
 	zenSuccessAt = time.Now()
 	zenSuccessMu.Unlock()
-	if maybeRefreshStalePool() {
+	lanesMu.Lock()
+	l.limitedSince = time.Now().Add(-time.Minute)
+	lanesMu.Unlock()
+	if maybeRefreshStalePool(l) {
 		t.Fatal("must not fire with fresh success")
 	}
 	zenSuccessMu.Lock()
 	zenSuccessAt = time.Now().Add(-time.Minute)
 	zenSuccessMu.Unlock()
-	if !maybeRefreshStalePool() {
-		t.Fatal("must fire when all cooling and stale 15s+")
+	if !maybeRefreshStalePool(l) {
+		t.Fatal("must fire when the lane run is stale 15s+ with no success")
 	}
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	for _, l := range lanes {
-		if !l.cooldown.IsZero() || l.proxy != "" {
-			t.Fatal("stale lanes must reset cooldown+proxy with fresh session")
+		if !l.limitedSince.IsZero() || l.proxy != "" {
+			t.Fatal("stale lanes must reset limit run+proxy with fresh session")
 		}
 	}
 }
@@ -292,6 +305,9 @@ func TestConvoTwoRequestRule(t *testing.T) {
 	resetConvoSeen()
 	defer resetLanes()
 	defer resetConvoSeen()
+	c := testConfig()
+	c.Zen.LaneConvo = boolPtr(true)
+	useConfig(t, c)
 	body := []byte(`{"messages":[{"role":"user","content":"title this chat"},{"role":"assistant","content":"done"}]}`)
 	l1 := laneFor("", body)
 	if strings.HasPrefix(laneKeyOf(l1), "convo:") {
@@ -462,24 +478,96 @@ func TestSlowStrikes(t *testing.T) {
 	zenProxiesMu.RUnlock()
 }
 
-// hedgedDo: first response wins, slow side loses.
+// hedgedDo: first response wins, slow side loses, client cancel wins all.
 func TestHedgedDo(t *testing.T) {
-	fast := func() (*http.Response, error) {
+	fast := func(context.Context) (*http.Response, error) {
 		return &http.Response{StatusCode: 200}, nil
 	}
-	slow := func() (*http.Response, error) {
-		time.Sleep(5 * time.Second)
-		return &http.Response{StatusCode: 200}, nil
+	slow := func(ctx context.Context) (*http.Response, error) {
+		select {
+		case <-time.After(5 * time.Second):
+			return &http.Response{StatusCode: 200}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	resp, err, hedged := hedgedDo(fast, slow, 50*time.Millisecond)
+	resp, err, hedged := hedgedDo(context.Background(), fast, slow, 50*time.Millisecond)
 	if err != nil || resp.StatusCode != 200 || hedged {
 		t.Fatalf("fast primary must win: %v %v hedged=%v", resp, err, hedged)
 	}
-	resp, err, hedged = hedgedDo(slow, fast, 50*time.Millisecond)
+	resp, err, hedged = hedgedDo(context.Background(), slow, fast, 50*time.Millisecond)
 	if err != nil || resp.StatusCode != 200 || !hedged {
 		t.Fatalf("hedge must win stalled primary: %v %v hedged=%v", resp, err, hedged)
 	}
-	resp, err, _ = hedgedDo(slow, slow, 0)
+	resp, err, _ = hedgedDo(context.Background(), slow, slow, 0)
 	_ = resp
 	_ = err
+	// cancelled ctx returns fast with ctx err, no orphan goroutine blocks.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err, _ := hedgedDo(cctx, slow, slow, 50*time.Millisecond); err == nil {
+		t.Fatal("cancelled ctx must return an error, not a response")
+	}
+}
+
+// hedgedDo owns the winner's response lifetime: the winning side's request
+// context must survive the return so the caller can stream the body; only
+// the losing side is cancelled. regression: deferred cancels killed the
+// winner's body right after return, so zen responses came back empty.
+func TestHedgedDoWinnerBodyReadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fl := w.(http.Flusher)
+		w.Write([]byte("data: chunk-one\n\n"))
+		fl.Flush()
+		time.Sleep(150 * time.Millisecond)
+		w.Write([]byte("data: chunk-two\n\n"))
+	}))
+	defer srv.Close()
+	send := func(ctx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		if err != nil {
+			return nil, err
+		}
+		return http.DefaultClient.Do(req)
+	}
+
+	// primary wins the race with the hedge armed, but the body keeps
+	// streaming after hedgedDo returns: reads must still succeed in full.
+	resp, err, hedged := hedgedDo(context.Background(), send, send, 5*time.Second)
+	if err != nil || hedged {
+		t.Fatalf("primary send: %v hedged=%v", err, hedged)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("winner body must stay readable after return: %v", err)
+	}
+	if !strings.Contains(string(body), "chunk-two") {
+		t.Fatalf("winner body truncated, got %q", string(body))
+	}
+
+	// stalled primary loses to the hedge: winner readable, loser cancelled.
+	lost := make(chan error, 1)
+	slowPrimary := func(ctx context.Context) (*http.Response, error) {
+		<-ctx.Done()
+		lost <- ctx.Err()
+		return nil, ctx.Err()
+	}
+	hresp, herr, hhedged := hedgedDo(context.Background(), slowPrimary, send, 50*time.Millisecond)
+	if herr != nil || !hhedged {
+		t.Fatalf("hedge must win stalled primary: %v hedged=%v", herr, hhedged)
+	}
+	hbody, err := io.ReadAll(hresp.Body)
+	hresp.Body.Close()
+	if err != nil || !strings.Contains(string(hbody), "chunk-two") {
+		t.Fatalf("hedge winner body must stay readable: err=%v body=%q", err, string(hbody))
+	}
+	select {
+	case err := <-lost:
+		if err != context.Canceled {
+			t.Fatalf("loser must be cancelled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("loser was never cancelled")
+	}
 }

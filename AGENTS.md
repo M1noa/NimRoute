@@ -91,15 +91,15 @@ key/proxy/lane rotation to survive per-exit rate limits.
 
 | signal | meaning | action |
 |---|---|---|
-| 429 | per-exit rate limit. lane cooldown (exp backoff, 10m cap) + failover. `pool_refresh_429s` lanes limited = stale pool, refresh fires | normal, no fix |
+| 429 | per-exit rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits. `pool_refresh_429s` lanes limited = stale pool, refresh fires | normal, no fix |
 | 403 FreeTierError | per-exit-per-model burn (`burnExit`, `exit_burn_minutes` default 30m). lane forgets exit, rotates away | normal, no fix. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
 | 403 geo (`not available in your country`) / `[user_blocked]` | exit banned or region-blocked. `dropProxy` + failover; threshold (`error_threshold`, default 3) refreshes pool | normal, no fix |
 | 502 / transport error | dead exit, dropped from pool (`dropProxy`, transport closed) | normal noise, no fix |
 | 529 | treated as 429 in both NIM and zen paths | normal, no fix |
-| persistent all-exit failure | no success for `stale_pool_secs` (default 15s) with all lanes cooling = stale pool/sessions: refresh + `resetStaleLanes` | fix the refresh/rotation path, not the retry loop |
+| persistent all-exit failure | no success for `stale_pool_secs` (default 15s) with a lane limited the whole time = stale pool/sessions: refresh + `resetStaleLanes` | fix the refresh/rotation path, not the retry loop |
 
 Investigate only when rotation stops working: same burned exit reused,
-cooldowns never clearing, refresh storms (see TODO item 10: raise
+sessions never refreshing, refresh storms (see TODO item 10: raise
 `pool_refresh_429s`, cooldown between refreshes before touching retry
 logic).
 
@@ -113,7 +113,10 @@ logic).
 
 - lanes key on `x-session-id` verbatim (`"hdr:" + headerSession` in
   `laneFor`). never normalize, hash, or trim it lane-side; pii session
-  derivation (`piiSessionID`) is separate.
+  derivation (`piiSessionID`) is separate. lane identity modes
+  (`lane_hdr`/`lane_convo`/`lane_shared`) toggle independently, convo off
+  by default (buggy hash); shared pre-opens `lanes`-count lanes at startup.
+  limits rotate exit+session instantly (`laneRotate`), never a cooldown.
 - proxy urls may embed `user:pass`. run `redactProxyUserinfo` before any
   proxy value reaches `/status` AND logs.
 - never forward client credentials upstream: NIM path has a header

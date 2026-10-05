@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,10 +69,10 @@ type freepiAcct struct {
 // freepiStats mirrors the /me/stats fields we display. cached 60s:
 // stable enough for status, cheap enough to stay fresh.
 type freepiStats struct {
-	Tier      string
-	Credits   float64
-	SpentPct  float64
-	ReqToday  int
+	Tier        string
+	Credits     float64
+	SpentPct    float64
+	ReqToday    int
 	PromptToday int
 	CompToday   int
 }
@@ -89,13 +90,13 @@ func (fa *freepiAcct) refreshStats() freepiStats {
 	st := freepiStats{}
 	if code == 200 {
 		var ms struct {
-			Tier         string  `json:"tier"`
-			Credits      float64 `json:"credit_credits"`
-			CapToday     float64 `json:"cap_usd_today"`
-			SpentToday   float64 `json:"spent_usd_today"`
-			ReqToday     int     `json:"request_count_today"`
-			PromptToday  int     `json:"prompt_tokens_today"`
-			CompToday    int     `json:"completion_tokens_today"`
+			Tier        string  `json:"tier"`
+			Credits     float64 `json:"credit_credits"`
+			CapToday    float64 `json:"cap_usd_today"`
+			SpentToday  float64 `json:"spent_usd_today"`
+			ReqToday    int     `json:"request_count_today"`
+			PromptToday int     `json:"prompt_tokens_today"`
+			CompToday   int     `json:"completion_tokens_today"`
 		}
 		if json.Unmarshal(body, &ms) == nil {
 			st.Tier = ms.Tier
@@ -327,7 +328,7 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 	}
 	acclog.Printf("%s routed to freepi model=%s", reqID, realModel)
 
-	_, rb, acct, ok := freepiFetch(r.Method, oaiBody, realModel)
+	_, rb, acct, ok := freepiFetch(r.Context(), r.Method, oaiBody, realModel)
 	if !ok {
 		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "freepi: "+acct)
@@ -376,7 +377,7 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 // freshly claimed slot means a stale server-side lease (a crashed run):
 // this process serializes locally, so no live local request owns it and
 // the documented /session/reset is safe.
-func freepiFetch(method string, body []byte, model string) (*http.Response, []byte, string, bool) {
+func freepiFetch(ctx context.Context, method string, body []byte, model string) (*http.Response, []byte, string, bool) {
 	accts := freepiAccounts()
 	if len(accts) == 0 {
 		return nil, nil, "no freepi accounts configured", false
@@ -387,6 +388,10 @@ func freepiFetch(method string, body []byte, model string) (*http.Response, []by
 	tried := map[string]time.Time{} // account -> when we last used it
 
 	for {
+		// client gone: stop queueing, never burn an account on orphan output.
+		if ctx.Err() != nil {
+			return nil, nil, "client disconnected", false
+		}
 		// claim a slot: free-and-untried first, else the coldest tried one.
 		var fa *freepiAcct
 		for _, c := range accts {
@@ -423,11 +428,15 @@ func freepiFetch(method string, body []byte, model string) (*http.Response, []by
 			if time.Now().After(deadline) {
 				break
 			}
-			time.Sleep(150 * time.Millisecond)
+			select {
+			case <-time.After(150 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, nil, "client disconnected", false
+			}
 			continue
 		}
 
-		resp, rb, acct, errMsg, retry := freepiTry(method, target, body, fa, model)
+		resp, rb, acct, errMsg, retry := freepiTry(ctx, method, target, body, fa, model)
 		fa.mu.Lock()
 		fa.inflight--
 		fa.mu.Unlock()
@@ -451,11 +460,16 @@ func freepiFetch(method string, body []byte, model string) (*http.Response, []by
 
 // freepiTry makes one upstream attempt with lease recovery. retry=true
 // asks the caller to loop again (lease was released, or account failed).
-func freepiTry(method, target string, body []byte, fa *freepiAcct, model string) (*http.Response, []byte, string, string, bool) {
+// ctx cancels the upstream send: one live stream per jwt, so a disconnect
+// must free the account immediately.
+func freepiTry(ctx context.Context, method, target string, body []byte, fa *freepiAcct, model string) (*http.Response, []byte, string, string, bool) {
 	go freepiAdCycle(fa, fa.turns == 0)
 	var lastErr string
 	for attempt := 0; attempt < 2; attempt++ {
-		req, err := http.NewRequest(method, target, bytes.NewReader(body))
+		if ctx.Err() != nil {
+			return nil, nil, "", ctx.Err().Error(), false
+		}
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 		if err != nil {
 			return nil, nil, "", err.Error(), false
 		}
@@ -476,7 +490,11 @@ func freepiTry(method, target string, body []byte, fa *freepiAcct, model string)
 			// is a stale lease from a crashed run. release it.
 			acclog.Printf("  freepi acct=%s stale session lease, releasing", fa.name)
 			freepiSessionReset(fa)
-			time.Sleep(leaseGrace)
+			select {
+			case <-time.After(leaseGrace):
+			case <-ctx.Done():
+				return nil, nil, "", ctx.Err().Error(), false
+			}
 			lastErr = fe.Msg
 			continue
 		}
@@ -505,7 +523,7 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 	}
 	acclog.Printf("%s routed to freepi model=%s", reqID, realModel)
 
-	resp, rb, acct, ok := freepiFetch(r.Method, body, realModel)
+	resp, rb, acct, ok := freepiFetch(r.Context(), r.Method, body, realModel)
 	if !ok {
 		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
 		http.Error(w, fmt.Sprintf(`{"error":"freepi: %s"}`, acct), http.StatusBadGateway)

@@ -171,17 +171,28 @@ zen:
   # cap on auto-pool size after sorting by speed. 0 = no cap.
   pool_size: 400
   # pinned proxy+session lanes. concurrent conversations spread across
-  # lanes so they stop hammering one exit ip into 429s. lane identity:
-  # x-session-id header -> conversation hash -> shared lru pool.
-  # match this to concurrent clients + headroom; the keyless concurrency
-  # limit follows it, so both move together.
+  # lanes so they stop hammering one exit ip into 429s. lane identity
+  # modes below toggle independently; shared pre-opens lanes-count lanes
+  # and spreads every request across them. match lanes to concurrent
+  # clients + headroom; the keyless concurrency limit follows it, so both
+  # move together.
   lanes: 25
+  # pin an x-session-id header to a lane, converting an idle shared lane
+  # when the table is full.
+  lane_hdr: true
+  # pin a conversation hash (first user + last assistant block) from the
+  # second sighting. buggy, off by default: the hash drifts as history
+  # grows and one-shots pin lanes. shared spreads better.
+  lane_convo: false
+  # pre-open lanes-count shared lanes at startup and spread requests
+  # across them weighted toward fast exits. the smooth simple default.
+  lane_shared: true
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
   # drop lanes idle past this (minutes) on the same sweep, clearing the
   # session hash/id from cache. ttl stays the hard cap. 0 disables.
   session_idle_minutes: 6
-  # base 429 cooldown per lane (seconds), exponential backoff, capped.
+  # unused: limits rotate the exit+session instantly, no cooldown waits.
   lane_cooldown_secs: 60
   # minimum gap between sends on one lane (ms). paces a single
   # conversation's bursts so one exit never sees rapid-fire requests. 0 off.
@@ -199,16 +210,18 @@ zen:
   # upstream attempts per request (first try + retries). default 4 retries.
   # 0 = same default, negative = single attempt, no retry.
   max_retries: 4
-  # verify a lane's pinned exit before reuse (ms). 0 = 1000.
+  # unused: exits are verified on pool refresh and by real sends, never
+  # probed on the request hot path.
   probe_timeout_ms: 1000
-  # cap the parallel exit race when picking a proxy (ms). 0 = 3000.
+  # unused: the exit race is gone with hot-path probing; weighted picks
+  # plus hedging cover slow exits.
   race_timeout_ms: 3000
-  # cap pacing+cooldown wait per send (seconds). 0 = 10.
+  # cap pacing wait per send (seconds). 0 = 10.
   lane_gate_max_secs: 10
-  # clamp the all-lanes-cooling wait (seconds). 0 = 3.
+  # unused: lanes never cool, nothing waits on a backoff.
   lane_wait_max_secs: 3
-  # pool refresh + session rotation after this long with every lane
-  # cooling and no success (seconds). 0 = 15.
+  # pool refresh + session rotation after this long with no global success
+  # and a lane limited the whole time (seconds). 0 = 15.
   stale_pool_secs: 15
   # upstream timeouts: proxied vs direct (seconds). 0 = 120/300.
   zen_timeout_secs: 120

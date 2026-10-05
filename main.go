@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,7 +24,6 @@ import (
 
 const (
 	nvidiaBase    = "https://integrate.api.nvidia.com/v1"
-	OpencodeBase  = "https://opencode.ai/zen/v1"
 	cooldown429   = 1 * time.Minute
 	maxBackoff    = 16 * time.Minute
 	failWindow    = 50 * time.Minute
@@ -40,6 +40,9 @@ const (
 
 // versionStr is overridden at build time via -ldflags "-X main.versionStr=x.y.z".
 var versionStr = "2.6.0"
+
+// OpencodeBase is a var so tests can point the zen path at a fake upstream.
+var OpencodeBase = "https://opencode.ai/zen/v1"
 
 type Key struct {
 	Name           string
@@ -161,14 +164,28 @@ func (p *Pool) syncSemLimit(entries map[string]string) {
 	}
 }
 
-// semAcquire blocks until an in-flight slot frees.
-func (p *Pool) semAcquire() {
+// semAcquire blocks until an in-flight slot frees. ctx-aware: a client
+// disconnect stops queueing instead of holding a slot nobody needs.
+func (p *Pool) semAcquire(ctx context.Context) bool {
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.semCond.Broadcast()
+		case <-done:
+		}
+	}()
 	p.semMu.Lock()
 	defer p.semMu.Unlock()
 	for p.semUsed >= p.semLimit {
 		p.semCond.Wait()
+		if ctx.Err() != nil {
+			return false
+		}
 	}
 	p.semUsed++
+	return true
 }
 
 // semRelease frees a slot and wakes one waiter.
@@ -349,7 +366,9 @@ func (p *Pool) Postpone(k *Key, d time.Duration) {
 
 // callUpstream runs the retry loop against NIM and returns the result.
 // Returns (nil, nil) when all keys exhausted, (nil, error) on hard error.
-func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header, model, remoteAddr string) (*upstreamResult, error) {
+// ctx cancels the upstream send: a client disconnect stops the request on
+// nvidia's end instead of burning tokens on output nobody reads.
+func (p *Pool) callUpstream(ctx context.Context, method, target string, body []byte, fwd http.Header, model, remoteAddr string) (*upstreamResult, error) {
 	exclude := make(map[string]bool)
 	cl := &http.Client{Timeout: 300 * time.Second}
 	var retries int
@@ -358,10 +377,17 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 
 	sticky := p.stickyKey(model)
 	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		key := p.PickSticky(exclude, model, sticky)
 		if key == nil {
 			if attempt < 3 {
-				time.Sleep(200 * time.Millisecond)
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			dbglog.Printf("no keys available at attempt %d (excluded=%d, model=%s)", attempt, len(exclude), model)
@@ -369,7 +395,7 @@ func (p *Pool) callUpstream(method, target string, body []byte, fwd http.Header,
 		}
 		used = key
 
-		req, err := http.NewRequest(method, target, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("NewRequest: %w", err)
 		}
@@ -485,7 +511,7 @@ type freepiAcctStatus struct {
 	Inflight   bool     `json:"inflight"`
 	Tier       string   `json:"tier,omitempty"`
 	Credits    float64  `json:"credits,omitempty"`
-	SpentPct   float64   `json:"spent_pct,omitempty"`
+	SpentPct   float64  `json:"spent_pct,omitempty"`
 	ReqToday   int      `json:"req_today,omitempty"`
 }
 
@@ -1514,6 +1540,153 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames)
 	return
 }
 
+// streamResponsesLive converts an upstream /responses SSE body to OAI chat
+// chunks while reading: each upstream chunk is converted and flushed
+// immediately, so client TTFT is zen's first byte, not the full turn. line
+// framing survives chunk splits via carry. ctx aborts the read (upstream
+// body close cancels the in-flight request, freeing the exit).
+func streamResponsesLive(ctx context.Context, w http.ResponseWriter, body io.Reader, tnames toolNames) (written int64, promptT, compT int) {
+	fl, _ := w.(http.Flusher)
+	flush := func() {
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	var strip sentinelStripper
+	var carry []byte
+	buf := make([]byte, 4096)
+	// evt mirrors the subset streamResponsesToChat parses; kept local so
+	// the live path never blocks on the buffered converter's shape.
+	feed := func(blk []byte) {
+		lines := strings.Split(string(blk), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "event: ") || line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				n, _ := w.Write([]byte("data: [DONE]\n\n"))
+				written += int64(n)
+				flush()
+				return
+			}
+			var evt struct {
+				Type  string `json:"type"`
+				Delta string `json:"delta"`
+				Item  *struct {
+					Type      string `json:"type"`
+					CallID    string `json:"call_id"`
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"item"`
+				Response *struct {
+					Usage *struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(data), &evt); err != nil {
+				continue
+			}
+			switch evt.Type {
+			case "response.output_text.delta":
+				if evt.Delta != "" {
+					if clean := strip.push(evt.Delta); clean != "" {
+						chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(clean))
+						n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+						written += int64(n)
+						flush()
+					}
+				}
+			case "response.output_item.added":
+				if evt.Item != nil && evt.Item.Type == "function_call" {
+					tid := evt.Item.CallID
+					if tid == "" {
+						tid = "toolu_" + randHex(24)
+					}
+					chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":%s,"type":"function","function":{"name":%s,"arguments":""}}]},"finish_reason":null}],"usage":null}`, jsonStr(tid), jsonStr(tnames.resolve(evt.Item.Name)))
+					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+					written += int64(n)
+					flush()
+				}
+			case "response.function_call_arguments.delta":
+				if evt.Delta != "" {
+					chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":%s}}]},"finish_reason":null}],"usage":null}`, jsonStr(evt.Delta))
+					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+					written += int64(n)
+					flush()
+				}
+			case "response.completed":
+				if tail := strip.flush(); tail != "" {
+					chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(tail))
+					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+					written += int64(n)
+				}
+				if evt.Response != nil && evt.Response.Usage != nil {
+					promptT = evt.Response.Usage.InputTokens
+					compT = evt.Response.Usage.OutputTokens
+					chunk := fmt.Sprintf(`{"choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`, promptT, compT, promptT+compT)
+					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+					written += int64(n)
+				}
+				n, _ := w.Write([]byte("data: [DONE]\n\n"))
+				written += int64(n)
+				flush()
+				return
+			}
+		}
+	}
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		n, err := body.Read(buf)
+		if n > 0 {
+			blk := buf[:n]
+			if len(carry) > 0 {
+				blk = append(carry, buf[:n]...)
+				carry = nil
+			}
+			// hold back the trailing partial line: only convert complete
+			// lines, keep the rest for the next read.
+			if i := bytes.LastIndexByte(blk, '\n'); i >= 0 {
+				feed(blk[:i+1])
+				if i+1 < len(blk) {
+					carry = append(carry[:0], blk[i+1:]...)
+				}
+			} else {
+				carry = append(carry[:0], blk...)
+				if len(carry) > 65536 {
+					// absurdly long line: convert anyway rather than
+					// buffering forever.
+					feed(carry)
+					carry = nil
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(carry) > 0 {
+		feed(append(carry, '\n'))
+	}
+	if tail := strip.flush(); tail != "" {
+		chunk := fmt.Sprintf(`{"choices":[{"index":0,"delta":{"content":%s},"finish_reason":null}],"usage":null}`, jsonStr(tail))
+		n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
+		written += int64(n)
+	}
+	n, _ := w.Write([]byte("data: [DONE]\n\n"))
+	written += int64(n)
+	flush()
+	return
+}
+
 // isTerminalResponsesEvent reports whether a /responses SSE payload ends the
 // turn, after which streamResponsesToChat returns and ignores the rest.
 func isTerminalResponsesEvent(data string) bool {
@@ -1553,8 +1726,8 @@ func mergeResponsesSSE(bodies [][]byte) []byte {
 }
 
 // nudgePostResponses re-POSTs a body to zen on the caller's lane, with the
-// same pacing, cooldown and rotation policy as the main request. best
-// effort: nil on any failure.
+// same pacing and rotation policy as the main request. best effort: nil on
+// any failure. client disconnect cancels the upstream send.
 func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, sessionID *string, lane *zenLane) []byte {
 	if lane == nil {
 		return nil
@@ -1563,23 +1736,14 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 	lastProxy := ""
 	rotating := true
 	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
-		if !laneHealthy(lane) {
-			if nl := laneFailover(lane); nl != nil {
-				lane = nl
-				*sessionID = laneSession(lane)
-			}
-		} else {
-			laneGate(lane)
-		}
+		laneGate(r.Context(), lane)
 		proxy := ""
 		if rotating {
 			proxy = laneProxyFor(lane, reqModel(nb))
 			if proxy == "" && cfg().Zen.AlwaysProxy {
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					*sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane, reqModel(nb))
-				}
+				lane = laneFailover(lane)
+				*sessionID = laneSession(lane)
+				proxy = laneProxyFor(lane, reqModel(nb))
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				continue
@@ -1591,7 +1755,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			proxy = lastProxy
 			cl = zenClient(proxy)
 		}
-		req, err := http.NewRequest(r.Method, target, bytes.NewReader(nb))
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(nb))
 		if err != nil {
 			return nil
 		}
@@ -1607,7 +1771,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			rotating = true
 			acclog.Printf("!! opencode zen error (retry %d/%d) nudge country=%s proxy=%s %s: %v", zenRetries, zenRetryLabel(), proxyCountry(proxy), redactProxyUserinfo(proxy), target, err)
 			if !zenLastRetry(zenRetries) {
-				zenBackoff(zenRetries)
+				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
 			return nil
@@ -1616,7 +1780,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			up.Body.Close()
 			dropProxy(proxy)
 			rotating = true
-			zenBackoff(zenRetries)
+			zenBackoffCtx(r.Context(), zenRetries)
 			continue
 		}
 		if up.StatusCode != http.StatusOK {
@@ -1625,7 +1789,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			if zenServiceOverloaded(eb) {
 				rotating = false
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
@@ -1635,7 +1799,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 				dropProxy(proxy)
 				rotating = true
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
@@ -2610,7 +2774,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if used, limit := p.semStats(); used >= limit {
 		acclog.Printf("%s ... all %d slots busy, queueing", reqID, limit)
 	}
-	p.semAcquire()
+	if !p.semAcquire(r.Context()) {
+		acclog.Printf("!! %s client disconnected while queueing", reqID)
+		http.Error(w, `{"error":"client disconnected"}`, 499)
+		return
+	}
 	p.concurrent.Add(1)
 	defer func() {
 		p.concurrent.Add(-1)
@@ -2920,6 +3088,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// usage json is small and lands wholly in one final chunk.
 			var carry []byte
 			for {
+				// client gone: close upstream, stop streaming orphan bytes.
+				if r.Context().Err() != nil {
+					lastResp.Body.Close()
+					break
+				}
 				n, err := lastResp.Body.Read(buf)
 				if n > 0 {
 					w.Write(buf[:n])
@@ -3040,24 +3213,18 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var usedProxy string
 	rotating := true
 	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
-		// lane failover: a cooling lane yields to the healthiest lane,
-		// keeping this request off a 429-backed exit. when every lane is
-		// cooling, wait out the shortest backoff instead of failing fast.
-		// otherwise pace: never hit one exit faster than lane_min_gap_ms.
-		if !laneHealthy(lane) {
-			if nl := laneFailover(lane); nl != nil {
-				lane = nl
-				sessionID = laneSession(lane)
-			} else if zenRetries > 0 {
-				if maybeRefreshStalePool() {
-					sessionID = laneSession(lane)
-				} else if wait := laneWait(); wait > 0 {
-					acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/%d)", wait, zenRetries, zenRetryLabel())
-					time.Sleep(wait)
-				}
-			}
-		} else {
-			laneGate(lane)
+		// pace only: lanes never cool, a limit rotates the exit instead.
+		// maybeRefreshStalePool trips only when this lane has been limited
+		// 15s+ with no global success (stale pool/sessions).
+		if zenRetries > 0 && maybeRefreshStalePool(lane) {
+			sessionID = laneSession(lane)
+		}
+		laneGate(r.Context(), lane)
+		// client gone while pacing: stop before burning an exit.
+		if r.Context().Err() != nil {
+			acclog.Printf("!! opencode client disconnected model=%s (paced)", model)
+			http.Error(w, `{"error":"client disconnected"}`, 499)
+			return
 		}
 		proxy := ""
 		if zenRetries == 0 {
@@ -3065,11 +3232,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// pool dry: fail over once instead of burning a retry
 				// on direct, which always_proxy already ruled out.
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane, realModel)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneSession(lane)
+				proxy = laneProxyFor(lane, realModel)
 				if proxy == "" {
 					continue
 				}
@@ -3080,11 +3245,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			proxy = laneProxyFor(lane, realModel)
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// pool dry and proxied mode: try another lane's exit.
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane, realModel)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneSession(lane)
+				proxy = laneProxyFor(lane, realModel)
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				continue
@@ -3096,7 +3259,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			proxy = usedProxy
 			cl = zenClient(proxy)
 		}
-		req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
 			return
@@ -3117,8 +3280,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 
 		// hedged send: if no first byte in ~2s, fire the same body on a
-		// second exit; first response wins, loser is closed. first-byte
-		// latency over 6s earns the exit a slow strike (2 in 1h drops it).
+		// second exit; first response wins, loser is cancelled. first-byte
+		// latency over 6s earns the exit a slow strike (2 in 1h drops it);
+		// every sample feeds the live rtt weight so fast exits win more.
 		hedgeAfter := 2 * time.Second
 		if ms := cfg().Zen.HedgeAfterMs; ms != 0 {
 			if ms < 0 {
@@ -3127,17 +3291,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				hedgeAfter = time.Duration(ms) * time.Millisecond
 			}
 		}
-		hedgeFn := func() (*http.Response, error) {
-			hl := lane
-			if nl := laneFailover(lane); nl != nil {
-				hl = nl
-			}
+		hedgeFn := func(hctx context.Context) (*http.Response, error) {
+			hl := laneFailover(lane)
 			hp := laneProxyFor(hl, realModel)
 			if hp == "" || hp == proxy {
-				select {} // no distinct exit: hang so primary wins
+				<-hctx.Done() // no distinct exit: wait to be cancelled
+				return nil, hctx.Err()
 			}
 			hcl := zenClient(hp)
-			hreq, herr := http.NewRequest(r.Method, target, bytes.NewReader(body))
+			hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
 			if herr != nil {
 				return nil, herr
 			}
@@ -3159,14 +3321,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			GotFirstResponseByte: func() { firstByteAt = time.Now() },
 		}))
 		sendStart := time.Now()
-		primaryFn := func() (*http.Response, error) {
-			return cl.Do(traced)
+		primaryFn := func(pctx context.Context) (*http.Response, error) {
+			return cl.Do(traced.WithContext(pctx))
 		}
 		var hedged bool
-		resp, err, hedged = hedgedDo(primaryFn, hedgeFn, hedgeAfter)
+		resp, err, hedged = hedgedDo(r.Context(), primaryFn, hedgeFn, hedgeAfter)
 		_ = hedged
 		if err == nil && !firstByteAt.IsZero() {
-			if fb := firstByteAt.Sub(sendStart); fb > 6*time.Second {
+			fb := firstByteAt.Sub(sendStart)
+			noteExitRTT(proxy, float64(fb.Milliseconds()))
+			if fb > 6*time.Second {
 				noteExitSlow(proxy)
 			}
 		}
@@ -3180,7 +3344,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				resetZenNetworkErrors()
 			}
 			if !zenLastRetry(zenRetries) {
-				zenBackoff(zenRetries)
+				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
 			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
@@ -3192,19 +3356,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			resp.Body.Close()
-			acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, cooling lane",
+			acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, rotating exit+session",
 				resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
 			if proxy == "" {
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
 			noteExit429(proxy)
-			laneCool(lane)
-			if nl := laneFailover(lane); nl != nil {
-				lane = nl
-				sessionID = laneSession(lane)
-			}
+			lane = laneFailover(lane)
+			sessionID = laneRotate(lane, realModel)
 			rotating = true
-			zenBackoff(zenRetries)
+			zenBackoffCtx(r.Context(), zenRetries)
 			continue
 		}
 
@@ -3216,18 +3377,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 				rotating = false
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
 			if zenGeoBlocked(eb) {
 				logZenBlocked("geo", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
-				laneCoolSoft(lane)
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenGeoErr() {
 					acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
@@ -3235,18 +3393,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					resetZenGeoErrs()
 				}
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
 			if zenUserBlocked(eb) {
 				logZenBlocked("user", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
-				laneBlock(lane)
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenBlockErr() {
 					acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
@@ -3254,7 +3409,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					resetZenBlockErrs()
 				}
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
@@ -3266,11 +3421,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				if proxy == "" {
 					laneEscalate(lane, realModel) // direct is flagged: give the lane an exit
 				}
-				laneBlock(lane)
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenFreeTierErr() {
 					acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
@@ -3278,7 +3430,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					resetZenFreeTierErrs()
 				}
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 			}
@@ -3299,7 +3451,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
 			noteExitOK(usedProxy)
-		laneTouch(lane, usedProxy)
+			laneTouch(lane, usedProxy)
 		}
 		break
 	}
@@ -3386,15 +3538,25 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var written int64
 	if isStream && resp.StatusCode == http.StatusOK {
 		if endpoint == "/responses" {
-			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
-			resp.Body.Close()
-			if os.Getenv("ZEN_DUMP") != "" {
-				rp := fmt.Sprintf("/tmp/zenraw_%d.sse", time.Now().UnixNano())
-				os.WriteFile(rp, rb, 0o644)
-				acclog.Printf("ZEN_DUMP raw responses SSE %d bytes -> %s", len(rb), rp)
+			if nudgeEnabled(model) && toolsOffered(body) {
+				// nudge needs the full turn before deciding: buffer, same
+				// as before. without tools offered, stream live below.
+				rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
+				resp.Body.Close()
+				if os.Getenv("ZEN_DUMP") != "" {
+					rp := fmt.Sprintf("/tmp/zenraw_%d.sse", time.Now().UnixNano())
+					os.WriteFile(rp, rb, 0o644)
+					acclog.Printf("ZEN_DUMP raw responses SSE %d bytes -> %s", len(rb), rp)
+				}
+				rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model, lane)
+				written, prompT, compT = streamResponsesToChat(w, rb, tnames)
+			} else {
+				// live: convert + flush each upstream chunk, first byte out
+				// as soon as zen sends it. client disconnect aborts the
+				// upstream read so the exit stops working for nobody.
+				written, prompT, compT = streamResponsesLive(r.Context(), w, resp.Body, tnames)
+				resp.Body.Close()
 			}
-			rb = p.maybeNudgeResponses(r, target, body, rb, &sessionID, model, lane)
-			written, prompT, compT = streamResponsesToChat(w, rb, tnames)
 		} else if wrapBack {
 			// responses client on a chat model with stream=true: fold the
 			// upstream chat SSE to one chat body, wrap to responses shape,
@@ -3411,6 +3573,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			buf := make([]byte, 4096)
 			var carry []byte
 			for {
+				// client gone: close upstream, stop copying orphan bytes.
+				if r.Context().Err() != nil {
+					resp.Body.Close()
+					break
+				}
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
 					w.Write(buf[:n])

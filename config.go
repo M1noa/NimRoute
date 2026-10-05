@@ -106,6 +106,9 @@ func (t *translateConfig) restoreToolNames() bool {
 	return *t.RestoreToolNameCase
 }
 
+// boolPtr boxes a bool for default-true/false *bool config knobs.
+func boolPtr(b bool) *bool { return &b }
+
 type zenConfig struct {
 	Enabled          bool     `yaml:"enabled"`
 	AlwaysProxy      bool     `yaml:"always_proxy"`
@@ -115,8 +118,18 @@ type zenConfig struct {
 	MaxResponseMs    int      `yaml:"max_response_ms"`
 	PoolSize         int      `yaml:"pool_size"`
 	Lanes            int      `yaml:"lanes"`
-	LaneTTLMinutes   int      `yaml:"lane_ttl_minutes"`
-	LaneCooldownSecs int      `yaml:"lane_cooldown_secs"`
+	// lane identity modes, independently toggleable. shared pre-opens
+	// lanes-count lanes and spreads requests across them; hdr pins an
+	// x-session-id header to a lane (converting an idle shared lane when
+	// full); convo pins a conversation hash from the second sighting.
+	// convo is buggy (hash drifts as history grows, one-shots pin lanes)
+	// and off by default: shared spreads better. all off falls back to
+	// shared with a warning.
+	LaneHdr          *bool `yaml:"lane_hdr"`
+	LaneConvo        *bool `yaml:"lane_convo"`
+	LaneShared       *bool `yaml:"lane_shared"`
+	LaneTTLMinutes   int   `yaml:"lane_ttl_minutes"`
+	LaneCooldownSecs int   `yaml:"lane_cooldown_secs"`
 	// SessionIdleMinutes drops lanes idle past this (minutes) on the pool
 	// sweep, clearing the session hash/id from cache. lane_ttl_minutes
 	// stays the hard cap. 0 disables (ttl only).
@@ -156,7 +169,7 @@ type zenConfig struct {
 	// ZenTimeoutSecs caps a proxied upstream request. 0 = 120.
 	// HedgeAfterMs fires a second request on another exit when no first
 	// byte arrives within this long. first response wins. -1 disables.
-	HedgeAfterMs int `yaml:"hedge_after_ms"`
+	HedgeAfterMs   int `yaml:"hedge_after_ms"`
 	ZenTimeoutSecs int `yaml:"zen_timeout_secs"`
 	// ZenDirectTimeoutSecs caps a direct upstream request. 0 = 300.
 	ZenDirectTimeoutSecs int `yaml:"zen_direct_timeout_secs"`
@@ -326,6 +339,9 @@ func defaultConfig() appConfig {
 			RefreshIntervalMinutes: 60,
 			RetryBackoffMs:         150,
 			RetryBackoffMaxMs:      300,
+			LaneHdr:                boolPtr(true),
+			LaneConvo:              boolPtr(false),
+			LaneShared:             boolPtr(true),
 		},
 		Status: statusConfig{
 			ShowKeys:           true,

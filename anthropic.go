@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -1024,6 +1025,70 @@ func (s *respStreamer) feed(body []byte, last bool) {
 	}
 }
 
+// streamResponsesLiveAnthropic converts an upstream /responses SSE body to
+// Anthropic events while reading: preamble + first delta flush on zen's
+// first byte, so client TTFT is upstream TTFT. ctx aborts the read and the
+// upstream body close cancels the in-flight request.
+func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
+	fl, _ := w.(http.Flusher)
+	s := &respStreamer{w: w, clientModel: clientModel, tnames: tnames, toolIdx: map[string]int{}, textIdx: -1}
+	if fl != nil {
+		s.fl = fl
+		s.hasFlusher = true
+	}
+
+	msgID := "msg_" + randHex(24)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	s.written += writeSSE(w, "message_start", preamble)
+	s.written += writeSSE(w, "ping", `{"type":"ping"}`)
+	s.flush()
+
+	var carry []byte
+	buf := make([]byte, 4096)
+	done := false
+	for !done {
+		if ctx.Err() != nil {
+			return s.written, s.promptT, s.compT
+		}
+		n, err := body.Read(buf)
+		if n > 0 {
+			blk := buf[:n]
+			if len(carry) > 0 {
+				blk = append(carry, buf[:n]...)
+				carry = nil
+			}
+			if i := bytes.LastIndexByte(blk, '\n'); i >= 0 {
+				s.feed(blk[:i+1], false)
+				if s.sentStop {
+					done = true
+				} else if i+1 < len(blk) {
+					carry = append(carry[:0], blk[i+1:]...)
+				}
+			} else {
+				carry = append(carry[:0], blk...)
+				if len(carry) > 65536 {
+					s.feed(carry, false)
+					carry = nil
+					if s.sentStop {
+						done = true
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !done {
+		if len(carry) > 0 {
+			s.feed(append(carry, '\n'), true)
+		} else {
+			s.finish()
+		}
+	}
+	return s.written, s.promptT, s.compT
+}
+
 // streamResponsesMerged emits several buffered /responses SSE bodies as one
 // Anthropic turn: one preamble, continuous block indices, one stop.
 func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
@@ -1408,7 +1473,11 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	if used, limit := p.semStats(); used >= limit {
 		acclog.Printf("%s ... all %d slots busy, queueing", reqID, limit)
 	}
-	p.semAcquire()
+	if !p.semAcquire(r.Context()) {
+		acclog.Printf("!! %s client disconnected while queueing", reqID)
+		writeAnthropicError(w, 499, "api_error", "client disconnected")
+		return
+	}
 	p.concurrent.Add(1)
 	defer func() {
 		p.concurrent.Add(-1)
@@ -1481,7 +1550,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		fwd.Set("Accept", "text/event-stream")
 	}
 
-	u, upErr := p.callUpstream(r.Method, target, oaiBody, fwd, upstreamModel, r.RemoteAddr)
+	u, upErr := p.callUpstream(r.Context(), r.Method, target, oaiBody, fwd, upstreamModel, r.RemoteAddr)
 	elapsed := time.Since(start)
 
 	if u == nil {
@@ -1804,30 +1873,22 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		lastProxy := ""
 		rotating := true
 		for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
-			if !laneHealthy(lane) {
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-				} else if zenRetries > 0 {
-					if maybeRefreshStalePool() {
-						sessionID = laneSession(lane)
-					} else if wait := laneWait(); wait > 0 {
-						acclog.Printf("  opencode all lanes cooling, waiting %v (retry %d/%d)", wait, zenRetries, zenRetryLabel())
-						time.Sleep(wait)
-					}
-				}
-			} else {
-				laneGate(lane)
+			// pace only: lanes never cool, a limit rotates the exit instead.
+			if zenRetries > 0 && maybeRefreshStalePool(lane) {
+				sessionID = laneSession(lane)
+			}
+			laneGate(r.Context(), lane)
+			// client gone while pacing: stop before burning an exit.
+			if r.Context().Err() != nil {
+				return nil
 			}
 			proxy := ""
 			if zenRetries == 0 {
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && cfg().Zen.AlwaysProxy {
-					if nl := laneFailover(lane); nl != nil {
-						lane = nl
-						sessionID = laneSession(lane)
-						proxy = laneProxyFor(lane, zenModel)
-					}
+					lane = laneFailover(lane)
+					sessionID = laneSession(lane)
+					proxy = laneProxyFor(lane, zenModel)
 					if proxy == "" {
 						return nil
 					}
@@ -1837,11 +1898,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			} else if rotating {
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && cfg().Zen.AlwaysProxy {
-					if nl := laneFailover(lane); nl != nil {
-						lane = nl
-						sessionID = laneSession(lane)
-						proxy = laneProxyFor(lane, zenModel)
-					}
+					lane = laneFailover(lane)
+					sessionID = laneSession(lane)
+					proxy = laneProxyFor(lane, zenModel)
 				}
 				if proxy == "" && cfg().Zen.AlwaysProxy {
 					continue
@@ -1853,7 +1912,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				proxy = lastProxy
 				cl = zenClient(proxy)
 			}
-			req, err := http.NewRequest(r.Method, target, bytes.NewReader(body))
+			req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 			if err != nil {
 				return nil
 			}
@@ -1875,19 +1934,17 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				GotFirstResponseByte: func() { firstByteAt = time.Now() },
 			}))
 			sendStart := time.Now()
-			up, err, _ := hedgedDo(
-				func() (*http.Response, error) { return cl.Do(traced) },
-				func() (*http.Response, error) {
-					hl := lane
-					if nl := laneFailover(lane); nl != nil {
-						hl = nl
-					}
+			up, err, _ := hedgedDo(r.Context(),
+				func(pctx context.Context) (*http.Response, error) { return cl.Do(traced.WithContext(pctx)) },
+				func(hctx context.Context) (*http.Response, error) {
+					hl := laneFailover(lane)
 					hp := laneProxyFor(hl, zenModel)
 					if hp == "" || hp == proxy {
-						select {}
+						<-hctx.Done() // no distinct exit: wait to be cancelled
+						return nil, hctx.Err()
 					}
 					hcl := zenClient(hp)
-					hreq, herr := http.NewRequest(r.Method, target, bytes.NewReader(body))
+					hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
 					if herr != nil {
 						return nil, herr
 					}
@@ -1899,7 +1956,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					return hup, huerr
 				}, hedgeAfter)
 			if err == nil && !firstByteAt.IsZero() {
-				if fb := firstByteAt.Sub(sendStart); fb > 6*time.Second {
+				fb := firstByteAt.Sub(sendStart)
+				noteExitRTT(proxy, float64(fb.Milliseconds()))
+				if fb > 6*time.Second {
 					noteExitSlow(proxy)
 				}
 			}
@@ -1913,7 +1972,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					resetZenNetworkErrors()
 				}
 				if !zenLastRetry(zenRetries) {
-					zenBackoff(zenRetries)
+					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
 				return nil
@@ -1921,19 +1980,16 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				up.Body.Close()
-				acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, cooling lane",
+				acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
 					up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
 				noteExit429(proxy)
-			laneCool(lane)
-				if nl := laneFailover(lane); nl != nil {
-					lane = nl
-					sessionID = laneSession(lane)
-				}
+				lane = laneFailover(lane)
+				sessionID = laneRotate(lane, zenModel)
 				rotating = true
-				zenBackoff(zenRetries)
+				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
 
@@ -1945,18 +2001,15 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, errSnippet(eb, 160))
 					rotating = false
 					if !zenLastRetry(zenRetries) {
-						zenBackoff(zenRetries)
+						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
 				}
 				if zenGeoBlocked(eb) {
 					logZenBlocked("geo", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
-					laneCoolSoft(lane)
-					if nl := laneFailover(lane); nl != nil {
-						lane = nl
-						sessionID = laneSession(lane)
-					}
+					lane = laneFailover(lane)
+					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenGeoErr() {
 						acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
@@ -1964,18 +2017,15 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						resetZenGeoErrs()
 					}
 					if !zenLastRetry(zenRetries) {
-						zenBackoff(zenRetries)
+						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
 				}
 				if zenUserBlocked(eb) {
 					logZenBlocked("user", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
-					laneBlock(lane)
-					if nl := laneFailover(lane); nl != nil {
-						lane = nl
-						sessionID = laneSession(lane)
-					}
+					lane = laneFailover(lane)
+					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenBlockErr() {
 						acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
@@ -1983,7 +2033,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						resetZenBlockErrs()
 					}
 					if !zenLastRetry(zenRetries) {
-						zenBackoff(zenRetries)
+						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
 				}
@@ -1995,11 +2045,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					if proxy == "" {
 						laneEscalate(lane, zenModel) // direct is flagged: give the lane an exit
 					}
-					laneBlock(lane)
-					if nl := laneFailover(lane); nl != nil {
-						lane = nl
-						sessionID = laneSession(lane)
-					}
+					lane = laneFailover(lane)
+					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenFreeTierErr() {
 						acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
@@ -2007,7 +2054,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						resetZenFreeTierErrs()
 					}
 					if !zenLastRetry(zenRetries) {
-						zenBackoff(zenRetries)
+						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
 				}
@@ -2019,7 +2066,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
 				noteExitOK(proxy)
-			laneTouch(lane, proxy)
+				laneTouch(lane, proxy)
 			}
 			return up
 		}
@@ -2049,37 +2096,46 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 
 	if isStream {
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		var written int64
 		var promptT, compT int
-		if isResponses {
-			// nudge_no_tools (models.params in config.yml): when the
-			// client offered tools but the model ended with none, refetch
-			// once on the same session with a nudge and stream both bodies
-			// as one turn. If the retry also calls nothing, the turn ends.
-			bodies := [][]byte{rb}
-			post := func(nb []byte) []byte {
-				nresp := zenPost(nb, true, "nudge")
-				if nresp == nil {
-					return nil
-				}
-				defer nresp.Body.Close()
-				if nresp.StatusCode != http.StatusOK {
-					return nil
-				}
-				nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
-				return nb2
-			}
-			if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
-				bodies = append(bodies, retry)
-			}
-			written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
+		if isResponses && (!nudgeEnabled(upstreamModel) || !toolsOffered(oaiBody)) {
+			// live: stream each upstream chunk as it arrives, full-turn
+			// TTFT instead of buffered. nudge needs the whole turn, so it
+			// keeps the buffered path below.
+			written, promptT, compT = streamResponsesLiveAnthropic(r.Context(), w, resp.Body, clientModel, tnames)
+			resp.Body.Close()
 		} else {
-			written, promptT, compT = streamAnthropic(w, rb, clientModel, tnames)
+			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
+			resp.Body.Close()
+			if isResponses {
+				// nudge_no_tools (models.params in config.yml): when the
+				// client offered tools but the model ended with none, refetch
+				// once on the same session with a nudge and stream both bodies
+				// as one turn. If the retry also calls nothing, the turn ends.
+				bodies := [][]byte{rb}
+				post := func(nb []byte) []byte {
+					nresp := zenPost(nb, true, "nudge")
+					if nresp == nil {
+						return nil
+					}
+					defer nresp.Body.Close()
+					if nresp.StatusCode != http.StatusOK {
+						return nil
+					}
+					nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
+					return nb2
+				}
+				if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
+					bodies = append(bodies, retry)
+				}
+				written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
+			} else {
+				written, promptT, compT = streamAnthropic(w, rb, clientModel, tnames)
+			}
 		}
 
 		logUsage(UsageRecord{

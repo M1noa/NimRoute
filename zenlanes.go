@@ -1,12 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"math/rand"
+	"io"
 	"net/http"
-	"net/http/httptrace"
 	"sort"
 	"strings"
 	"sync"
@@ -18,18 +18,21 @@ import (
 // zen lanes: pinned proxy+session pairs so concurrent conversations spread
 // across exit ips instead of hammering one into 429s. lane identity falls
 // back down a chain: x-session-id header -> conversation hash (first user
-// + last assistant block) -> shared lru pool.
+// + last assistant block) -> shared lru pool. there is no waiting: a dead
+// exit rotates to a fresh proxy+session immediately, never a cooldown.
 
 type zenLane struct {
 	id        string // lane key (header value, convo hash, or shared-n)
-	session   string // stable ses_* for this lane, minted once
+	session   string // ses_* for this lane, re-minted on every rotation
 	proxy     string // pinned exit
 	country   string
 	lastUsed  time.Time
-	cooldown  time.Time // 429 backoff until
-	fails     int       // consecutive 429s, drives backoff
 	requests  int
 	rateLimit int
+	// limitedSince stamps the first of a consecutive run of limits; a
+	// success clears it. a run lasting past stale_pool_secs marks the
+	// pool stale (refresh + session rotation).
+	limitedSince time.Time
 	// lastSend is the pacing clock: a lane waits lane_min_gap_ms between
 	// sends so one exit never sees a burst from a single conversation.
 	lastSend time.Time
@@ -43,7 +46,6 @@ type laneStatus struct {
 	Proxy     string `json:"proxy"`
 	Country   string `json:"country"`
 	LastUsed  string `json:"last_used_ago"`
-	Cooldown  string `json:"cooldown_remaining,omitempty"`
 	Requests  int    `json:"requests"`
 	RateLimit int    `json:"rate_limited"`
 }
@@ -263,54 +265,78 @@ func sweepBurns() {
 	}
 }
 
-// firstByteDo runs do() with a trace recording when the first response
-// byte arrives. returns the response plus first-byte latency (0 on error
-// before headers). callers use it for slow-strike accounting.
-func firstByteDo(do func(*httptrace.ClientTrace) (*http.Response, error)) (*http.Response, error, time.Duration) {
-	var firstByte time.Time
-	start := time.Now()
-	trace := &httptrace.ClientTrace{
-		GotFirstResponseByte: func() { firstByte = time.Now() },
-	}
-	resp, err := do(trace)
-	if err != nil || firstByte.IsZero() {
-		return resp, err, 0
-	}
-	return resp, err, firstByte.Sub(start)
+// bodyCancelCloser cancels a hedged side's request context when its
+// response body is closed: the winner keeps streaming after hedgedDo
+// returns, and the context is still released.
+type bodyCancelCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
 }
+
+func (b bodyCancelCloser) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
+// zenSideResult is one hedged side's outcome.
+type zenSideResult struct {
+	resp *http.Response
+	err  error
+}
+
+// zenSide runs send under its own cancellable context and returns the
+// cancel immediately, so hedgedDo can kill a losing side mid-flight. the
+// response body cancels the context on close, so a winning side streams
+// after zenSide returns and the context is freed when the caller is done.
+func zenSide(ctx context.Context, send func(context.Context) (*http.Response, error)) (context.CancelFunc, <-chan zenSideResult) {
+	pctx, pcancel := context.WithCancel(ctx)
+	ch := make(chan zenSideResult, 1)
+	go func() {
+		resp, err := send(pctx)
+		if err != nil || resp == nil || resp.Body == nil {
+			pcancel() // nothing will own the context: release now
+		} else {
+			resp.Body = bodyCancelCloser{resp.Body, pcancel}
+		}
+		ch <- zenSideResult{resp, err}
+	}()
+	return pcancel, ch
+}
+
 // fires hedge concurrently: first completed response wins, the loser is
-// cancelled (body closed). chat completions are read-only from our side,
+// cancelled (context + body). chat completions are read-only from our side,
 // so double-send is safe. returns which side won (true = hedge).
-func hedgedDo(primary, hedge func() (*http.Response, error), hedgeAfter time.Duration) (*http.Response, error, bool) {
+// both sides derive from ctx, so a client disconnect cancels the upstream
+// request instead of burning an exit on output nobody reads.
+func hedgedDo(ctx context.Context, primary, hedge func(context.Context) (*http.Response, error), hedgeAfter time.Duration) (*http.Response, error, bool) {
 	if hedgeAfter <= 0 || hedge == nil {
-		resp, err := primary()
+		resp, err := primary(ctx)
 		return resp, err, false
 	}
-	type result struct {
-		resp *http.Response
-		err  error
-		hed  bool
-	}
-	primaryCh := make(chan result, 1)
-	go func() {
-		resp, err := primary()
-		primaryCh <- result{resp, err, false}
-	}()
+	pcancel, primaryCh := zenSide(ctx, primary)
 	timer := time.NewTimer(hedgeAfter)
 	defer timer.Stop()
 	select {
 	case r := <-primaryCh:
+		// winner: its context dies with its body (bodyCancelCloser).
 		return r.resp, r.err, false
 	case <-timer.C:
+	case <-ctx.Done():
+		// client gone before the hedge fired: cancel the primary and
+		// return immediately so no orphan request keeps running.
+		pcancel()
+		if r := <-primaryCh; r.resp != nil && r.resp.Body != nil {
+			r.resp.Body.Close()
+		}
+		return nil, ctx.Err(), false
 	}
-	hedgeCh := make(chan result, 1)
-	go func() {
-		resp, err := hedge()
-		hedgeCh <- result{resp, err, true}
-	}()
+	hcancel, hedgeCh := zenSide(ctx, hedge)
 	select {
 	case r := <-primaryCh:
-		// loser still running: close its body when it lands to free the conn.
+		// loser still running: cancel it now, close its body when it
+		// lands to free the conn. winner keeps its context via its body.
+		hcancel()
 		go func() {
 			if hr := <-hedgeCh; hr.resp != nil && hr.resp.Body != nil {
 				hr.resp.Body.Close()
@@ -318,12 +344,27 @@ func hedgedDo(primary, hedge func() (*http.Response, error), hedgeAfter time.Dur
 		}()
 		return r.resp, r.err, false
 	case r := <-hedgeCh:
+		pcancel()
 		go func() {
 			if pr := <-primaryCh; pr.resp != nil && pr.resp.Body != nil {
 				pr.resp.Body.Close()
 			}
 		}()
 		return r.resp, r.err, true
+	case <-ctx.Done():
+		pcancel()
+		hcancel()
+		go func() {
+			if pr := <-primaryCh; pr.resp != nil && pr.resp.Body != nil {
+				pr.resp.Body.Close()
+			}
+		}()
+		go func() {
+			if hr := <-hedgeCh; hr.resp != nil && hr.resp.Body != nil {
+				hr.resp.Body.Close()
+			}
+		}()
+		return nil, ctx.Err(), false
 	}
 }
 
@@ -339,13 +380,6 @@ func laneTTL() time.Duration {
 		return time.Duration(m) * time.Minute
 	}
 	return 30 * time.Minute
-}
-
-func laneCooldownBase() time.Duration {
-	if s := cfg().Zen.LaneCooldownSecs; s > 0 {
-		return time.Duration(s) * time.Second
-	}
-	return time.Minute
 }
 
 // sessionIdleTTL is the idle time after which a lane's session hash/id is
@@ -375,20 +409,6 @@ func laneRelease() time.Duration {
 	return time.Duration(cfg().Zen.LaneReleaseSecs) * time.Second
 }
 
-func probeTimeout() time.Duration {
-	if ms := cfg().Zen.ProbeTimeoutMs; ms > 0 {
-		return time.Duration(ms) * time.Millisecond
-	}
-	return time.Second
-}
-
-func raceTimeout() time.Duration {
-	if ms := cfg().Zen.RaceTimeoutMs; ms > 0 {
-		return time.Duration(ms) * time.Millisecond
-	}
-	return 3 * time.Second
-}
-
 // zenMaxRetries caps zen upstream attempts per request (loop bound is
 // attempts, log labels stay /N on retries).
 func zenMaxRetries() int {
@@ -407,11 +427,12 @@ func zenRetryLabel() int { return zenMaxRetries() - 1 }
 func zenLastRetry(retry int) bool { return retry+1 >= zenMaxRetries() }
 
 // laneGate blocks until the lane may send: pacing gap since its previous
-// send, plus any residual cooldown. the slot is claimed under the lane lock
+// send only, never a cooldown. the slot is claimed under the lane lock
 // before sleeping, so concurrent requests are spaced one gap apart instead
 // of all waking together and bursting the same exit. wait is capped so a
-// lane never stalls a request indefinitely.
-func laneGate(l *zenLane) time.Duration {
+// lane never stalls a request indefinitely. ctx-aware: a client disconnect
+// aborts the pacing sleep instead of blocking shutdown.
+func laneGate(ctx context.Context, l *zenLane) time.Duration {
 	now := time.Now()
 	maxWait := 10 * time.Second
 	if s := cfg().Zen.LaneGateMaxSecs; s > 0 {
@@ -424,9 +445,6 @@ func laneGate(l *zenLane) time.Duration {
 			wait = w
 		}
 	}
-	if cd := l.cooldown.Sub(now); cd > wait {
-		wait = cd
-	}
 	if wait > maxWait {
 		wait = maxWait
 	}
@@ -435,7 +453,10 @@ func laneGate(l *zenLane) time.Duration {
 	l.lastSend = now.Add(wait)
 	lanesMu.Unlock()
 	if wait > 0 {
-		time.Sleep(wait)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+		}
 	}
 	return wait
 }
@@ -518,17 +539,30 @@ func contentText(c any) string {
 // then the least-recently-used healthy lane (shared pool fallback).
 // convo-hash lanes pin only from the second sighting: single-turn
 // one-shots (title-gen) fall to the shared pool and never pin a lane.
+// hdr/convo/convo modes toggle independently in config; all off (or header
+// with shared off) falls back to shared with a logged warning.
+//
+// shared lanes are pre-opened up to the cap on startup (ensureSharedLanes),
+// so a cold start does not serialize on lane creation. an hdr or convo key
+// that arrives with a full table converts the idlest shared lane instead
+// of piling onto one fallback lane.
 func laneFor(headerSession string, body []byte) *zenLane {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
+	wantHdr, wantConvo, wantShared := laneModes()
+	if !wantHdr && !wantConvo && !wantShared {
+		wantShared = true // all off: spread anyway, never fail a request
+	}
 	key := ""
-	if headerSession != "" {
+	if headerSession != "" && wantHdr {
 		key = "hdr:" + headerSession
-	} else if h := convoHash(body); h != "" {
-		if seenConvoLocked(h) {
-			key = h
-		} else {
-			noteConvoLocked(h)
+	} else if wantConvo {
+		if h := convoHash(body); h != "" {
+			if seenConvoLocked(h) {
+				key = h
+			} else {
+				noteConvoLocked(h)
+			}
 		}
 	}
 	if key != "" {
@@ -540,10 +574,88 @@ func laneFor(headerSession string, body []byte) *zenLane {
 			lanes[key] = l
 			return l
 		}
-		// table full: fall through to shared pool rather than evict a
-		// pinned conversation mid-flight.
+		// table full: convert the idlest shared lane into this key so a
+		// burst of new conversations spreads instead of piling onto one
+		// fallback lane (or evicting a pinned one mid-flight).
+		if convertSharedLocked(key) != nil {
+			return lanes[key]
+		}
+	}
+	if !wantShared {
+		// shared off but nothing else matched (e.g. header with hdr off):
+		// create a throwaway lane, capped so one-shots cannot grow the
+		// table past cap.
+		if len(lanes) < laneCap() {
+			l := &zenLane{id: "shared", session: zenSession(), lastUsed: time.Now()}
+			k := "shared:" + l.session[len(l.session)-6:]
+			l.id = shortLaneID(k)
+			lanes[k] = l
+			return l
+		}
 	}
 	return sharedLaneLocked()
+}
+
+// laneModes reads the three lane identity toggles. nil (absent key) means
+// the default: hdr on, convo off (buggy), shared on.
+func laneModes() (hdr, convo, shared bool) {
+	c := cfg().Zen
+	hdr, convo, shared = true, false, true
+	if c.LaneHdr != nil {
+		hdr = *c.LaneHdr
+	}
+	if c.LaneConvo != nil {
+		convo = *c.LaneConvo
+	}
+	if c.LaneShared != nil {
+		shared = *c.LaneShared
+	}
+	return hdr, convo, shared
+}
+
+// convertSharedLocked renames the idlest shared lane to key, minting a fresh
+// session for the new identity. caller holds lanesMu. nil when no shared
+// lane exists to convert.
+func convertSharedLocked(key string) *zenLane {
+	var victimKey string
+	var victim *zenLane
+	for k, l := range lanes {
+		if !strings.HasPrefix(k, "shared:") {
+			continue
+		}
+		if victim == nil || l.lastUsed.Before(victim.lastUsed) {
+			victim, victimKey = l, k
+		}
+	}
+	if victim == nil {
+		return nil
+	}
+	delete(lanes, victimKey)
+	victim.session = zenSession()
+	victim.proxy = ""
+	victim.limitedSince = time.Time{}
+	victim.lastUsed = time.Now()
+	victim.id = shortLaneID(key)
+	lanes[key] = victim
+	return victim
+}
+
+// ensureSharedLanes pre-opens shared lanes up to the cap so a cold start
+// does not serialize early requests on lane creation + exit races. runs
+// once at startup after the first pool refresh.
+func ensureSharedLanes() {
+	_, _, wantShared := laneModes()
+	if !wantShared {
+		return
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for len(lanes) < laneCap() {
+		l := &zenLane{id: "shared", session: zenSession(), lastUsed: time.Now()}
+		k := "shared:" + l.session[len(l.session)-6:]
+		l.id = shortLaneID(k)
+		lanes[k] = l
+	}
 }
 
 func shortLaneID(key string) string {
@@ -553,8 +665,9 @@ func shortLaneID(key string) string {
 	return key[:8] + "..." + key[len(key)-4:]
 }
 
-// sharedLaneLocked picks the lru non-cooling lane, creating shared-n slots
-// up to cap. caller holds lanesMu.
+// sharedLaneLocked picks the lru shared lane, creating shared-n slots up
+// to cap. caller holds lanesMu. no health filtering: lanes never cool, a
+// limit rotates the exit instead of blocking the lane.
 func sharedLaneLocked() *zenLane {
 	var cands []*zenLane
 	for k, l := range lanes {
@@ -564,10 +677,8 @@ func sharedLaneLocked() *zenLane {
 	}
 	now := time.Now()
 	sort.Slice(cands, func(i, j int) bool { return cands[i].lastUsed.Before(cands[j].lastUsed) })
-	for _, l := range cands {
-		if now.After(l.cooldown) {
-			return l
-		}
+	if len(cands) > 0 {
+		return cands[0]
 	}
 	if len(lanes) < laneCap() {
 		l := &zenLane{id: "shared", session: zenSession(), lastUsed: now}
@@ -576,11 +687,11 @@ func sharedLaneLocked() *zenLane {
 		lanes[k] = l
 		return l
 	}
-	// all lanes cooling: return the one whose cooldown ends first so the
-	// caller waits on the shortest backoff rather than failing outright.
+	// table full of pinned lanes: reuse the stalest one so the request
+	// goes out on a fresh rotation instead of failing.
 	var best *zenLane
 	for _, l := range lanes {
-		if best == nil || l.cooldown.Before(best.cooldown) {
+		if best == nil || l.lastUsed.Before(best.lastUsed) {
 			best = l
 		}
 	}
@@ -592,46 +703,23 @@ func sharedLaneLocked() *zenLane {
 	return best
 }
 
-// laneCool marks a 429 on the lane: exponential backoff, capped at 10m.
-// The pinned exit is forgotten so the lane picks a fresh one when its
-// cooldown lapses, instead of walking straight back into the same limit.
-func laneCool(l *zenLane) {
+// laneRotate swaps the lane onto a fresh exit + session after any limit or
+// identity block. the old exit keeps serving other lanes; this lane never
+// waits, it just moves. stamps limitedSince so a run of consecutive limits
+// past stale_pool_secs trips the stale-pool refresh. returns the new
+// session id.
+func laneRotate(l *zenLane, model string) string {
 	lanesMu.Lock()
-	l.fails++
 	l.rateLimit++
-	// cap before shifting: an unbounded fails count overflows the duration
-	// after ~31 doublings, producing a negative (past) cooldown and no
-	// backoff at all — the exact opposite of what 429 handling needs.
-	if l.fails > 8 {
-		l.fails = 8
+	if l.limitedSince.IsZero() {
+		l.limitedSince = time.Now()
 	}
-	d := laneCooldownBase() << (l.fails - 1)
-	if d > 10*time.Minute {
-		d = 10 * time.Minute
-	}
-	l.cooldown = time.Now().Add(d)
-	l.proxy = ""
+	l.session = zenSession()
+	l.lastUsed = time.Now()
 	lanesMu.Unlock()
+	laneReproxy(l, model)
 	noteRateLimit()
-}
-
-// laneCoolSoft records an exit-specific failure (geo-block) without the
-// full 429 backoff: the lane fails over once, but stays usable.
-func laneCoolSoft(l *zenLane) {
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	l.rateLimit++
-}
-
-// laneBlock marks an identity-level block (free-tier / user-blocked) on
-// the lane. those are per-exit, not a request-rate signal, so the lane only
-// forgets the exit and fails over: no long cooldown, since the next exit
-// usually works.
-func laneBlock(l *zenLane) {
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	l.proxy = ""
-	l.cooldown = time.Now().Add(3 * time.Second)
+	return laneSession(l)
 }
 
 // noteRateLimit counts lanes rate-limited since the last pool refresh and
@@ -666,21 +754,13 @@ var (
 	poolRefresh429s  int
 )
 
-// laneHealthy reports whether the lane may take a request right now.
-func laneHealthy(l *zenLane) bool {
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	return time.Now().After(l.cooldown)
-}
-
-// laneTouch records a successful use: clears backoff, stamps last-used,
-// pins the working proxy.
+// laneTouch records a successful use: stamps last-used, clears the limit
+// run, pins the working proxy.
 func laneTouch(l *zenLane, proxy string) {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	l.lastUsed = time.Now()
-	l.fails = 0
-	l.cooldown = time.Time{}
+	l.limitedSince = time.Time{}
 	l.requests++
 	if proxy != "" {
 		l.proxy = proxy
@@ -716,10 +796,8 @@ func pickLaneProxyFor(model string) string {
 		if len(free) == 0 {
 			return ""
 		}
-		if w := raceProbe(free, raceTimeout()); w != "" {
-			return w
-		}
-		return free[rand.Intn(len(free))]
+		sort.Slice(free, func(i, j int) bool { return proxyWeight(free[i]) > proxyWeight(free[j]) })
+		return sampleWeighted(free, 1)[0]
 	}
 
 	zenProxiesMu.RLock()
@@ -730,7 +808,8 @@ func pickLaneProxyFor(model string) string {
 	}
 	// untaken, unburned exits, fastest+most-reliable first. weighting
 	// (not strict quartiles) keeps the whole pool in play while fast
-	// exits win most draws.
+	// exits win most draws. no hot-path race: pool entries are verified
+	// on refresh, and verified-on-success keeps the set fresh.
 	var cands []string
 	for _, p := range pool {
 		if taken[p] || exitBurned(p, model) || exitLongBurned(p) {
@@ -742,9 +821,6 @@ func pickLaneProxyFor(model string) string {
 		return ""
 	}
 	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
-	if w := raceProbe(sampleWeighted(cands, 3), raceTimeout()); w != "" {
-		return w
-	}
 	return sampleWeighted(cands, 1)[0]
 }
 
@@ -793,30 +869,15 @@ func laneEscalate(l *zenLane, model string) string {
 	return p
 }
 
-// laneWait returns how long until the soonest lane leaves cooldown,
-// clamped so one stuck lane can't stall a request.
-func laneWait() time.Duration {
+// laneStaleRun reports how long the lane's current consecutive limit run
+// has lasted. 0 means the lane is not in a run.
+func laneStaleRun(l *zenLane) time.Duration {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
-	now := time.Now()
-	var soonest time.Time
-	for _, l := range lanes {
-		if l.cooldown.After(now) && (soonest.IsZero() || l.cooldown.Before(soonest)) {
-			soonest = l.cooldown
-		}
-	}
-	if soonest.IsZero() {
+	if l.limitedSince.IsZero() {
 		return 0
 	}
-	d := soonest.Sub(now)
-	maxWait := 3 * time.Second
-	if s := cfg().Zen.LaneWaitMaxSecs; s > 0 {
-		maxWait = time.Duration(s) * time.Second
-	}
-	if d > maxWait {
-		return maxWait
-	}
-	return d
+	return time.Since(l.limitedSince)
 }
 
 // lastZenSuccess tracks the last working zen response, so the retry loops
@@ -842,10 +903,10 @@ func zenStaleSince() time.Duration {
 	return time.Since(zenSuccessAt)
 }
 
-// maybeRefreshStalePool fires a pool refresh + session rotation when every
-// lane has been cooling with no success for 15s: the pool/sessions are
-// stale, not just busy. returns true when it fired.
-func maybeRefreshStalePool() bool {
+// maybeRefreshStalePool fires a pool refresh + session rotation when no
+// request has succeeded for 15s and this lane's limit run is that old:
+// the pool/sessions are stale, not just busy. returns true when it fired.
+func maybeRefreshStalePool(l *zenLane) bool {
 	stale := 15 * time.Second
 	if s := cfg().Zen.StalePoolSecs; s > 0 {
 		stale = time.Duration(s) * time.Second
@@ -853,34 +914,22 @@ func maybeRefreshStalePool() bool {
 	if zenStaleSince() < stale {
 		return false
 	}
-	lanesMu.Lock()
-	now := time.Now()
-	allCooling := len(lanes) > 0
-	for _, l := range lanes {
-		if now.After(l.cooldown) {
-			allCooling = false
-			break
-		}
-	}
-	lanesMu.Unlock()
-	if !allCooling {
+	if laneStaleRun(l) < stale {
 		return false
 	}
-	acclog.Printf("  zen: all lanes limited 15s+ with no success, refreshing pool + sessions")
+	acclog.Printf("  zen: lane %s limited %v+ with no success, refreshing pool + sessions", l.id, stale)
 	refreshZenProxiesAsync()
 	resetStaleLanes()
 	return true
 }
 
-// resetStaleLanes clears cooldowns and mints fresh sessions after a stale
-// refresh, so retry loops re-enter on new sessions instead of waiting out
-// dead backoffs.
+// resetStaleLanes mints fresh sessions and drops pinned exits after a stale
+// refresh, so retry loops re-enter on new sessions instead of dead ones.
 func resetStaleLanes() {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	for _, l := range lanes {
-		l.cooldown = time.Time{}
-		l.fails = 0
+		l.limitedSince = time.Time{}
 		l.proxy = ""
 		l.session = zenSession()
 	}
@@ -998,9 +1047,6 @@ func laneSnapshot() []laneStatus {
 			LastUsed: now.Sub(l.lastUsed).Round(time.Second).String(),
 			Requests: l.requests, RateLimit: l.rateLimit,
 		}
-		if now.Before(l.cooldown) {
-			st.Cooldown = l.cooldown.Sub(now).Round(time.Second).String()
-		}
 		out = append(out, st)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1014,15 +1060,16 @@ func laneSession(l *zenLane) string {
 	return l.session
 }
 
-// laneFailover returns the healthiest lane other than l, or nil when every
-// lane (including l) is cooling — the caller then waits out the backoff.
+// laneFailover returns the stalest lane other than l so the retry spreads
+// to another exit. never nil: worst case the caller reuses l on its fresh
+// rotation instead of waiting on a cooldown.
 func laneFailover(l *zenLane) *zenLane {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	now := time.Now()
 	var best *zenLane
 	for _, c := range lanes {
-		if c == l || now.Before(c.cooldown) {
+		if c == l {
 			continue
 		}
 		if best == nil || c.lastUsed.Before(best.lastUsed) {
@@ -1039,30 +1086,29 @@ func laneFailover(l *zenLane) *zenLane {
 		lanes[k] = nl
 		return nl
 	}
-	return nil
+	return l
 }
 
-// laneProxyFor returns the lane's pinned proxy, verifying and (re)picking
-// when empty or dead. "" means direct, which is correct on a cold lane when
-// always_proxy is off; once a lane has been escalated (direct got limited)
-// the pinned exit is returned regardless of that setting. repicks skip
-// exits burned for model.
+// laneProxyFor returns the lane's pinned proxy, re-picking when empty or
+// burned for model. no hot-path probe: the pool is verified on refresh,
+// dead exits die on real sends, and a probe here costs a full round trip
+// on every request. "" means direct, correct on a cold lane when
+// always_proxy is off; once escalated the pinned exit wins regardless.
 func laneProxyFor(l *zenLane, model string) string {
 	lanesMu.Lock()
 	p := l.proxy
 	escalated := l.escalated
 	lanesMu.Unlock()
+	if p != "" && !exitBurned(p, model) && !exitLongBurned(p) {
+		return p
+	}
 	if p != "" {
-		if !exitBurned(p, model) && !exitLongBurned(p) && probeProxyFull(p, probeTimeout()) {
-			return p
+		lanesMu.Lock()
+		if l.proxy == p {
+			l.proxy = ""
 		}
-		if exitBurned(p, model) || exitLongBurned(p) {
-			lanesMu.Lock()
-			if l.proxy == p {
-				l.proxy = ""
-			}
-			lanesMu.Unlock()
-		} else {
+		lanesMu.Unlock()
+		if !exitBurned(p, model) && !exitLongBurned(p) {
 			dropProxy(p)
 			laneDropProxy(p)
 		}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -1982,6 +1983,88 @@ func TestLaneHeaderPinning(t *testing.T) {
 	}
 }
 
+// lane modes toggle independently: hdr off means headers spread on shared,
+// shared+convo off means headers still pin, all off falls back to shared.
+func TestLaneModesToggle(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	c := testConfig()
+	c.Zen.Lanes = 4
+	c.Zen.LaneHdr = boolPtr(false)
+	c.Zen.LaneConvo = boolPtr(false)
+	c.Zen.LaneShared = boolPtr(true)
+	useConfig(t, c)
+	// headers never pin when hdr is off: both land in the shared pool,
+	// and no hdr: key exists in the table.
+	for _, h := range []string{"h1", "h2", "h3"} {
+		laneFor(h, body)
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for k := range lanes {
+		if strings.HasPrefix(k, "hdr:") {
+			t.Fatalf("hdr off: pinned key %s exists, want shared only", k)
+		}
+		if !strings.HasPrefix(k, "shared:") {
+			t.Fatalf("hdr off: unexpected key %s, want shared only", k)
+		}
+	}
+}
+
+// convo off by default: repeated bodies never pin a convo lane.
+func TestConvoOffByDefault(t *testing.T) {
+	resetLanes()
+	resetConvoSeen()
+	defer resetLanes()
+	defer resetConvoSeen()
+	d := defaultConfig()
+	applyConfig(&d)
+	defer applyConfig(testConfig())
+	if h, co, s := laneModes(); !h || co || !s {
+		t.Fatalf("defaults must be hdr on, convo off, shared on: got %v %v %v", h, co, s)
+	}
+	body := []byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
+	laneFor("", body)
+	if k := laneKeyOf(laneFor("", body)); strings.HasPrefix(k, "convo:") {
+		t.Fatalf("convo off: repeat body pinned %s, want shared", k)
+	}
+}
+
+// shared pre-open fills the table to cap on a cold start.
+func TestEnsureSharedLanesPreopens(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 6
+	useConfig(t, c)
+	ensureSharedLanes()
+	lanesMu.Lock()
+	n := len(lanes)
+	lanesMu.Unlock()
+	if n != 6 {
+		t.Fatalf("pre-opened %d lanes, want 6", n)
+	}
+}
+
+// live rtt folds into the weight: a fast live sample beats a slow api ms.
+func TestProxyWeightLiveRTT(t *testing.T) {
+	setProxyLatency(map[string]int{"http://a:1": 100, "http://b:1": 400})
+	setProxyReliability(map[string]float64{"http://a:1": 0.9, "http://b:1": 0.9})
+	zenLiveMu.Lock()
+	zenLive = map[string]float64{}
+	zenLiveMu.Unlock()
+	slow, fast := proxyWeight("http://a:1"), proxyWeight("http://b:1")
+	noteExitRTT("http://b:1", 20)
+	if proxyWeight("http://b:1") <= fast {
+		t.Fatal("fast live sample must raise the weight")
+	}
+	_ = slow
+	zenLiveMu.Lock()
+	zenLive = map[string]float64{}
+	zenLiveMu.Unlock()
+}
+
 func TestRedactProxyUserinfo(t *testing.T) {
 	cases := map[string]string{
 		"http://user:pass@host:8080": "http://***@host:8080",
@@ -2025,6 +2108,9 @@ func TestLaneConvoHash(t *testing.T) {
 	resetConvoSeen()
 	defer resetLanes()
 	defer resetConvoSeen()
+	c := testConfig()
+	c.Zen.LaneConvo = boolPtr(true)
+	useConfig(t, c)
 	b1 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"}]}`)
 	b2 := []byte(`{"messages":[{"role":"user","content":"fix the login bug"},{"role":"assistant","content":"sure"},{"role":"user","content":"now the logout too"}]}`)
 	// first sighting falls to shared (two-request rule); second pins.
@@ -2046,7 +2132,7 @@ func TestLaneConvoHash(t *testing.T) {
 	}
 }
 
-func TestLaneCooldownFailover(t *testing.T) {
+func TestLaneRotateFailover(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	c := testConfig()
@@ -2056,24 +2142,19 @@ func TestLaneCooldownFailover(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":"a"}]}`)
 	a := laneFor("s1", body)
 	b := laneFor("s2", body)
-	laneCool(a)
-	if laneHealthy(a) {
-		t.Fatal("cooled lane must report unhealthy")
+	asess := laneSession(a)
+	laneRotate(a, "")
+	if laneSession(a) == asess {
+		t.Fatal("rotated lane must mint a fresh session")
 	}
 	if got := laneFailover(a); got != b {
-		t.Fatal("failover must pick the healthy lane")
+		t.Fatal("failover must pick another lane")
 	}
-	// fill to cap, then all cooling: nil (caller waits out backoff).
+	// fill to cap: failover never returns nil, worst case the same lane
+	// on its fresh rotation instead of a cooldown wait.
 	laneFor("s3", body)
-	laneCool(b)
-	lanesMu.Lock()
-	for _, l := range lanes {
-		l.fails = 1
-		l.cooldown = time.Now().Add(time.Minute)
-	}
-	lanesMu.Unlock()
-	if got := laneFailover(a); got != nil {
-		t.Fatal("all-cooling failover must be nil")
+	if got := laneFailover(a); got == nil {
+		t.Fatal("failover must never be nil (no cooling waits)")
 	}
 }
 
@@ -2144,22 +2225,25 @@ func TestPickLaneProxyDistinct(t *testing.T) {
 	}
 }
 
-func TestLaneWaitClamped(t *testing.T) {
+func TestLaneStaleRunTracksLimits(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	lanesMu.Lock()
-	lanes["a"] = &zenLane{id: "a", session: zenSession(), cooldown: time.Now().Add(30 * time.Second)}
+	l := &zenLane{id: "a", session: zenSession()}
+	lanes["a"] = l
 	lanesMu.Unlock()
-	if d := laneWait(); d <= 0 || d > 3*time.Second {
-		t.Fatalf("laneWait = %v, want a clamped positive wait", d)
+	if d := laneStaleRun(l); d != 0 {
+		t.Fatalf("laneStaleRun = %v with no limits, want 0", d)
 	}
 	lanesMu.Lock()
-	for _, l := range lanes {
-		l.cooldown = time.Time{}
-	}
+	l.limitedSince = time.Now().Add(-30 * time.Second)
 	lanesMu.Unlock()
-	if d := laneWait(); d != 0 {
-		t.Fatalf("laneWait = %v with no cooling lanes, want 0", d)
+	if d := laneStaleRun(l); d < 29*time.Second || d > 31*time.Second {
+		t.Fatalf("laneStaleRun = %v, want ~30s", d)
+	}
+	laneTouch(l, "")
+	if d := laneStaleRun(l); d != 0 {
+		t.Fatalf("laneStaleRun = %v after success, want 0", d)
 	}
 }
 
@@ -2194,39 +2278,42 @@ func TestLaneEscalateFromDirect(t *testing.T) {
 	}
 }
 
-func TestLaneCooldownClearsPinKeepsLatch(t *testing.T) {
+func TestLaneRotateRefreshesSessionKeepsLatch(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	l := &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.9:9", escalated: true}
 	lanesMu.Lock()
 	lanes["x"] = l
 	lanesMu.Unlock()
-	laneCool(l)
+	before := laneSession(l)
+	after := laneRotate(l, "")
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
-	if l.proxy != "" {
-		t.Error("429 must clear the pinned exit so the lane takes a fresh one")
+	if l.proxy == "http://10.0.0.9:9" {
+		t.Error("429 must drop the pinned exit so the lane takes a fresh one")
+	}
+	if before == after {
+		t.Error("429 must mint a fresh session")
 	}
 	if !l.escalated {
-		t.Error("escalation latch must survive cooldown (else lane reverts to burned direct)")
+		t.Error("escalation latch must survive rotation (else lane reverts to burned direct)")
 	}
 }
 
-func TestLaneBlockIsShortAndDropsExit(t *testing.T) {
+func TestLaneRotateResetsRunOnSuccess(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
-	l := &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.8:8", fails: 4}
+	l := &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.8:8"}
 	lanesMu.Lock()
 	lanes["b"] = l
 	lanesMu.Unlock()
-	laneBlock(l)
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	if l.proxy != "" {
-		t.Error("identity block must drop the exit")
+	laneRotate(l, "")
+	if d := laneStaleRun(l); d <= 0 {
+		t.Error("rotated lane must stamp a limit run")
 	}
-	if d := time.Until(l.cooldown); d > 4*time.Second {
-		t.Errorf("identity block cooldown %v, want <= ~3s (not a rate limit)", d)
+	laneTouch(l, "http://10.0.0.8:8")
+	if d := laneStaleRun(l); d != 0 {
+		t.Error("success must clear the limit run")
 	}
 }
 
@@ -2238,12 +2325,12 @@ func TestLaneGatePaces(t *testing.T) {
 	applyConfig(c)
 	defer applyConfig(testConfig())
 	l := &zenLane{id: "p", session: zenSession(), lastUsed: time.Now()}
-	if w := laneGate(l); w != 0 {
+	if w := laneGate(context.Background(), l); w != 0 {
 		t.Fatalf("first send must not wait, waited %v", w)
 	}
 	// immediate second send on the same lane must pace near the gap.
 	start := time.Now()
-	if w := laneGate(l); w < 80*time.Millisecond {
+	if w := laneGate(context.Background(), l); w < 80*time.Millisecond {
 		t.Fatalf("second send waited %v, want ~120ms pacing", w)
 	}
 	if d := time.Since(start); d < 80*time.Millisecond {
@@ -2259,8 +2346,8 @@ func TestLaneGateDisabled(t *testing.T) {
 	applyConfig(c)
 	defer applyConfig(testConfig())
 	l := &zenLane{id: "p", session: zenSession(), lastUsed: time.Now()}
-	laneGate(l)
-	if w := laneGate(l); w != 0 {
+	laneGate(context.Background(), l)
+	if w := laneGate(context.Background(), l); w != 0 {
 		t.Fatalf("gap 0 must not pace, waited %v", w)
 	}
 }
@@ -2314,6 +2401,14 @@ func TestZenBackoffCapped(t *testing.T) {
 			t.Fatalf("retry %d slept %v, want <= ~300ms", r, d)
 		}
 	}
+	// cancelled ctx aborts the sleep instead of blocking shutdown.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	zenBackoffCtx(cctx, 10)
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("cancelled backoff slept %v, want immediate return", d)
+	}
 }
 
 func TestRaceProbeSkipsDead(t *testing.T) {
@@ -2347,9 +2442,6 @@ func TestRaceProbeSkipsDead(t *testing.T) {
 	u := "http://" + ln.Addr().String()
 	if !probeProxyFull(u, 2*time.Second) {
 		t.Fatalf("local CONNECT proxy probed false: %s", u)
-	}
-	if w := raceProbe([]string{"http://127.0.0.1:1", u}, 2*time.Second); w != u {
-		t.Fatalf("race winner = %q, want %q", w, u)
 	}
 }
 

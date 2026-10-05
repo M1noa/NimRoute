@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"testing"
@@ -26,7 +27,7 @@ func TestLaneGateSerializesConcurrentSenders(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			laneGate(l)
+			laneGate(context.Background(), l)
 			sends[i] = time.Now()
 		}(i)
 	}
@@ -43,20 +44,30 @@ func TestLaneGateSerializesConcurrentSenders(t *testing.T) {
 	}
 }
 
-// laneCool must stay bounded: many consecutive 429s may not overflow the
-// duration into the negative (which would clear the cooldown entirely).
-func TestLaneCoolBackoffNeverNegative(t *testing.T) {
+// laneRotate never waits: a lane hit by 100 consecutive 429s keeps a
+// fresh exit + session on every rotation, no backoff, no overflow.
+func TestLaneRotateNeverWaits(t *testing.T) {
 	applyConfig(testConfig())
 	defer applyConfig(testConfig())
 
 	resetLanes()
 	defer resetLanes()
 	l := &zenLane{id: "test", session: zenSession()}
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.99.0.1:1"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	sess := map[string]bool{}
 	for i := 0; i < 100; i++ {
-		laneCool(l)
-		if l.cooldown.Before(time.Now()) {
-			t.Fatalf("laneCool iteration %d produced a past cooldown (%v): backoff overflow", i, l.cooldown)
+		s := laneRotate(l, "")
+		if sess[s] {
+			t.Fatalf("laneRotate iteration %d reused session %s: must mint fresh", i, s)
 		}
+		sess[s] = true
 	}
 }
 
