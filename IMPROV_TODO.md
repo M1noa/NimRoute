@@ -83,6 +83,24 @@ one line per item, checkbox marks state. ordered by priority.
       complete; silent when disabled
 - [x] `/health`, `/v1/models`, `/v1/messages/count_tokens`, `claude-*`
       mapping all 200
+- [x] all 13 non-deepseek models swept on `/v1/messages`. **1 of 13 passes:
+      space-bunny-free.** the other 12 fail, and the failure is upstream, not
+      the proxy — evidence:
+  - 56 distinct exits attempted across the sweep; every other model drew
+    403 `FreeTierError` or 429 on all of them
+  - space-bunny hit **zero** blocks on those same exits in the same run and
+    answered `end_turn` + `[DONE]` on request both before and after the sweep
+  - log tally: 32 free-tier-blocked, 46 rate-limited, 1 x 200
+  - the lane/rotation machinery is provably working (it rotates on every
+    one of those failures and lands on a distinct exit each time); it just
+    cannot outrun a per-exit-per-model gate
+  - only exception needing its own look: `jev-1.13-free` returns upstream
+    **500** `{"type":"error","message":"Internal server error"}` rather than
+    403, i.e. the provider 500s on it. not a proxy defect either, but worth
+    remembering if jev starts 500ing on a good exit
+  - so: only space-bunny-free is usable right now. the rest are listed in
+    `/v1/models` but are effectively dead upstream. not something rotation
+    can fix.
 
 ## not done
 
@@ -120,8 +138,10 @@ one line per item, checkbox marks state. ordered by priority.
   budget on `reasoning_content` and returns zero visible content at low
   `max_tokens`. with headroom it answers fully. worth remembering before
   chasing it again.
-- muse-spark still 403s `FreeTierError` on most exits. known, per-exit
-  per-model, rotation cannot fix it.
+- muse-spark and most other zen free models now 403 `FreeTierError` on
+  essentially every exit in the pool (see the model sweep above). known,
+  per-exit per-model: rotation cannot fix a model-level gate, and only
+  space-bunny-free is currently serving.
 - `hedgedDo` winner must keep streaming. any change there needs a test that
   asserts the body still yields bytes after it returns — that is the bug
   that broke real sessions.
