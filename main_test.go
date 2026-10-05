@@ -546,13 +546,8 @@ func TestConvertResponsesFlatToolsPreserved(t *testing.T) {
 }
 
 func TestMatchSparkNudgeFlag(t *testing.T) {
-	p := matchModelParams("opencode/muse-spark-1.3-contributor-free")
-	if p == nil {
-		t.Fatalf("no params matched")
-	}
-	nv, ok := p["nudge_no_tools"]
-	if !ok || nv != true {
-		t.Fatalf("nudge_no_tools missing/not true: %v %v", ok, nv)
+	if !modelNudge("opencode/muse-spark-1.3-contributor-free") {
+		t.Fatal("spark model must nudge per model_info")
 	}
 }
 
@@ -1496,6 +1491,52 @@ func TestStreamAnthropicRestoresToolNameCase(t *testing.T) {
 	}
 }
 
+// usage lands in a trailing chunk AFTER finish_reason. streamAnthropic
+// returns on finish_reason, so the counts must come from a scan of the
+// whole body. this is the silent-zero bug: every streamed turn reported 0
+// tokens, which also left the per-lane totals empty.
+func TestStreamAnthropicCapturesTrailingUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":null}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":184,"completion_tokens":626,"total_tokens":810}}`,
+		`data: [DONE]`,
+	}, "\n\n")
+
+	rec := httptest.NewRecorder()
+	_, promptT, compT := streamAnthropic(rec, []byte(sse), "m", nil)
+	if promptT != 184 || compT != 626 {
+		t.Fatalf("prompt/completion = %d/%d, want 184/626 (usage after finish_reason)", promptT, compT)
+	}
+	// the client-facing usage must carry the real output count too
+	if !strings.Contains(rec.Body.String(), `"output_tokens":626`) {
+		t.Errorf("message_delta usage missing real count:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "message_stop") {
+		t.Error("stream not terminated")
+	}
+}
+
+// respTokens only reads a json body; the SSE fold has its own usage scan.
+// the trailing usage chunk (after finish_reason) must still be picked up.
+func TestSSEToNonStreamCapturesTrailingUsage(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"answer"}}],"usage":null}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":null}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}`,
+		`data: [DONE]`,
+	}, "\n\n")
+	out := sseToNonStream([]byte(sse), "m", nil)
+	if !strings.Contains(string(out), `"answer"`) {
+		t.Fatalf("fold lost content: %s", out)
+	}
+	// the folded body carries usage, which respTokens then reads
+	promptT, compT, total := respTokens(out)
+	if promptT != 11 || compT != 22 || total != 33 {
+		t.Fatalf("folded usage = %d/%d/%d, want 11/22/33", promptT, compT, total)
+	}
+}
+
 // /responses streaming path: the item name goes through the same restoration.
 func TestStreamResponsesMergedRestoresToolNameCase(t *testing.T) {
 	sse := strings.Join([]string{
@@ -1514,10 +1555,6 @@ func TestStreamResponsesMergedRestoresToolNameCase(t *testing.T) {
 
 func testConfig() *appConfig {
 	c := defaultConfig()
-	c.Models.Params = []modelParamYAML{
-		{Pattern: "*muse-spark*", Params: map[string]any{"reasoning_effort": "medium", "nudge_no_tools": true}},
-		{Pattern: "*", Params: map[string]any{"temperature": 1.0}},
-	}
 	c.Models.ClaudeMap = []claudeMapYAML{
 		{Pattern: "claude-sonnet-*", Model: "opencode/muse-spark-1.3-contributor-free"},
 		{Pattern: "claude-*", Model: "moonshotai/kimi-k3"},
@@ -1621,12 +1658,19 @@ func TestConfigToggles(t *testing.T) {
 	if strings.Contains(string(b), "system") {
 		t.Errorf("disabled injector must not add system msg: %s", b)
 	}
-	b2 := []byte(`{"model":"anything","temperature":0.2}`)
+	// injectParams normalizes spelling only, never adds sampling knobs.
+	b2 := []byte(`{"model":"anything","temperature":0.2,"topP":0.9,"_nim":true}`)
 	injectParams(&b2)
 	var m map[string]any
 	json.Unmarshal(b2, &m)
 	if _, ok := m["reasoning_effort"]; ok {
-		t.Errorf("disabled params must not inject: %s", b2)
+		t.Errorf("normalizer must not invent params: %s", b2)
+	}
+	if v, ok := m["top_p"]; !ok || v != 0.9 {
+		t.Errorf("camelCase must fold to snake_case: %s", b2)
+	}
+	if _, ok := m["_nim"]; ok {
+		t.Errorf("_nim opt-out must be stripped: %s", b2)
 	}
 }
 
@@ -1876,22 +1920,20 @@ func TestNudgeMasterSwitch(t *testing.T) {
 		t.Fatal("spark must nudge when switch on and flag set")
 	}
 	// per-model flag still wins when explicitly false.
+	f, _ := os.CreateTemp("", "modelinfo*.jsonc")
+	defer os.Remove(f.Name())
+	f.WriteString(`{"opencode/muse-spark-1.3-contributor-free": {"nudge_no_tools": false}}`)
+	f.Close()
+	t.Setenv("MODEL_INFO_FILE", f.Name())
 	c3 := testConfig()
 	c3.Nudge.Enabled = true
-	c3.Models.Params = []modelParamYAML{
-		{Pattern: "*muse-spark*", Params: map[string]any{"nudge_no_tools": false}},
-	}
 	applyConfig(c3)
 	if nudgeEnabled("opencode/muse-spark-1.3-contributor-free") {
 		t.Fatal("explicit nudge_no_tools=false must win over master switch")
 	}
-	// unknown non-spark model without params: off.
-	c4 := testConfig()
-	c4.Nudge.Enabled = true
-	c4.Models.Params = nil
-	applyConfig(c4)
+	// unknown non-spark model without info: off.
 	if nudgeEnabled("opencode/big-pickle") {
-		t.Fatal("paramless non-spark model must not nudge")
+		t.Fatal("infoless non-spark model must not nudge")
 	}
 }
 
@@ -1904,13 +1946,13 @@ func TestNudgeExampleConfigOn(t *testing.T) {
 		t.Error("example nudge.enabled must default true")
 	}
 	found := false
-	for _, e := range c.Models.Params {
-		if v, ok := e.Params["nudge_no_tools"]; ok && v == true {
+	for _, e := range loadModelInfo(modelInfoPath()) {
+		if e.Nudge != nil && *e.Nudge {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("example must carry at least one nudge_no_tools=true param")
+		t.Error("model_info must carry at least one nudge_no_tools=true entry")
 	}
 }
 
@@ -3010,5 +3052,133 @@ func TestSseToNonStreamRestoresToolNameCase(t *testing.T) {
 	}
 	if strings.Contains(string(out), `"name":"bash"`) {
 		t.Errorf("lowercase name leaked:\n%s", out)
+	}
+}
+
+// modelinfo owns the catalog boundary: lookups, fallbacks, mult parsing.
+func TestModelInfoLookup(t *testing.T) {
+	prev := cfg()
+	defer applyConfig(prev)
+	f, _ := os.CreateTemp("", "modelinfo*.jsonc")
+	defer os.Remove(f.Name())
+	f.WriteString(`{
+  // comment line
+  "moonshotai/kimi-k3": {"name":"Kimi K3","desc":"d","ctx":1048576,"maxout":131072,"inputs":["text","image"],"reasoning":true,"tools":true,"supports_temperature":false,"nudge_no_tools":true},
+  "nvidia/riva-translate-4b-instruct-v2": {"ctx":8192},
+  "opencode/space-bunny-free": {"ctx":131072}
+}`)
+	f.Close()
+	t.Setenv("MODEL_INFO_FILE", f.Name())
+	applyConfig(testConfig())
+
+	cases := []struct {
+		id             string
+		ctx, maxout    int
+		name, modality string
+	}{
+		{"moonshotai/kimi-k3", 1048576, 131072, "Kimi K3", "text+image->text"},
+		{"nvidia/moonshotai/kimi-k3", 1048576, 131072, "Kimi K3", "text+image->text"}, // nvidia/ prefix strips to the nim id
+		{"nvidia/riva-translate-4b-instruct-v2", 8192, 0, "Riva translate 4b instruct v2", "text->text"},
+		{"opencode/space-bunny-free", 131072, 0, "Space bunny free", "text->text"},
+		{"opencode/unknown-thing", 0, 0, "Unknown thing", "text->text"},
+	}
+	for _, c := range cases {
+		if got := modelCtx(c.id); got != c.ctx {
+			t.Errorf("ctx(%q) = %d, want %d", c.id, got, c.ctx)
+		}
+		if got := modelMaxOut(c.id); got != c.maxout {
+			t.Errorf("maxout(%q) = %d, want %d", c.id, got, c.maxout)
+		}
+		if got := modelName(c.id); got != c.name {
+			t.Errorf("name(%q) = %q, want %q", c.id, got, c.name)
+		}
+		if got := modelModality(c.id); got != c.modality {
+			t.Errorf("modality(%q) = %q, want %q", c.id, got, c.modality)
+		}
+	}
+	if !modelNudge("moonshotai/kimi-k3") {
+		t.Error("explicit nudge_no_tools=true must hold")
+	}
+	if modelNudge("opencode/space-bunny-free") {
+		t.Error("no flag + non-spark must not nudge")
+	}
+	if !modelNudge("opencode/muse-spark-x") {
+		t.Error("spark default must nudge without an entry")
+	}
+	// missing file = empty catalog, lookups fall back cleanly.
+	setModelInfo(loadModelInfo(f.Name() + ".missing"))
+	if modelCtx("moonshotai/kimi-k3") != 0 {
+		t.Error("missing file must yield empty catalog")
+	}
+}
+
+func TestFreepiMultFromName(t *testing.T) {
+	cases := map[string]string{
+		"GLM 5.3 Flash · ~0.7x usage":  "~0.7x",
+		"DeepSeek V4 Flash · 1x usage": "1x",
+		"Muse Spark 1.3 Contributor · trains on your data (free-pi + Meta) · ~0.5x usage": "~0.5x",
+		"DeepSeek V4 Flash": "",
+		"":                  "",
+	}
+	for name, want := range cases {
+		if got := freepiMultFromName(name); got != want {
+			t.Errorf("mult(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestInfoModelEntry(t *testing.T) {
+	prev := cfg()
+	defer applyConfig(prev)
+	f, _ := os.CreateTemp("", "modelinfo*.jsonc")
+	defer os.Remove(f.Name())
+	f.WriteString(`{"moonshotai/kimi-k3": {"name":"Kimi K3","desc":"d","ctx":1048576,"maxout":131072,"inputs":["text","image"]}}`)
+	f.Close()
+	t.Setenv("MODEL_INFO_FILE", f.Name())
+	applyConfig(testConfig())
+
+	e := infoModel("nvidia/moonshotai/kimi-k3", "moonshotai/kimi-k3")
+	if e.ContextLength != 1048576 {
+		t.Errorf("ctx = %d", e.ContextLength)
+	}
+	if e.TopProvider["max_completion_tokens"] != 131072 {
+		t.Errorf("maxout = %v", e.TopProvider["max_completion_tokens"])
+	}
+	if e.Architecture["modality"] != "text+image->text" {
+		t.Errorf("modality = %v", e.Architecture["modality"])
+	}
+	u := infoModel("opencode/nope-free", "opencode/nope-free")
+	if u.ContextLength != 131072 || u.TopProvider["max_completion_tokens"] != nil {
+		t.Errorf("unknown must fall back to 131072/nil: %+v", u)
+	}
+}
+
+// config models.nudge beats the catalog: glob, first match wins.
+func TestNudgeConfigOverride(t *testing.T) {
+	prev := cfg()
+	defer applyConfig(prev)
+	f, _ := os.CreateTemp("", "modelinfo*.jsonc")
+	defer os.Remove(f.Name())
+	f.WriteString(`{"opencode/muse-spark-1.3-contributor-free": {"nudge_no_tools": true}}`)
+	f.Close()
+	t.Setenv("MODEL_INFO_FILE", f.Name())
+	c := testConfig()
+	c.Nudge.Enabled = true
+	c.Models.Nudge = []nudgeYAML{
+		{Pattern: "*muse-spark*", Nudge: false},
+		{Pattern: "*", Nudge: true},
+	}
+	applyConfig(c)
+	if nudgeEnabled("opencode/muse-spark-1.3-contributor-free") {
+		t.Fatal("config nudge=false must beat catalog true")
+	}
+	if !nudgeEnabled("opencode/big-pickle") {
+		t.Fatal("later * glob must catch the rest")
+	}
+	// no override: catalog rules again.
+	c.Models.Nudge = nil
+	applyConfig(c)
+	if !nudgeEnabled("opencode/muse-spark-1.3-contributor-free") {
+		t.Fatal("catalog true must apply without override")
 	}
 }

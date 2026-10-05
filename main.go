@@ -548,16 +548,17 @@ type StatusResponse struct {
 
 // freepiAcctStatus is one account's /status row. jwt never leaves config.
 type freepiAcctStatus struct {
-	Name       string   `json:"name"`
-	Models     []string `json:"models,omitempty"`
-	Requests   int      `json:"requests"`
-	Prompt     int      `json:"prompt_tokens"`
-	Completion int      `json:"completion_tokens"`
-	Inflight   bool     `json:"inflight"`
-	Tier       string   `json:"tier,omitempty"`
-	Credits    float64  `json:"credits,omitempty"`
-	SpentPct   float64  `json:"spent_pct,omitempty"`
-	ReqToday   int      `json:"req_today,omitempty"`
+	Name       string            `json:"name"`
+	Models     []string          `json:"models,omitempty"`
+	Mults      map[string]string `json:"mults,omitempty"`
+	Requests   int               `json:"requests"`
+	Prompt     int               `json:"prompt_tokens"`
+	Completion int               `json:"completion_tokens"`
+	Inflight   bool              `json:"inflight"`
+	Tier       string            `json:"tier,omitempty"`
+	Credits    float64           `json:"credits,omitempty"`
+	SpentPct   float64           `json:"spent_pct,omitempty"`
+	ReqToday   int               `json:"req_today,omitempty"`
 }
 
 // freepiSummary groups per-account freepi state, separate from zen.
@@ -766,52 +767,8 @@ func short(s string) string {
 	return s
 }
 
-type modelParamEntry struct {
-	pattern string
-	params  map[string]any
-}
-
-var (
-	modelParams []*modelParamEntry
-	modelMu     sync.RWMutex
-)
-
-// model params live in config.yml models.params now; applyConfig rebuilds
-// them, so there is no separate loader anymore.
-
-func matchModelParams(model string) map[string]any {
-	if e := matchesModelParams(model); e != nil {
-		return e.params
-	}
-	return nil
-}
-
-func globMatch(pattern, s string) bool {
-	parts := strings.Split(pattern, "*")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		idx := strings.Index(s, part)
-		if idx < 0 {
-			return false
-		}
-		s = s[idx+len(part):]
-	}
-	return true
-}
-
-func matchesModelParams(model string) *modelParamEntry {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	ml := strings.ToLower(model)
-	for _, e := range modelParams {
-		if globMatch(e.pattern, ml) {
-			return e
-		}
-	}
-	return nil
-}
+// model facts live in model_info.jsonc (modelinfo.go); the old
+// config.yml models.params glob table is gone.
 
 type openRouterModel struct {
 	ID               string            `json:"id"`
@@ -1870,14 +1827,7 @@ func nudgeEnabled(model string) bool {
 	if !cfg().Nudge.Enabled {
 		return false
 	}
-	mp := matchModelParams(model)
-	if mp == nil {
-		return strings.Contains(strings.ToLower(model), "spark")
-	}
-	if nv, ok := mp["nudge_no_tools"]; ok {
-		return nv == true
-	}
-	return strings.Contains(strings.ToLower(model), "spark")
+	return modelNudge(model)
 }
 
 func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []byte, sessionID *string, clientModel string, lane *zenLane) []byte {
@@ -1938,83 +1888,30 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 		if seen[mid] {
 			continue
 		}
-		ent := matchesModelParams(mid)
-		if ent == nil {
-			continue
-		}
 		seen[mid] = true
-		cl := 131072
-		desc := ""
-		if v, ok := ent.params["context_length"]; ok {
-			switch n := v.(type) {
-			case float64:
-				cl = int(n)
-			case int:
-				cl = n
-			}
-		}
-		if v, ok := ent.params["description"]; ok {
-			desc, _ = v.(string)
-		}
-		name := modelDisplayName(mid)
-		out.Data = append(out.Data, openRouterModel{
-			ID:            "nvidia/" + mid,
-			Name:          name,
-			Description:   desc,
-			ContextLength: cl,
-			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-			Architecture: map[string]any{
-				"modality":      "text->text",
-				"tokenizer":     "Other",
-				"instruct_type": nil,
-			},
-			TopProvider: map[string]any{
-				"context_length":        cl,
-				"max_completion_tokens": nil,
-				"is_moderated":          false,
-			},
-			PerRequestLimits: nil,
-		})
+		out.Data = append(out.Data, infoModel("nvidia/"+mid, mid))
 	}
-	// disabled or keyless: no nim models, skip the params fallback too.
+	// disabled or keyless: no live list, fall back to the catalog file
+	// (nim-side entries only; zen lists from the live api below).
 	if len(out.Data) == 0 && nvidiaEnabled() {
-		modelMu.RLock()
-		for _, e := range modelParams {
-			cl := 131072
-			desc := ""
-			if v, ok := e.params["context_length"]; ok {
-				switch n := v.(type) {
-				case float64:
-					cl = int(n)
-				case int:
-					cl = n
-				}
+		modelInfoMu.RLock()
+		for id := range modelInfo {
+			if strings.HasPrefix(id, "opencode/") || strings.HasPrefix(id, "freeepi/") {
+				continue
 			}
-			if v, ok := e.params["description"]; ok {
-				desc, _ = v.(string)
-			}
-			p := strings.ReplaceAll(e.pattern, "*", "")
-			// zen models list from the live api below; the nim
-			// fallback only covers nim-side patterns.
-			pl := strings.ToLower(p)
+			pl := strings.ToLower(id)
 			if strings.HasSuffix(pl, "-free") || pl == "big-pickle" || strings.HasPrefix(pl, "muse-spark") {
 				continue
 			}
-			if !strings.Contains(p, "/") {
-				p = "nvidia/" + p
+			disp := id
+			if !strings.Contains(disp, "/") {
+				disp = "nvidia/" + disp
+			} else if !strings.HasPrefix(disp, "nvidia/") {
+				disp = "nvidia/" + disp
 			}
-			out.Data = append(out.Data, openRouterModel{
-				ID:               p,
-				Name:             modelDisplayName(p),
-				Description:      desc,
-				ContextLength:    cl,
-				Pricing:          map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-				Architecture:     map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-				TopProvider:      map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
-				PerRequestLimits: nil,
-			})
+			out.Data = append(out.Data, infoModel(disp, id))
 		}
-		modelMu.RUnlock()
+		modelInfoMu.RUnlock()
 	}
 
 	// opencode zen free models (no auth) -> opencode/<id>
@@ -2028,31 +1925,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		ocSeen[m] = true
-		cl := 131072
-		desc := ""
-		if e := matchesModelParams(m); e != nil {
-			if v, ok := e.params["context_length"]; ok {
-				switch n := v.(type) {
-				case float64:
-					cl = int(n)
-				case int:
-					cl = n
-				}
-			}
-			if v, ok := e.params["description"]; ok {
-				desc, _ = v.(string)
-			}
-		}
-		ocID := "opencode/" + m
-		out.Data = append(out.Data, openRouterModel{
-			ID:            ocID,
-			Name:          modelDisplayName(ocID),
-			Description:   desc,
-			ContextLength: cl,
-			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-			Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-			TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
-		})
+		out.Data = append(out.Data, infoModel("opencode/"+m, "opencode/"+m))
 	}
 
 	// hard-coded extra free models, listed only when the live api still
@@ -2073,31 +1946,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seenIDs["opencode/"+id] = true
-		cl := 131072
-		desc := ""
-		if e := matchesModelParams(id); e != nil {
-			if v, ok := e.params["context_length"]; ok {
-				switch n := v.(type) {
-				case float64:
-					cl = int(n)
-				case int:
-					cl = n
-				}
-			}
-			if v, ok := e.params["description"]; ok {
-				desc, _ = v.(string)
-			}
-		}
-		ocID := "opencode/" + id
-		out.Data = append(out.Data, openRouterModel{
-			ID:            ocID,
-			Name:          modelDisplayName(ocID),
-			Description:   desc,
-			ContextLength: cl,
-			Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-			Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-			TopProvider:   map[string]any{"context_length": cl, "max_completion_tokens": nil, "is_moderated": false},
-		})
+		out.Data = append(out.Data, infoModel("opencode/"+id, "opencode/"+id))
 	}
 	appendFreepiModels(&out, seenIDs)
 
@@ -2125,15 +1974,41 @@ func appendFreepiModels(out *struct {
 				continue
 			}
 			seenIDs[id] = true
-			out.Data = append(out.Data, openRouterModel{
-				ID:            id,
-				Name:          modelDisplayName(id),
-				ContextLength: 1048576,
-				Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
-				Architecture:  map[string]any{"modality": "text->text", "tokenizer": "Other", "instruct_type": nil},
-				TopProvider:   map[string]any{"context_length": 1048576, "max_completion_tokens": nil, "is_moderated": false},
-			})
+			out.Data = append(out.Data, infoModel(id, id))
 		}
+	}
+}
+
+// infoModel builds the /v1/models entry from the catalog file: name,
+// description, context, max output, and modality all come from model_info.
+// unknown ids get the derived name and a default context.
+func infoModel(displayID, infoID string) openRouterModel {
+	cl := modelCtx(infoID)
+	if cl == 0 {
+		cl = 131072
+	}
+	var maxOut any
+	if mo := modelMaxOut(infoID); mo > 0 {
+		maxOut = mo
+	}
+	mod := modelModality(infoID)
+	return openRouterModel{
+		ID:            displayID,
+		Name:          modelName(infoID),
+		Description:   modelDesc(infoID),
+		ContextLength: cl,
+		Pricing:       map[string]string{"prompt": "0", "completion": "0", "request": "0"},
+		Architecture: map[string]any{
+			"modality":      mod,
+			"tokenizer":     "Other",
+			"instruct_type": nil,
+		},
+		TopProvider: map[string]any{
+			"context_length":        cl,
+			"max_completion_tokens": maxOut,
+			"is_moderated":          false,
+		},
+		PerRequestLimits: nil,
 	}
 }
 
@@ -2159,6 +2034,9 @@ var camelToSnake = map[string]string{
 	"reasoningBudget":   "reasoning_budget",
 }
 
+// injectParams normalizes a client body: camelCase -> snake_case renames
+// plus the _nim opt-out strip. no default params are injected anymore:
+// sampling knobs come from the client, model facts from model_info.jsonc.
 func injectParams(body *[]byte) {
 	if len(*body) == 0 {
 		return
@@ -2177,31 +2055,7 @@ func injectParams(body *[]byte) {
 		}
 	}
 
-	nimVal, hasNim := m["_nim"]
 	delete(m, "_nim")
-
-	inject := true
-	if hasNim {
-		if b, ok := nimVal.(bool); ok && b {
-			inject = false
-		}
-	}
-
-	if inject && cfg().Inject.Params {
-		model, _ := m["model"].(string)
-		if model != "" {
-			if p := matchModelParams(model); p != nil {
-				for k, v := range p {
-					if k == "context_length" || k == "description" || k == "nudge_no_tools" {
-						continue // proxy-local, never sent upstream
-					}
-					if _, exists := m[k]; !exists {
-						m[k] = v
-					}
-				}
-			}
-		}
-	}
 
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -2838,7 +2692,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	injectParams(&body)
+	if cfg().Inject.Params {
+		injectParams(&body)
+	}
 	injectHelpfulLine(&body)
 
 	// mask pii before anything upstream sees the body; the wrapped
@@ -3954,7 +3810,6 @@ func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 
 func serverMain() {
 	initLogging()
-	initUsageLog()
 	fetchOpenCodeVersion()
 
 	// everything comes from config.yml (auto-created from the example on
@@ -3962,6 +3817,9 @@ func serverMain() {
 	cpath := configPath()
 	c := loadOrCreateConfig(cpath)
 	applyConfig(c)
+	// must follow applyConfig: usage.path/enabled come from the config, so
+	// opening the file earlier silently used the defaults.
+	initUsageLog()
 	if len(c.NvidiaKeys) == 0 {
 		log.Printf("  no nvidia keys, running keyless (opencode/* free models only)")
 	}
@@ -4017,7 +3875,7 @@ func serverMain() {
 		log.Printf("  helpful-line injector: disabled")
 	}
 	if !c.Inject.Params {
-		log.Printf("  model-params injector: disabled")
+		log.Printf("  body normalization: disabled (bodies pass through as-is)")
 	}
 	if c.Anonymize.Enabled && (len(c.Anonymize.Terms) > 0 || len(c.Anonymize.Entities) > 0) {
 		log.Printf("  anonymize: %d term(s) %d entit(ies) mode=%s", len(c.Anonymize.Terms), len(c.Anonymize.Entities), c.Anonymize.Mode)
@@ -4079,12 +3937,11 @@ var probeModels = []string{
 }
 
 func runProbe() {
-	initUsageLog()
-
 	c, err := loadConfigFile(configPath())
 	if err != nil {
 		log.Fatalf("Cannot read %s: %v", configPath(), err)
 	}
+	initUsageLog()
 	entries := c.NvidiaKeys
 	if len(entries) == 0 {
 		log.Fatalf("%s has no nvidia_keys: probe needs nvidia keys", configPath())

@@ -245,19 +245,19 @@ type usageConfig struct {
 	Path    string `yaml:"path"`
 }
 
-type modelParamYAML struct {
-	Pattern string         `yaml:"pattern"`
-	Params  map[string]any `yaml:"params"`
-}
-
 type claudeMapYAML struct {
 	Pattern string `yaml:"pattern"`
 	Model   string `yaml:"model"`
 }
 
+type nudgeYAML struct {
+	Pattern string `yaml:"pattern"`
+	Nudge   bool   `yaml:"nudge"`
+}
+
 type modelsConfig struct {
-	Params    []modelParamYAML `yaml:"params"`
-	ClaudeMap []claudeMapYAML  `yaml:"claude_map"`
+	ClaudeMap []claudeMapYAML `yaml:"claude_map"`
+	Nudge     []nudgeYAML     `yaml:"nudge"`
 }
 
 type appConfig struct {
@@ -689,20 +689,18 @@ func applyConfig(c *appConfig) {
 	}
 	appCfg.Store(c)
 
-	// model params
-	modelMu.Lock()
-	modelParams = nil
-	for _, e := range c.Models.Params {
+	// model catalog (hot-reloaded with the config)
+	setModelInfo(loadModelInfo(modelInfoPath()))
+
+	// per-model nudge overrides: config beats the catalog
+	var no []nudgeOverride
+	for _, e := range c.Models.Nudge {
 		if e.Pattern == "" {
 			continue
 		}
-		p := e.Params
-		if p == nil {
-			p = make(map[string]any)
-		}
-		modelParams = append(modelParams, &modelParamEntry{pattern: strings.ToLower(e.Pattern), params: p})
+		no = append(no, nudgeOverride{pattern: strings.ToLower(e.Pattern), nudge: e.Nudge})
 	}
-	modelMu.Unlock()
+	setNudgeOverrides(no)
 
 	// claude mapping
 	claudeModelsMu.Lock()
@@ -782,8 +780,8 @@ func watchConfig(p *Pool, path string) {
 			if !c.Guardrails.Enabled {
 				ng = 0
 			}
-			log.Printf("  %s reloaded: keys +%d -%d = %d (%d available), guardrails=%d, params=%d",
-				path, added, removed, stat.Total, stat.Available, ng, len(modelParams))
+			log.Printf("  %s reloaded: keys +%d -%d = %d (%d available), guardrails=%d",
+				path, added, removed, stat.Total, stat.Available, ng)
 		}
 	}
 }

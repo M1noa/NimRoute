@@ -61,7 +61,7 @@ type freepiAcct struct {
 	turns     int
 	lastAd    time.Time
 	claimedAt time.Time // when inflight went 0->1
-	models    []string
+	catalog   []freepiCatalogEntry
 	stats     freepiStats
 	statsAt   time.Time
 }
@@ -246,32 +246,58 @@ func parseFreepiErr(status int, body []byte, hdr http.Header) freepiErr {
 	return fe
 }
 
-// freepiModels returns catalog ids via /client-version, fallback builtin.
+// freepiCatalogEntry is one model row from GET /client-version: the id is
+// the exact model string sent in completions, name carries the picker label
+// plus the usage multiplier ("GLM 5.3 Flash · ~0.7x usage").
+type freepiCatalogEntry struct {
+	ID   string
+	Name string
+	Mult string // parsed from name, "" when the name carries none
+}
+
+// freepiModels returns catalog ids via /client-version. no builtin fallback:
+// an unreachable catalog means no models, not a stale guess.
 func freepiModels(fa *freepiAcct) []string {
-	if len(fa.models) > 0 {
-		return fa.models
+	var out []string
+	for _, e := range freepiCatalog(fa) {
+		out = append(out, e.ID)
+	}
+	return out
+}
+
+// freepiCatalog returns the full catalog rows, caching ids + mults on the
+// account. names (and their multipliers) refresh with the stats tick.
+func freepiCatalog(fa *freepiAcct) []freepiCatalogEntry {
+	fa.mu.Lock()
+	cached := fa.catalog
+	fa.mu.Unlock()
+	if len(cached) > 0 {
+		return cached
 	}
 	_, body := freepiGet(fa, "/client-version", 5*time.Second)
 	var cv struct {
 		Models []struct {
-			ID string `json:"id"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
 		} `json:"models"`
 		Model string `json:"model"`
 	}
+	var out []freepiCatalogEntry
 	if json.Unmarshal(body, &cv) == nil {
 		for _, m := range cv.Models {
-			if m.ID != "" {
-				fa.models = append(fa.models, m.ID)
+			if m.ID == "" {
+				continue
 			}
+			out = append(out, freepiCatalogEntry{ID: m.ID, Name: m.Name, Mult: freepiMultFromName(m.Name)})
 		}
-		if len(fa.models) == 0 && cv.Model != "" {
-			fa.models = []string{cv.Model}
+		if len(out) == 0 && cv.Model != "" {
+			out = []freepiCatalogEntry{{ID: cv.Model, Name: cv.Model}}
 		}
 	}
-	if len(fa.models) == 0 {
-		fa.models = []string{"deepseek/deepseek-v4-flash"}
-	}
-	return fa.models
+	fa.mu.Lock()
+	fa.catalog = out
+	fa.mu.Unlock()
+	return out
 }
 
 // freepiSessionReset releases a stale session lease (client's
@@ -296,7 +322,15 @@ func freepiSessionReset(fa *freepiAcct) {
 func freepiSnapshot() *freepiSummary {
 	sum := &freepiSummary{Enabled: true}
 	for _, fa := range freepiAccounts() {
-		st := freepiAcctStatus{Name: fa.name, Models: freepiModels(fa)}
+		st := freepiAcctStatus{Name: fa.name, Mults: map[string]string{}}
+		for _, e := range freepiCatalog(fa) {
+			st.Models = append(st.Models, e.ID)
+			if m := e.Mult; m != "" {
+				st.Mults[e.ID] = m
+			} else if m := lookupModelInfo("freeepi/" + e.ID); m != nil && m.Mult != "" {
+				st.Mults[e.ID] = m.Mult
+			}
+		}
 		fst := fa.refreshStats()
 		st.Tier, st.Credits, st.SpentPct, st.ReqToday =
 			fst.Tier, fst.Credits, fst.SpentPct, fst.ReqToday

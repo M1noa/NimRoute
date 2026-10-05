@@ -262,7 +262,9 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 	}
 
 	ob, _ := json.Marshal(out)
-	injectParams(&ob)
+	if cfg().Inject.Params {
+		injectParams(&ob)
+	}
 
 	return ob, clientModel, upstreamModel, tnames, isStream, nil
 }
@@ -691,6 +693,14 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 
 func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
+
+	// usage arrives in a trailing chunk AFTER finish_reason, so the whole
+	// body is scanned for it before streaming: returning on finish_reason
+	// would report zero tokens for every streamed turn. chunk.Usage below
+	// can only refine these, never lower them.
+	if p, c := sseUsageTee(body); p > 0 || c > 0 {
+		promptT, compT = p, c
+	}
 
 	// proxy-internal marker must never reach the client.
 	body = stripSentinelSSE(body)

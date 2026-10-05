@@ -64,11 +64,12 @@ key/proxy/lane rotation to survive per-exit rate limits.
   running config.
 - new `/status` fields need a `status.show_*` flag plus redaction in
   `StatusFor` (section 4).
-- `models.params` globs are first-match-wins, applied by `injectParams`
-  unless `inject.params: false` or the body carries `"_nim": true`.
-  `context_length`/`description`/`nudge_no_tools` are proxy-local, never
-  sent upstream. new models need a params entry or they silently get no
-  defaults (TODO item 9: startup warn for unmatched `/v1/models` ids).
+- model facts (ctx, description, maxout, nudge flags) live in
+  `model_info.jsonc`, loaded by `modelinfo.go`, hot-reloaded with the
+  config. `injectParams` only folds camelCase and strips `"_nim"`; no
+  sampling defaults are ever injected. new models need an entry or they
+  fall back to 131072 ctx + derived name (TODO item 9: startup warn for
+  unmatched `/v1/models` ids).
 - usage tracking (`usage.go`): gated on `usage.enabled`, one json line
   per request to `nim-usage.jsonl` plus in-memory totals for `/status`.
   counters only move through `logUsage`; zero overhead when disabled.

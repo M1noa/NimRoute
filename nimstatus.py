@@ -166,18 +166,9 @@ def usage_bar(pct, width=10):
 
 PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "nvidia": "green"}
 
-# relative usage multipliers from FREEPI-DOCS.md §5 live bench (vs
-# deepseek-v4-flash 1x). benchmarked, approximate — real spend is measured
-# per request in the cost column.
-FREEPI_MULT = {
-    "deepseek-v4-flash": "1x",
-    "deepseek-v4.1-flash": "~0.1x",
-    "glm-5.3-flash": "~0.7x",
-    "gpt-oss-120b-speed": "~1.6x",
-    "mimo-v2.6-flash": "~0.4x",
-    "muse-spark-1.3-contributor": "~0.5x",
-    "solar-pro-4": "~1.6x",
-}
+# usage multipliers come from /status per-account "mults" (parsed live from
+# the freepi catalog display names, e.g. "GLM 5.3 Flash · ~0.7x usage").
+# real spend is measured per request in the cost column.
 
 
 def build_renderable(d, stats):
@@ -204,10 +195,11 @@ def build_renderable(d, stats):
         if r:
             costs[mid] = c
     fp = d.get("freepi") or {}
-    fp_models, fp_rows = [], []
+    fp_models, fp_rows, fp_mults = [], [], {}
     for acct in fp.get("accounts") or []:
         ms = acct.get("models") or []
         fp_models.extend(ms)
+        fp_mults.update(acct.get("mults") or {})
         req = acct.get("requests", 0)
         tok = acct.get("prompt_tokens", 0) + acct.get("completion_tokens", 0)
         mark = "◆" if acct.get("inflight") else "◇"
@@ -247,7 +239,7 @@ def build_renderable(d, stats):
                     cells.append(Text("$%.2g" % c if c else "·", style="dim"))
                     if name == "freepi":
                         bare = full.split("/", 1)[-1]
-                        cells.append(Text(FREEPI_MULT.get(bare, "·"), style="dim"))
+                        cells.append(Text(fp_mults.get(bare, "·"), style="dim"))
                 else:
                     cells.append(Text(""))
                     if name == "freepi":

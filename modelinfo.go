@@ -13,20 +13,19 @@ import (
 // hot-reloaded with the config (applyConfig), tests swap it via setModelInfo.
 
 type modelInfoEntry struct {
-	Name       string   `json:"name,omitempty"`
-	Desc       string   `json:"desc,omitempty"`
-	Ctx        int      `json:"ctx,omitempty"`
-	MaxOut     int      `json:"maxout,omitempty"`
-	Inputs     []string `json:"inputs,omitempty"`
-	Reasoning  bool     `json:"reasoning,omitempty"`
-	Tools      bool     `json:"tools,omitempty"`
-	Temp       bool     `json:"supports_temperature,omitempty"`
-	Params     string   `json:"params,omitempty"`
-	Nudge      bool     `json:"nudge_no_tools,omitempty"`
-	HasNudge   bool     `json:"-"`
-	Mult       string   `json:"freepi_mult,omitempty"`
-	Free       bool     `json:"free,omitempty"`
-	Source     string   `json:"source,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Desc      string   `json:"desc,omitempty"`
+	Ctx       int      `json:"ctx,omitempty"`
+	MaxOut    int      `json:"maxout,omitempty"`
+	Inputs    []string `json:"inputs,omitempty"`
+	Reasoning bool     `json:"reasoning,omitempty"`
+	Tools     bool     `json:"tools,omitempty"`
+	Temp      bool     `json:"supports_temperature,omitempty"`
+	Params    string   `json:"params,omitempty"`
+	Nudge     *bool    `json:"nudge_no_tools,omitempty"`
+	Mult      string   `json:"freepi_mult,omitempty"`
+	Free      bool     `json:"free,omitempty"`
+	Source    string   `json:"source,omitempty"`
 }
 
 var (
@@ -143,18 +142,62 @@ func modelModality(id string) string {
 	return "text->text"
 }
 
-// modelNudge reports the nudge_no_tools flag: explicit entry wins, else
-// spark-shaped models default on (same rule as before).
+// nudge overrides come from config.yml models.nudge (glob, first match
+// wins). rebuilt in applyConfig next to the catalog load.
+type nudgeOverride struct {
+	pattern string
+	nudge   bool
+}
+
+var (
+	nudgeMu        sync.RWMutex
+	nudgeOverrides []nudgeOverride
+)
+
+// setNudgeOverrides swaps the config nudge list (applyConfig, tests).
+func setNudgeOverrides(v []nudgeOverride) {
+	nudgeMu.Lock()
+	defer nudgeMu.Unlock()
+	nudgeOverrides = v
+}
+
+// modelNudge reports the nudge_no_tools flag: config override first, then
+// the catalog entry, else spark-shaped models default on.
 func modelNudge(id string) bool {
-	if e := lookupModelInfo(id); e != nil && e.HasNudge {
-		return e.Nudge
+	nudgeMu.RLock()
+	ml := strings.ToLower(id)
+	for _, o := range nudgeOverrides {
+		if globMatch(o.pattern, ml) {
+			nudgeMu.RUnlock()
+			return o.nudge
+		}
 	}
-	return strings.Contains(strings.ToLower(id), "spark")
+	nudgeMu.RUnlock()
+	if e := lookupModelInfo(id); e != nil && e.Nudge != nil {
+		return *e.Nudge
+	}
+	return strings.Contains(ml, "spark")
 }
 
 // multRe parses the usage multiplier out of a freepi catalog display name:
 // "GLM 5.3 Flash · ~0.7x usage" -> "~0.7x".
 var multRe = regexp.MustCompile(`(~?[\d.]+x)\s+usage`)
+
+// globMatch is * glob matching, first-match-wins order left to callers.
+func globMatch(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(s, part)
+		if idx < 0 {
+			return false
+		}
+		s = s[idx+len(part):]
+	}
+	return true
+}
 
 // freepiMultFromName extracts the multiplier from a catalog display name,
 // "" when the name carries none.

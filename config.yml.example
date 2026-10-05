@@ -49,9 +49,9 @@ guardrails:
 
 # --- inject: request body tweaks before forwarding upstream ---
 inject:
-  # apply per-model default params from models.params below. false = send
-  # the client body as-is (plus the camelCase -> snake_case rename).
-  # clients can opt a single request out with "_nim": true in the body.
+  # normalize client bodies (camelCase -> snake_case, strip "_nim").
+  # false = pass bodies through as-is. no default sampling params are
+  # ever injected: knobs come from the client, facts from model_info.jsonc.
   params: true
   # prepend a helpful system line to every chat request (both /v1/chat and
   # /v1/messages paths). false = never touch the system prompt.
@@ -119,7 +119,7 @@ anonymize:
 # --- nudge: continue tool-less spark answers with one reprompt round ---
 nudge:
   # master switch. false = never reprompt, first answer stands.
-  # per-model nudge_no_tools in models.params still applies.
+  # per-model nudge_no_tools in model_info.jsonc still applies.
   enabled: true
 
 # --- rtk: tool_result compression (port of rtk-ai/rtk) ---
@@ -327,104 +327,17 @@ usage:
   path: "nim-usage.jsonl"   # relative to the working dir
 
 # --- models ---
+# model facts (context length, description, nudge flags) live in
+# model_info.jsonc, hot-reloaded with this file. edit that file, not here.
 models:
-  # per-model default params. glob on the model id, first match wins.
-  # context_length + description only feed /v1/models; the rest are injected
-  # into chat requests when missing (unless inject.params is false).
-  # nudge_no_tools is special: one extra reprompt round for tool-less answers.
-  params:
-    - pattern: "*kimi-k3*"
-      params:
-        context_length: 1048576
-        description: "Kimi K3 - 2.8T MoE (16/896 experts), 1M ctx, native vision, thinking always on, reasoning-effort max"
-        temperature: 1.0
-        top_p: 0.95
-        reasoning_effort: "max"
-    - pattern: "*deepseek-v4-pro-0813*"
-      params:
-        context_length: 1048576
-        description: "DeepSeek V4 Pro - 1.6T MoE (49B active), 1M ctx, reasoning-effort max"
-        temperature: 1.0
-        top_p: 0.95
-        reasoning_effort: "max"
-    - pattern: "*deepseek-v4-flash-0731*"
-      params:
-        context_length: 1048576
-        description: "DeepSeek V4 Flash - 284B MoE (13B active), 1M ctx, reasoning-effort max"
-        temperature: 1.0
-        top_p: 0.95
-        reasoning_effort: "max"
-    - pattern: "*nemotron-3.5-lightning-30b-a3b*"
-      params:
-        context_length: 1000000
-        description: "Nemotron 3.5 Lightning 30B-A3B-NVFP4 - MoE, optimal sampling temp 1.0 top_p 0.95"
-        temperature: 1.0
-        top_p: 0.95
-    - pattern: "*muse-glimmer-30b*"
-      params:
-        context_length: 131072
-        description: "Muse Glimmer 30B - dense vision model, reasoning-strength xhigh, top_k 64"
-        temperature: 1.0
-        top_p: 0.95
-        top_k: 64
-        reasoning_effort: "xhigh"
-        nudge_no_tools: true
-    - pattern: "*laguna-xs-2.1*"
-      params:
-        context_length: 262144
-        description: "Laguna XS 2.1 - poolside reasoning model, thinking on, top_k 20, top_p 1.0"
-        temperature: 1.0
-        top_p: 1.0
-        min_p: 0.0
-        top_k: 20
-        reasoning_effort: "max"
-    - pattern: "*minimax-m3*"
-      params:
-        context_length: 1048576
-        description: "MiniMax M3 - ~428B MoE (23B active), 1M ctx, multimodal, top_k 40, thinking_mode enabled"
-        temperature: 1.0
-        top_p: 0.95
-        top_k: 40
-        chat_template_kwargs:
-          thinking_mode: "enabled"
-    - pattern: "*nemotron-3-ultra-550b-a55b*"
-      params:
-        context_length: 1048576
-        description: "Nemotron 3 Ultra 550B-A55B - frontier reasoning model (55B active), 1M ctx, reasoning-effort max"
-        temperature: 1.0
-        top_p: 0.95
-        min_p: 0.01
-        reasoning_effort: "max"
-    - pattern: "*big-pickle*"
-      params:
-        context_length: 131072
-        description: "Big Pickle - free stealth model, limited time offer"
-    - pattern: "*muse-spark*"
-      params:
-        context_length: 131072
-        description: "Muse Spark - Meta AI coding model, reasoning-effort medium"
-        reasoning_effort: "medium"
-        nudge_no_tools: true
-    - pattern: "*mimo-v2.5-free*"
-      params:
-        context_length: 131072
-        description: "MiMo-V2.5 Free - free limited-time model"
-    - pattern: "*ling-3.0-flash-fin-free*"
-      params:
-        context_length: 131072
-        description: "Ling 3.0 Flash Fin Free - free limited-time model, reasoning-effort high"
-        reasoning_effort: "high"
-    - pattern: "*nemotron-3-ultra-free*"
-      params:
-        context_length: 1048576
-        description: "Nemotron 3 Ultra Free - free NVIDIA trial model"
-        temperature: 1.0
-        reasoning_effort: "max"
-    - pattern: "*nemotron-3.5-lightning-free*"
-      params:
-        context_length: 1000000
-        description: "Nemotron 3.5 Lightning Free - free NVIDIA trial model"
-
+  # per-model nudge override: one extra reprompt round for tool-less
+  # answers. glob on the model id, first match wins. beats model_info.jsonc
+  # (which already flags the spark models). empty = catalog rules.
+  nudge:
+    # - pattern: "*muse-spark*"
+    #   nudge: true
+    # - pattern: "*big-pickle*"
+    #   nudge: false
   # claude-* names -> backend for /v1/messages. glob, first match wins.
   # defaults route to free opencode/* models, so claude code works keyless.
   claude_map:

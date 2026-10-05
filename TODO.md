@@ -145,17 +145,18 @@ lanes exist (`zenlanes.go`) but several outline behaviors are missing:
 - overflow past cap: assign to least-recently-used lane (already does via
   shared pool fallback; verify under a 8-concurrent test).
 
-## 9. full model params audit [large]
+## 9. model_info coverage audit [large]
 
-`models.params` covers the main models but a new/renamed model silently
-gets no params. zen 400/403s when required fields are missing.
+done (2026-10-05): `models.params` globs replaced by `model_info.jsonc`
+(102 entries: 81 nim + 14 zen + 7 freepi). sampling defaults are gone;
+`injectParams` only folds camelCase and strips `_nim`.
 
-- on startup, log models in `/v1/models` output with no matching params
-  entry (warn, don't fail).
+- on startup, log models in `/v1/models` output with no model_info entry
+  (warn, don't fail).
 - add a test that every `opencode/*` id returned by `fetchZenModelIDs`
-  matches at least one params glob.
-- keep `inject.params: false` as the escape hatch; document `_nim: true`
-  per-request opt-out (already in example).
+  has a model_info entry.
+- keep `inject.params: false` as the escape hatch (skips normalization);
+  `_nim` strip is part of normalization.
 
 ## 10. pool tuning: calm the refresh storms [medium]
 
