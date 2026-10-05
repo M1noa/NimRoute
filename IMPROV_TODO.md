@@ -86,6 +86,28 @@ one line per item, checkbox marks state. ordered by priority.
 
 ## not done
 
+- [ ] **tokens served per lane and per model, since process start.**
+      right now `laneStatus` carries `requests` + `rate_limited` only, and
+      `usageTotals` is keyed by model and by KeyName (freepi account / nvidia
+      key), never by lane. what is wanted: in-memory counters for tokens
+      served, broken down by lane and by model, covering everything since
+      the proxy started (not the rolling jsonl). shows in `/status` and the
+      `nimstatus.py` lane table. notes:
+      - lane ids are ephemeral (`shared:...` / `hdr:...` / `pck:...`), and
+        `laneRotate` mints a new `ses_*` on the same lane object, so keying
+        on the lane key means a converted lane leaves its old totals behind.
+        keying on the `*zenLane` pointer keeps them across rotation, and
+        sidesteps the question for lanes that get swept.
+      - decide whether totals follow a lane across `convertSharedLocked`
+        (renames the key, same object) and across `sweepLanes` (drops the
+        lane). keeping them on the pointer answers both for free.
+      - per-model needs a map on the lane, so `laneTouch` needs the model
+        and token counts passed in. `laneTouch(lane, proxy)` is the single
+        success hook on the zen path, so that is the one call site to widen.
+      - in-memory only (resets on restart), matching the ask. if it should
+        survive restarts, the jsonl already has the raw rows.
+      - needs a `status.show_*` flag per the /status rules, plus redaction
+        in `StatusFor`.
 - [ ] live restart of the primary (:5419). deliberately left to the user.
 
 ## notes
