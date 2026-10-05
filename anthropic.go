@@ -2061,7 +2061,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
 				noteExitOK(proxy)
-				laneTouch(lane, proxy)
+				laneTouch(lane, proxy, zenModel)
 			}
 			return up
 		}
@@ -2147,6 +2147,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           true,
 			ContentBytes:     int64(len(origBody)),
 		})
+		laneTokensAdd(lane, zenModel, promptT, compT, promptT+compT)
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), written, clientModel, reqID)
 	} else {
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
@@ -2210,6 +2211,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           false,
 			ContentBytes:     int64(len(origBody)),
 		})
+		laneTokensAdd(lane, zenModel, prompT, compT, prompT+compT)
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), len(out), clientModel, reqID)
 	}
 }

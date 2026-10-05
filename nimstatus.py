@@ -82,7 +82,8 @@ def plain_status(d):
         d.get("version", "?"), d.get("uptime", "?"),
         d.get("concurrent", 0), d.get("sem_limit", 0)))
     lanes = d.get("zen_lanes") or []
-    c.append("lanes %d live" % len(lanes))
+    served = sum(l.get("total_tokens", 0) for l in lanes)
+    c.append("lanes %d live · %s tok served" % (len(lanes), fmt_tok(served)))
     p = d.get("pool") or {}
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
@@ -101,7 +102,7 @@ def plain_status(d):
 
 
 def merged_table(d):
-    """One table: lane + its exit (host, cc, ms) + req + state."""
+    """One table: lane + its exit (host, cc, ms) + req + tokens + state."""
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
     exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
@@ -113,6 +114,7 @@ def merged_table(d):
     t.add_column("cc")
     t.add_column("ms", justify="right")
     t.add_column("req", justify="right")
+    t.add_column("tok", justify="right")
     t.add_column("state")
     for l in lanes:
         mark = Text("●", style="green")
@@ -124,9 +126,19 @@ def merged_table(d):
             exit_t = Text(host)
         else:
             exit_t = Text("—", style="dim")
+        # per-model breakdown on hover-equivalent: suffix the count with the
+        # top model so a busy lane says what it served.
+        tok = l.get("total_tokens", 0)
+        by_model = l.get("by_model") or {}
+        if len(by_model) > 1:
+            top = max(by_model, key=lambda m: by_model[m].get("total_tokens", 0))
+            tok_t = Text(fmt_tok(tok), style="dim")
+            tok_t.append(" " + top.split("/")[-1][:12], style="dim")
+        else:
+            tok_t = Text(fmt_tok(tok), style="dim")
         t.add_row(mark, (l.get("id") or "?")[:14], exit_t,
                   str(e.get("country", "·")), str(e.get("latency_ms", "·")),
-                  str(l.get("requests", 0)), state)
+                  str(l.get("requests", 0)), tok_t, state)
     return t
 
 

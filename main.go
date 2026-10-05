@@ -3459,7 +3459,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
 			noteExitOK(usedProxy)
-			laneTouch(lane, usedProxy)
+			laneTouch(lane, usedProxy, realModel)
 		}
 		break
 	}
@@ -3533,6 +3533,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			Error:            recErr,
 			ContentBytes:     int64(len(body)),
 		})
+		if resp.StatusCode == http.StatusOK {
+			laneTokensAdd(lane, realModel, prompT, compT, totalT)
+		}
 	}
 
 	for k, v := range resp.Header {
@@ -3604,6 +3607,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			Stream:           true,
 			ContentBytes:     int64(len(body)),
 		})
+		laneTokensAdd(lane, realModel, prompT, compT, totalT)
 	}
 	acclog.Printf("<- %d %s %s %v %d bytes [opencode] model=%s %s", resp.StatusCode, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond), written, realModel, reqID)
 }

@@ -39,6 +39,18 @@ type zenLane struct {
 	// escalated latches once a direct attempt proved unusable, so the
 	// lane keeps using a proxy even when always_proxy is off.
 	escalated bool
+	// tokens served since process start, by model. lives on the lane object
+	// rather than keyed by lane key, so totals survive laneRotate (new
+	// session, same lane) and convertSharedLocked (key renamed, same lane).
+	tokens map[string]laneTokens
+}
+
+// laneTokens is one model's contribution to a lane's lifetime totals.
+type laneTokens struct {
+	Requests   int `json:"requests"`
+	Prompt     int `json:"prompt_tokens"`
+	Completion int `json:"completion_tokens"`
+	Total      int `json:"total_tokens"`
 }
 
 type laneStatus struct {
@@ -48,6 +60,12 @@ type laneStatus struct {
 	LastUsed  string `json:"last_used_ago"`
 	Requests  int    `json:"requests"`
 	RateLimit int    `json:"rate_limited"`
+	// Prompt/Completion/Tokens are lifetime totals since process start.
+	Prompt     int `json:"prompt_tokens"`
+	Completion int `json:"completion_tokens"`
+	Tokens     int `json:"total_tokens"`
+	// ByModel breaks the totals down per model served on this lane.
+	ByModel map[string]laneTokens `json:"by_model,omitempty"`
 }
 
 var (
@@ -804,8 +822,10 @@ var (
 )
 
 // laneTouch records a successful use: stamps last-used, clears the limit
-// run, pins the working proxy.
-func laneTouch(l *zenLane, proxy string) {
+// run, pins the working proxy, and counts the request against the model.
+// token counts are not known yet at this point (upstream reports them in
+// the body), so laneTokensAdd folds those in once the turn is parsed.
+func laneTouch(l *zenLane, proxy, model string) {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	l.lastUsed = time.Now()
@@ -815,6 +835,40 @@ func laneTouch(l *zenLane, proxy string) {
 		l.proxy = proxy
 		l.country = proxyCountry(proxy)
 	}
+	if model == "" {
+		return
+	}
+	if l.tokens == nil {
+		l.tokens = map[string]laneTokens{}
+	}
+	m := l.tokens[model]
+	m.Requests++
+	l.tokens[model] = m
+}
+
+// laneTokensAdd folds one turn's upstream token counts into the lane's
+// lifetime per-model totals. tok.Total falls back to prompt+completion
+// when upstream omits it.
+func laneTokensAdd(l *zenLane, model string, prompt, completion, total int) {
+	if l == nil || model == "" {
+		return
+	}
+	if total <= 0 {
+		total = prompt + completion
+	}
+	if total == 0 && prompt == 0 && completion == 0 {
+		return
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if l.tokens == nil {
+		l.tokens = map[string]laneTokens{}
+	}
+	m := l.tokens[model]
+	m.Prompt += prompt
+	m.Completion += completion
+	m.Total += total
+	l.tokens[model] = m
 }
 
 // pickLaneProxy returns a verified proxy not already pinned by another
@@ -1191,6 +1245,17 @@ func laneSnapshot() []laneStatus {
 			ID: l.id, Proxy: redactProxyUserinfo(l.proxy), Country: l.country,
 			LastUsed: now.Sub(l.lastUsed).Round(time.Second).String(),
 			Requests: l.requests, RateLimit: l.rateLimit,
+		}
+		for _, m := range l.tokens {
+			st.Prompt += m.Prompt
+			st.Completion += m.Completion
+			st.Tokens += m.Total
+		}
+		if len(l.tokens) > 0 {
+			st.ByModel = make(map[string]laneTokens, len(l.tokens))
+			for k, v := range l.tokens {
+				st.ByModel[k] = v
+			}
 		}
 		out = append(out, st)
 	}

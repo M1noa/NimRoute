@@ -2365,7 +2365,7 @@ func TestLaneSnapshot(t *testing.T) {
 	defer resetLanes()
 	body := []byte(`{"messages":[{"role":"user","content":"snap"}]}`)
 	l := laneFor("snap-1", body)
-	laneTouch(l, "")
+	laneTouch(l, "", "")
 	snap := laneSnapshot()
 	if len(snap) != 1 || snap[0].Requests != 1 {
 		t.Fatalf("snapshot = %+v, want 1 lane with 1 request", snap)
@@ -2421,7 +2421,7 @@ func TestLaneStaleRunTracksLimits(t *testing.T) {
 	if d := laneStaleRun(l); d < 29*time.Second || d > 31*time.Second {
 		t.Fatalf("laneStaleRun = %v, want ~30s", d)
 	}
-	laneTouch(l, "")
+	laneTouch(l, "", "")
 	if d := laneStaleRun(l); d != 0 {
 		t.Fatalf("laneStaleRun = %v after success, want 0", d)
 	}
@@ -2491,7 +2491,7 @@ func TestLaneRotateResetsRunOnSuccess(t *testing.T) {
 	if d := laneStaleRun(l); d <= 0 {
 		t.Error("rotated lane must stamp a limit run")
 	}
-	laneTouch(l, "http://10.0.0.8:8")
+	laneTouch(l, "http://10.0.0.8:8", "")
 	if d := laneStaleRun(l); d != 0 {
 		t.Error("success must clear the limit run")
 	}
