@@ -1866,6 +1866,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 	lane := laneFor(r.Header.Get("x-session-id"), oaiBody)
 	sessionID := laneSession(lane)
+	noteLaneUse(true) // capacity tracking for the low-load lane race
+	defer noteLaneUse(false)
 
 	// zenPost sends body to zen with proxy failover and returns the response.
 	zenPost := func(body []byte, stream bool, tag string) *http.Response {
@@ -1921,14 +1923,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 			}
 
-			hedgeAfter := 2 * time.Second
-			if ms := cfg().Zen.HedgeAfterMs; ms != 0 {
-				if ms < 0 {
-					hedgeAfter = 0
-				} else {
-					hedgeAfter = time.Duration(ms) * time.Millisecond
-				}
-			}
+			hedgeAfter := hedgeDelay()
 			var firstByteAt time.Time
 			traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 				GotFirstResponseByte: func() { firstByteAt = time.Now() },

@@ -121,15 +121,34 @@ type zenConfig struct {
 	// lane identity modes, independently toggleable. shared pre-opens
 	// lanes-count lanes and spreads requests across them; hdr pins an
 	// x-session-id header to a lane (converting an idle shared lane when
-	// full); convo pins a conversation hash from the second sighting.
-	// convo is buggy (hash drifts as history grows, one-shots pin lanes)
-	// and off by default: shared spreads better. all off falls back to
-	// shared with a warning.
-	LaneHdr          *bool `yaml:"lane_hdr"`
-	LaneConvo        *bool `yaml:"lane_convo"`
-	LaneShared       *bool `yaml:"lane_shared"`
-	LaneTTLMinutes   int   `yaml:"lane_ttl_minutes"`
-	LaneCooldownSecs int   `yaml:"lane_cooldown_secs"`
+	// full); cache_key pins the openai-compat prompt_cache_key when no
+	// session header arrives; convo pins a conversation hash from the
+	// second sighting. convo is buggy (hash drifts as history grows,
+	// one-shots pin lanes) and off by default: shared spreads better.
+	// all off falls back to shared with a warning.
+	LaneHdr    *bool `yaml:"lane_hdr"`
+	LaneConvo  *bool `yaml:"lane_convo"`
+	LaneShared *bool `yaml:"lane_shared"`
+	// LaneCacheKey pins a lane on the openai-compat prompt_cache_key when
+	// no x-session-id header is sent. true by default: without it those
+	// requests all fall onto the shared pool.
+	LaneCacheKey *bool `yaml:"lane_cache_key"`
+	// LaneRaceEnabled races two lanes and keeps the first byte when the
+	// pool is idle. costs two upstream inferences per request (the loser
+	// is cancelled once the winner's headers land), so it is off by
+	// default and only runs below RaceUtilizationThreshold.
+	LaneRaceEnabled bool `yaml:"lane_race_enabled"`
+	// RaceUtilizationThreshold is the busy-lane share (percent) under
+	// which the race is allowed. 0 = 30.
+	RaceUtilizationThreshold int `yaml:"race_utilization_threshold"`
+	// RaceUseWindowMinutes is the rolling window the busy share is
+	// measured over. 0 = 10.
+	RaceUseWindowMinutes int `yaml:"race_use_window_minutes"`
+	// RaceHedgeAfterMs is the wait before the second lane starts when
+	// racing. 0 = both fire at once, which is what a race wants.
+	RaceHedgeAfterMs int `yaml:"race_hedge_after_ms"`
+	LaneTTLMinutes   int `yaml:"lane_ttl_minutes"`
+	LaneCooldownSecs int `yaml:"lane_cooldown_secs"`
 	// SessionIdleMinutes drops lanes idle past this (minutes) on the pool
 	// sweep, clearing the session hash/id from cache. lane_ttl_minutes
 	// stays the hard cap. 0 disables (ttl only).
@@ -313,35 +332,38 @@ func defaultConfig() appConfig {
 			AdInlineEvery: 5,
 		},
 		Zen: zenConfig{
-			Enabled:                true,
-			BlockedCountries:       []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
-			MaxResponseMs:          250,
-			PoolSize:               400,
-			Lanes:                  25,
-			LaneTTLMinutes:         30,
-			LaneCooldownSecs:       60,
-			SessionIdleMinutes:     6,
-			ConvoIdleMinutes:       1,
-			LaneMinGapMs:           1500,
-			LaneReleaseSecs:        90,
-			PoolRefresh429s:        2,
-			ExitBurnMinutes:        30,
-			MaxRetries:             4,
-			ProbeTimeoutMs:         1000,
-			RaceTimeoutMs:          3000,
-			LaneGateMaxSecs:        10,
-			LaneWaitMaxSecs:        3,
-			StalePoolSecs:          15,
-			ZenTimeoutSecs:         120,
-			ZenDirectTimeoutSecs:   300,
-			VerifyConcurrency:      40,
-			ErrorThreshold:         3,
-			RefreshIntervalMinutes: 60,
-			RetryBackoffMs:         150,
-			RetryBackoffMaxMs:      300,
-			LaneHdr:                boolPtr(true),
-			LaneConvo:              boolPtr(false),
-			LaneShared:             boolPtr(true),
+			Enabled:                  true,
+			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
+			MaxResponseMs:            250,
+			PoolSize:                 400,
+			Lanes:                    25,
+			LaneTTLMinutes:           30,
+			LaneCooldownSecs:         60,
+			SessionIdleMinutes:       6,
+			ConvoIdleMinutes:         1,
+			LaneMinGapMs:             1500,
+			LaneReleaseSecs:          90,
+			PoolRefresh429s:          2,
+			ExitBurnMinutes:          30,
+			MaxRetries:               4,
+			ProbeTimeoutMs:           1000,
+			RaceTimeoutMs:            3000,
+			LaneGateMaxSecs:          10,
+			LaneWaitMaxSecs:          3,
+			StalePoolSecs:            15,
+			ZenTimeoutSecs:           120,
+			ZenDirectTimeoutSecs:     300,
+			VerifyConcurrency:        40,
+			ErrorThreshold:           3,
+			RefreshIntervalMinutes:   60,
+			RetryBackoffMs:           150,
+			RetryBackoffMaxMs:        300,
+			LaneHdr:                  boolPtr(true),
+			LaneConvo:                boolPtr(false),
+			LaneShared:               boolPtr(true),
+			LaneCacheKey:             boolPtr(true),
+			RaceUtilizationThreshold: 30,
+			RaceUseWindowMinutes:     10,
 		},
 		Status: statusConfig{
 			ShowKeys:           true,

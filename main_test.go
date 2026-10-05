@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1983,32 +1985,210 @@ func TestLaneHeaderPinning(t *testing.T) {
 	}
 }
 
-// lane modes toggle independently: hdr off means headers spread on shared,
-// shared+convo off means headers still pin, all off falls back to shared.
-func TestLaneModesToggle(t *testing.T) {
+// prompt_cache_key pins a lane for openai-compat clients that send no
+// x-session-id header, and stays stripped from the upstream body.
+func TestLaneCacheKeyIdentity(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
-	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	c := testConfig()
 	c.Zen.Lanes = 4
+	useConfig(t, c)
+	b1 := []byte(`{"model":"opencode/space-bunny-free","prompt_cache_key":"conv-a","messages":[{"role":"user","content":"hi"}]}`)
+	b2 := []byte(`{"model":"opencode/space-bunny-free","prompt_cache_key":"conv-b","messages":[{"role":"user","content":"hi"}]}`)
+	a := laneFor("", b1)
+	if got := laneKeyOf(a); !strings.HasPrefix(got, "pck:") {
+		t.Fatalf("prompt_cache_key must pin a lane, got %q", got)
+	}
+	if laneFor("", b1) != a {
+		t.Fatal("same prompt_cache_key must reuse its lane")
+	}
+	if laneFor("", b2) == a {
+		t.Fatal("different prompt_cache_key must not share a lane")
+	}
+	// camel spelling works too
+	camel := []byte(`{"promptCacheKey":"conv-c","messages":[{"role":"user","content":"hi"}]}`)
+	if k := laneKeyOf(laneFor("", camel)); !strings.HasPrefix(k, "pck:") {
+		t.Fatalf("promptCacheKey must pin a lane, got %q", k)
+	}
+	// never reaches upstream
+	var m map[string]any
+	if json.Unmarshal(b1, &m) != nil {
+		t.Fatal("bad fixture")
+	}
+	stripCacheFields(m)
+	if _, ok := m["prompt_cache_key"]; ok {
+		t.Fatal("prompt_cache_key must be stripped for zen")
+	}
+	// off sends those requests to the shared pool
+	resetLanes()
+	c.Zen.LaneCacheKey = boolPtr(false)
+	useConfig(t, c)
+	laneFor("", b1)
+	if k := laneKeyOf(laneFor("", b1)); strings.HasPrefix(k, "pck:") {
+		t.Fatalf("lane_cache_key off must not pin, got %q", k)
+	}
+}
+
+// the low-load lane race: off by default, on when idle under threshold,
+// never when the pool is busy.
+func TestLaneRaceGate(t *testing.T) {
+	c := testConfig()
+	c.Zen.LaneRaceEnabled = true
+	c.Zen.RaceUtilizationThreshold = 30
+	c.Zen.RaceUseWindowMinutes = 10
+	c.Zen.Lanes = 4
+	useConfig(t, c)
+	resetLanes()
+	defer resetLanes()
+	ensureSharedLanes() // utilization reads against lane count, so fill first
+
+	// no traffic recorded: idle, so the race fires at once.
+	resetLaneUse()
+	if d := hedgeDelay(); d != 0 {
+		t.Fatalf("idle pool must race immediately, got %v", d)
+	}
+
+	// all four lanes busy: over the 30% threshold, fall back to hedging.
+	resetLaneUse()
+	for i := 0; i < 4; i++ {
+		noteLaneUse(true)
+	}
+	if got := laneUtilization(); got < 0.99 {
+		t.Fatalf("4 of 4 lanes busy must read ~100%%, got %.2f", got)
+	}
+	if d := hedgeDelay(); d != 2*time.Second {
+		t.Fatalf("busy pool must use the 2s hedge, got %v", d)
+	}
+
+	// one of four busy: 25%, under threshold, race again.
+	resetLaneUse()
+	noteLaneUse(true)
+	if got := laneUtilization(); got > 0.26 {
+		t.Fatalf("1 of 4 lanes busy must read ~25%%, got %.2f", got)
+	}
+	if d := hedgeDelay(); d != 0 {
+		t.Fatalf("mostly-idle pool must race, got %v", d)
+	}
+
+	// off: never races, even when idle.
+	resetLaneUse()
+	c.Zen.LaneRaceEnabled = false
+	useConfig(t, c)
+	if d := hedgeDelay(); d != 2*time.Second {
+		t.Fatalf("race disabled must hedge, got %v", d)
+	}
+}
+
+// hedge_after_ms -1 still disables hedging regardless of the race setting.
+func TestHedgeDelayDisabledWins(t *testing.T) {
+	c := testConfig()
+	c.Zen.LaneRaceEnabled = true
+	c.Zen.HedgeAfterMs = -1
+	useConfig(t, c)
+	resetLaneUse()
+	defer resetLaneUse()
+	if d := hedgeDelay(); d != 0 {
+		t.Fatalf("hedge_after_ms -1 must disable the race too, got %v", d)
+	}
+}
+
+func resetLaneUse() {
+	useMu.Lock()
+	useLog = nil
+	useMu.Unlock()
+}
+
+// shared lanes must actually spread: N successive headerless requests (what a
+// client without x-session-id sends) must touch N distinct lanes, not stack
+// on the coldest one. lastUsed is stamped on hand-out, not just on success.
+func TestSharedLanesSpreadAcrossConcurrentClients(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 6
 	c.Zen.LaneHdr = boolPtr(false)
 	c.Zen.LaneConvo = boolPtr(false)
 	c.Zen.LaneShared = boolPtr(true)
 	useConfig(t, c)
-	// headers never pin when hdr is off: both land in the shared pool,
-	// and no hdr: key exists in the table.
-	for _, h := range []string{"h1", "h2", "h3"} {
-		laneFor(h, body)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		seen[laneKeyOf(laneFor("", body))] = true
+	}
+	if len(seen) != 6 {
+		t.Fatalf("6 requests touched %d lanes, want 6 distinct: %v", len(seen), seen)
+	}
+}
+
+// concurrent shared requests must not collapse onto one lane: this is the
+// bug where lastUsed only advanced on success, so every in-flight request
+// drew the same coldest lane.
+func TestSharedLanesSpreadConcurrently(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 8
+	c.Zen.LaneHdr = boolPtr(false)
+	c.Zen.LaneConvo = boolPtr(false)
+	c.Zen.LaneShared = boolPtr(true)
+	useConfig(t, c)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	var mu sync.Mutex
+	seen := map[*zenLane]bool{}
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l := laneFor("", body)
+			mu.Lock()
+			seen[l] = true
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(seen) < 6 {
+		t.Fatalf("24 concurrent requests hit only %d lanes, want most of 8", len(seen))
+	}
+}
+
+// an hdr key arriving at a full table converts the idlest shared lane
+// rather than piling onto one fallback or evicting a pinned lane.
+func TestFullTableConvertsSharedLane(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 3
+	c.Zen.LaneHdr = boolPtr(true)
+	c.Zen.LaneShared = boolPtr(true)
+	useConfig(t, c)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	// fill with three shared lanes, staggered so one is clearly idlest
+	ensureSharedLanes()
+	lanesMu.Lock()
+	var keys []string
+	for k := range lanes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		lanes[k].lastUsed = time.Now().Add(-time.Duration(len(keys)-i) * time.Minute)
+	}
+	idlest, idlestSess := keys[0], lanes[keys[0]].session
+	lanesMu.Unlock()
+
+	l := laneFor("newclient", body)
+	if got := laneKeyOf(l); !strings.HasPrefix(got, "hdr:") {
+		t.Fatalf("hdr key landed on %s, want an hdr: lane", got)
+	}
+	if laneSession(l) == idlestSess {
+		t.Fatal("converted lane must mint a fresh session")
 	}
 	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	for k := range lanes {
-		if strings.HasPrefix(k, "hdr:") {
-			t.Fatalf("hdr off: pinned key %s exists, want shared only", k)
-		}
-		if !strings.HasPrefix(k, "shared:") {
-			t.Fatalf("hdr off: unexpected key %s, want shared only", k)
-		}
+	_, stillThere := lanes[idlest]
+	lanesMu.Unlock()
+	if stillThere {
+		t.Fatal("converted shared lane must be renamed, not left behind")
 	}
 }
 

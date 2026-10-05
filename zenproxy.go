@@ -537,6 +537,30 @@ func zenBackoffCtx(ctx context.Context, retry int) {
 	}
 }
 
+// hedgeDelay resolves the hedge wait for a send. when the lane race is on
+// and the pool has been idle, both lanes fire at once (race_hedge_after_ms,
+// 0 by default) and the first byte wins: costs a second inference, but the
+// pool has the headroom. otherwise the configured hedge delay applies.
+// hedge_after_ms -1 disables hedging, 0 means the 2s default.
+func hedgeDelay() time.Duration {
+	if share, threshold := lanesIdleEnough(); share < threshold {
+		ms := cfg().Zen.RaceHedgeAfterMs
+		if ms < 0 {
+			ms = 0
+		}
+		acclog.Printf("  opencode lane race on (busy share %.0f%% < %.0f%%)", share*100, threshold*100)
+		return time.Duration(ms) * time.Millisecond
+	}
+	ms := cfg().Zen.HedgeAfterMs
+	if ms < 0 {
+		return 0 // -1 disables hedging entirely
+	}
+	if ms == 0 {
+		return 2 * time.Second
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // zenGeoBlocked reports whether an upstream error body means the model is
 // geo-restricted for the exit IP. Switching proxies fixes the request.
 func zenGeoBlocked(body []byte) bool {

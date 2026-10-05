@@ -550,13 +550,27 @@ func laneFor(headerSession string, body []byte) *zenLane {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	wantHdr, wantConvo, wantShared := laneModes()
-	if !wantHdr && !wantConvo && !wantShared {
+	// absent key = default on: openai-compat clients with no session
+	// header would otherwise all share one lane.
+	wantCacheKey := true
+	if b := cfg().Zen.LaneCacheKey; b != nil {
+		wantCacheKey = *b
+	}
+	if !wantHdr && !wantConvo && !wantShared && !wantCacheKey {
 		wantShared = true // all off: spread anyway, never fail a request
 	}
 	key := ""
-	if headerSession != "" && wantHdr {
+	switch {
+	case headerSession != "" && wantHdr:
 		key = "hdr:" + headerSession
-	} else if wantConvo {
+	case wantCacheKey:
+		// openai-compat clients that send no session header pin on
+		// prompt_cache_key, which is per conversation.
+		if ck := cacheKeyOf(body); ck != "" {
+			key = "pck:" + ck
+		}
+	}
+	if key == "" && wantConvo {
 		if h := convoHash(body); h != "" {
 			if seenConvoLocked(h) {
 				key = h
@@ -593,6 +607,10 @@ func laneFor(headerSession string, body []byte) *zenLane {
 			return l
 		}
 	}
+	// top the shared pool up to the cap on first use too, so a cold start
+	// that skipped ensureSharedLanes still spreads across all lanes
+	// instead of stacking on whichever one was created first.
+	ensureSharedLanesLocked()
 	return sharedLaneLocked()
 }
 
@@ -642,7 +660,7 @@ func convertSharedLocked(key string) *zenLane {
 
 // ensureSharedLanes pre-opens shared lanes up to the cap so a cold start
 // does not serialize early requests on lane creation + exit races. runs
-// once at startup after the first pool refresh.
+// at startup after the first pool refresh and again on first request.
 func ensureSharedLanes() {
 	_, _, wantShared := laneModes()
 	if !wantShared {
@@ -650,6 +668,13 @@ func ensureSharedLanes() {
 	}
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
+	ensureSharedLanesLocked()
+}
+
+// ensureSharedLanesLocked is ensureSharedLanes with lanesMu already held.
+// new lanes get an epoch lastUsed so they land at the cold end of the lru
+// pick and hand out one per request before any lane is reused.
+func ensureSharedLanesLocked() {
 	for len(lanes) < laneCap() {
 		l := &zenLane{id: "shared", session: zenSession(), lastUsed: time.Now()}
 		k := "shared:" + l.session[len(l.session)-6:]
@@ -658,6 +683,26 @@ func ensureSharedLanes() {
 	}
 }
 
+// cacheKeyOf reads the openai-compat prompt_cache_key (or camel
+// promptCacheKey) off a body. clients set it per conversation, so it works
+// as a lane identity where no x-session-id header exists. read before
+// stripCacheFields, which deletes the field for upstream.
+func cacheKeyOf(body []byte) string {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	for _, k := range []string{"prompt_cache_key", "promptCacheKey"} {
+		if s, ok := m[k].(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// shortLaneID shortens a lane key for display.
 func shortLaneID(key string) string {
 	if len(key) <= 12 {
 		return key
@@ -665,9 +710,12 @@ func shortLaneID(key string) string {
 	return key[:8] + "..." + key[len(key)-4:]
 }
 
-// sharedLaneLocked picks the lru shared lane, creating shared-n slots up
-// to cap. caller holds lanesMu. no health filtering: lanes never cool, a
-// limit rotates the exit instead of blocking the lane.
+// sharedLaneLocked picks the coldest shared lane, creating shared-n slots
+// up to cap. caller holds lanesMu. no health filtering: lanes never cool, a
+// limit rotates the exit instead of blocking the lane. stamps lastUsed on
+// hand-out so the next request moves to a different lane: without this,
+// lastUsed only advanced on success and every concurrent request drew the
+// same coldest lane, stacking clients on one exit.
 func sharedLaneLocked() *zenLane {
 	var cands []*zenLane
 	for k, l := range lanes {
@@ -678,6 +726,7 @@ func sharedLaneLocked() *zenLane {
 	now := time.Now()
 	sort.Slice(cands, func(i, j int) bool { return cands[i].lastUsed.Before(cands[j].lastUsed) })
 	if len(cands) > 0 {
+		cands[0].lastUsed = now
 		return cands[0]
 	}
 	if len(lanes) < laneCap() {
@@ -878,6 +927,102 @@ func laneStaleRun(l *zenLane) time.Duration {
 		return 0
 	}
 	return time.Since(l.limitedSince)
+}
+
+// --- capacity tracking (low-load lane race) ---
+
+// laneUse is one sample on a lane: an open marks a request starting, a
+// close marks it finishing.
+type laneUse struct {
+	at     time.Time
+	opened bool
+}
+
+var (
+	useMu  sync.Mutex
+	useLog []laneUse
+)
+
+// noteLaneUse records a lane taking (opened) or finishing (close) a request.
+func noteLaneUse(opened bool) {
+	at := time.Now()
+	useMu.Lock()
+	useLog = append(useLog, laneUse{at: at, opened: opened})
+	cut := at.Add(-laneUseWindow())
+	i := 0
+	for i < len(useLog) && useLog[i].at.Before(cut) {
+		i++
+	}
+	if i > 0 {
+		useLog = append([]laneUse(nil), useLog[i:]...)
+	}
+	useMu.Unlock()
+}
+
+// laneUseWindow is how far back utilization is measured. configurable since
+// the idle threshold only means something over a stated window.
+func laneUseWindow() time.Duration {
+	if m := cfg().Zen.RaceUseWindowMinutes; m > 0 {
+		return time.Duration(m) * time.Minute
+	}
+	return 10 * time.Minute
+}
+
+// laneUtilization reports the peak share of lanes that were busy at once
+// inside the window: busy-when-busiest is exactly what decides whether a
+// spare lane is free to race on. returns 0 when nothing was recorded.
+func laneUtilization() float64 {
+	cut := time.Now().Add(-laneUseWindow())
+	type ev struct {
+		at   time.Time
+		open bool
+	}
+	var evs []ev
+	useMu.Lock()
+	for _, u := range useLog {
+		if u.at.After(cut) {
+			evs = append(evs, ev{at: u.at, open: u.opened})
+		}
+	}
+	useMu.Unlock()
+	lanesMu.Lock()
+	n := len(lanes)
+	lanesMu.Unlock()
+	if len(evs) == 0 || n == 0 {
+		return 0
+	}
+	// samples arrive in time order per lane (one open, one close), so a
+	// running depth count is the concurrent lane count.
+	cur, peak := 0, 0
+	for _, e := range evs {
+		if e.open {
+			cur++
+			if cur > peak {
+				peak = cur
+			}
+		} else if cur > 0 {
+			cur--
+		}
+	}
+	share := float64(peak) / float64(n)
+	if share > 1 {
+		share = 1
+	}
+	return share
+}
+
+// lanesIdleEnough reports the measured busy share and the threshold. when
+// the share is under the threshold the pool has spare exits, so racing two
+// lanes is cheap enough to cut ttft. disabled -> never idle.
+func lanesIdleEnough() (share, threshold float64) {
+	threshold = 0.30
+	if t := cfg().Zen.RaceUtilizationThreshold; t > 0 {
+		threshold = float64(t) / 100 // config is a percent
+	}
+	if !cfg().Zen.LaneRaceEnabled {
+		return 1, threshold
+	}
+	return laneUtilization(), threshold
 }
 
 // lastZenSuccess tracks the last working zen response, so the retry loops

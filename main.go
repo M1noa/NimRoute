@@ -209,6 +209,51 @@ func (p *Pool) semCap() int {
 	return n
 }
 
+// copyZenChatStream pipes an upstream zen chat SSE body to the client,
+// flushing each read. it stops as soon as the client context is done, so a
+// cancelled request closes upstream instead of draining generation nobody
+// reads. usage tokens are teed off the passthrough. extra, when non-nil,
+// receives a copy of everything written (debug mode).
+func copyZenChatStream(ctx context.Context, w http.ResponseWriter, resp *http.Response, extra *bytes.Buffer, prompT, compT int) (written int64, promptT, completionT int) {
+	fl, _ := w.(http.Flusher)
+	buf := make([]byte, 4096)
+	// carry: a usage chunk split across reads is still caught, usage json
+	// is small and lands wholly in one final chunk.
+	var carry []byte
+	for {
+		if ctx.Err() != nil {
+			resp.Body.Close()
+			return written, prompT, compT
+		}
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			if extra != nil {
+				extra.Write(buf[:n])
+			}
+			blk := buf[:n]
+			if len(carry) > 0 {
+				blk = append(carry, buf[:n]...)
+				carry = nil
+			}
+			if p, c := sseUsageTee(blk); p > 0 || c > 0 {
+				prompT, compT = p, c
+			} else if len(blk) > 512 {
+				carry = append(carry[:0], blk[len(blk)-512:]...)
+			} else {
+				carry = append(carry[:0], blk...)
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+			written += int64(n)
+		}
+		if err != nil {
+			return written, prompT, compT
+		}
+	}
+}
+
 func (p *Pool) Reload(entries map[string]string) (added, removed int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3082,42 +3127,8 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStream && lastResp.StatusCode == http.StatusOK {
-		if fl, ok := w.(http.Flusher); ok {
-			buf := make([]byte, 4096)
-			// carry: a usage chunk split across reads is still caught,
-			// usage json is small and lands wholly in one final chunk.
-			var carry []byte
-			for {
-				// client gone: close upstream, stop streaming orphan bytes.
-				if r.Context().Err() != nil {
-					lastResp.Body.Close()
-					break
-				}
-				n, err := lastResp.Body.Read(buf)
-				if n > 0 {
-					w.Write(buf[:n])
-					if respBodyBuf != nil {
-						respBodyBuf.Write(buf[:n])
-					}
-					blk := buf[:n]
-					if len(carry) > 0 {
-						blk = append(carry, buf[:n]...)
-						carry = nil
-					}
-					if p, c := sseUsageTee(blk); p > 0 || c > 0 {
-						prompT, compT = p, c
-					} else if len(blk) > 512 {
-						carry = append(carry[:0], blk[len(blk)-512:]...)
-					} else {
-						carry = append(carry[:0], blk...)
-					}
-					fl.Flush()
-					written += int64(n)
-				}
-				if err != nil {
-					break
-				}
-			}
+		if _, ok := w.(http.Flusher); ok {
+			written, prompT, compT = copyZenChatStream(r.Context(), w, lastResp, respBodyBuf, prompT, compT)
 		} else {
 			written, _ = io.Copy(w, lastResp.Body)
 		}
@@ -3166,6 +3177,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		wantResponses = false
 	}
 	tnames := oaiToolNames(body)
+	// lane identity must be read before stripCacheFields drops the field.
+	lane := laneFor(r.Header.Get("x-session-id"), body)
+	sessionID := laneSession(lane)
+	noteLaneUse(true) // capacity tracking for the low-load lane race
+	defer noteLaneUse(false)
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
@@ -3207,9 +3223,6 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var resp *http.Response
 	var prompT, compT, totalT int
 	var recErr string
-
-	lane := laneFor(r.Header.Get("x-session-id"), body)
-	sessionID := laneSession(lane)
 	var usedProxy string
 	rotating := true
 	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
@@ -3279,18 +3292,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 		}
 
-		// hedged send: if no first byte in ~2s, fire the same body on a
-		// second exit; first response wins, loser is cancelled. first-byte
-		// latency over 6s earns the exit a slow strike (2 in 1h drops it);
-		// every sample feeds the live rtt weight so fast exits win more.
-		hedgeAfter := 2 * time.Second
-		if ms := cfg().Zen.HedgeAfterMs; ms != 0 {
-			if ms < 0 {
-				hedgeAfter = 0 // -1 disables hedging
-			} else {
-				hedgeAfter = time.Duration(ms) * time.Millisecond
-			}
-		}
+		// hedged send: normally a second exit starts only if the first
+		// gives no first byte in ~2s. when the pool has been idle and
+		// lane_race_enabled is set, hedgeDelay collapses that to zero so
+		// both lanes race and the first byte wins. first-byte latency over
+		// 6s earns the exit a slow strike (2 in 1h drops it); every sample
+		// feeds the live rtt weight so fast exits win more.
+		hedgeAfter := hedgeDelay()
 		hedgeFn := func(hctx context.Context) (*http.Response, error) {
 			hl := laneFailover(lane)
 			hp := laneProxyFor(hl, realModel)
@@ -3569,37 +3577,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			w.Header().Set("Content-Type", "application/json")
 			n, _ := w.Write(rb)
 			written = int64(n)
-		} else if fl, ok := w.(http.Flusher); ok {
-			buf := make([]byte, 4096)
-			var carry []byte
-			for {
-				// client gone: close upstream, stop copying orphan bytes.
-				if r.Context().Err() != nil {
-					resp.Body.Close()
-					break
-				}
-				n, err := resp.Body.Read(buf)
-				if n > 0 {
-					w.Write(buf[:n])
-					blk := buf[:n]
-					if len(carry) > 0 {
-						blk = append(carry, buf[:n]...)
-						carry = nil
-					}
-					if p, c := sseUsageTee(blk); p > 0 || c > 0 {
-						prompT, compT = p, c
-					} else if len(blk) > 512 {
-						carry = append(carry[:0], blk[len(blk)-512:]...)
-					} else {
-						carry = append(carry[:0], blk...)
-					}
-					fl.Flush()
-					written += int64(n)
-				}
-				if err != nil {
-					break
-				}
-			}
+		} else if _, ok := w.(http.Flusher); ok {
+			written, prompT, compT = copyZenChatStream(r.Context(), w, resp, nil, prompT, compT)
 		} else {
 			written, _ = io.Copy(w, resp.Body)
 		}

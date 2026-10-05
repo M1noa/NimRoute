@@ -187,6 +187,26 @@ zen:
   # pre-open lanes-count shared lanes at startup and spread requests
   # across them weighted toward fast exits. the smooth simple default.
   lane_shared: true
+  # pin a lane on the openai-compat prompt_cache_key when the client sends
+  # no x-session-id header. clients set that key per conversation, so it
+  # keeps a chat on one exit. off sends those requests to the shared pool.
+  lane_cache_key: true
+  # LOW-LOAD LANE RACE. when the pool has been mostly idle, fire the request
+  # on two lanes at once and keep whichever gives a first byte sooner.
+  # WARNING: this burns two upstream inferences per request (the loser is
+  # cancelled once the winner's headers land, but zen has already started
+  # generating), so it costs free-tier quota and can trip per-exit rate
+  # limits sooner. off by default. it only runs while the pool is idle, so
+  # under real load it stops firing on its own.
+  lane_race_enabled: false
+  # busy-lane share (percent) under which the race is allowed. measured as
+  # the peak share of lanes busy at once inside the window below. 0 = 30.
+  race_utilization_threshold: 30
+  # rolling window the busy share is measured over (minutes). 0 = 10.
+  race_use_window_minutes: 10
+  # wait before the second lane starts when racing (ms). 0 = both at once,
+  # which is what a race wants. negative = same as 0.
+  race_hedge_after_ms: 0
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
   # drop lanes idle past this (minutes) on the same sweep, clearing the
