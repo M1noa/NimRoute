@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -377,8 +378,84 @@ func TestParseFreepiErr(t *testing.T) {
 	}
 }
 
+// fakeFreepi points freePiBase at a local server for the test.
+func fakeFreepi(t *testing.T, h http.HandlerFunc) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	old := freePiBase
+	freePiBase = srv.URL
+	t.Cleanup(func() {
+		srv.Close()
+		freePiBase = old
+		freepiMu.Lock()
+		freepiAccts = map[string]*freepiAcct{}
+		freepiMu.Unlock()
+	})
+}
+
+// /status must never wait on api.freepi.ai: the snapshot reads cache and
+// refreshes in the background, one flight per account.
+func TestFreepiSnapshotNonBlocking(t *testing.T) {
+	var hits atomic.Int32
+	fakeFreepi(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	c := testConfig()
+	c.Freepi.Enabled = true
+	c.Freepi.Accounts = []freepiAccount{{Name: "slow", JWT: "j"}}
+	useConfig(t, c)
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		if sum := freepiSnapshot(); sum == nil || len(sum.Accounts) != 1 {
+			t.Fatalf("want 1 account: %+v", sum)
+		}
+	}
+	if d := time.Since(start); d > 150*time.Millisecond {
+		t.Fatalf("snapshot blocked on upstream: %v", d)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if n := hits.Load(); n > 2 {
+		t.Fatalf("failing upstream hit %d times, want one flight (catalog+stats)", n)
+	}
+}
+
+// a warmed cache serves models and stats without touching upstream again.
+func TestFreepiSnapshotServesCache(t *testing.T) {
+	fakeFreepi(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/client-version":
+			w.Write([]byte(`{"models":[{"id":"m1","name":"M1 · ~0.5x usage"}]}`))
+		case "/me/stats":
+			w.Write([]byte(`{"tier":"free","request_count_today":7}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	c := testConfig()
+	c.Freepi.Enabled = true
+	c.Freepi.Accounts = []freepiAccount{{Name: "warm", JWT: "j"}}
+	useConfig(t, c)
+	freepiSnapshot()
+	deadline := time.Now().Add(2 * time.Second)
+	var sum *freepiSummary
+	for time.Now().Before(deadline) {
+		sum = freepiSnapshot()
+		if len(sum.Accounts[0].Models) == 1 && sum.Accounts[0].Tier == "free" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	a := sum.Accounts[0]
+	if len(a.Models) != 1 || a.Models[0] != "m1" || a.Tier != "free" || a.ReqToday != 7 {
+		t.Fatalf("cache not served: %+v", a)
+	}
+}
+
 // freepi disabled without accounts; jwt never in status.
 func TestFreepiSnapshotNoLeak(t *testing.T) {
+	fakeFreepi(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	c := testConfig()
 	c.Freepi.Enabled = true
 	c.Freepi.Accounts = []freepiAccount{{Name: "a", JWT: "secret-jwt"}}

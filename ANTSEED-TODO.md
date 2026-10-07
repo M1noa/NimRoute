@@ -39,7 +39,17 @@ offer failover only (no lanes — 28/28 no-429 experiment killed that).
       chat + anthropic /v1/messages + streaming ok, /status antseed
       section ok, burst8 + rapid12 = 20/20 200, zero failovers
 - [x] teardown: scratch config/usage/binary removed
-- [ ] live restart of primary (:5419) — left to user
+- [x] dht fallback: sellers with no `publicAddress` in the stats
+      snapshot resolved via bep5 get_peers on `antseed:peer:<id>`
+      (dht1/dht2.antseed.com:6881); all endpoints kept, tried in order
+- [x] model list = every free chat/llm offer, sorted by local
+      per-model request count then name (network has no per-model
+      usage feed, only seller totals)
+- [x] `./nim status` antseed column + plain-text line (nimstatus.py)
+- [x] e2e: 12 models / 13 offers / 5 peers; glm-5.3-flash and
+      gpt-oss-120b (Open Forge, previously dropped) answer
+- [x] live restart of primary (:5419): shows antseed column
+- [x] smoke chat on primary (`antseed/glm-5.3-flash`), then done
 
 ## bugs found in e2e (fixed)
 

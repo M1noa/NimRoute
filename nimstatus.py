@@ -98,6 +98,11 @@ def plain_status(d):
         c.append("freepi:%s %d req, %s tok%s" % (
             acct.get("name", "?"), acct.get("requests", 0), fmt_tok(tok),
             " INFLIGHT" if acct.get("inflight") else ""))
+    antseed = d.get("antseed") or {}
+    if antseed:
+        c.append("antseed %d peers, %d offers: %s" % (
+            antseed.get("peers", 0), antseed.get("offers", 0),
+            ", ".join("antseed/" + m for m in antseed.get("models") or [])))
     return "\n".join(c)
 
 
@@ -164,7 +169,7 @@ def usage_bar(pct, width=10):
     return bar
 
 
-PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "nvidia": "green"}
+PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "antseed": "blue", "nvidia": "green"}
 
 # usage multipliers come from /status per-account "mults" (parsed live from
 # the freepi catalog display names, e.g. "GLM 5.3 Flash · ~0.7x usage").
@@ -218,6 +223,11 @@ def build_renderable(d, stats):
                 seen.add(full)
                 uniq.append(full)
         cols.append(("freepi", uniq))
+    antseed = d.get("antseed")
+    if antseed:
+        antseed_models = antseed.get("models") or []
+        cols.append(("antseed", ["antseed/" + m for m in antseed_models]
+                     or ["discovering…" if not antseed.get("stale_for") else "no free models"]))
     if nv_keys:
         cols.append(("nvidia", ["keys: " + ", ".join(nv_keys)]))
     if cols:

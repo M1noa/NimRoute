@@ -17,7 +17,7 @@ import (
 // per account, x-client-version, silent ad cycle (next + impression),
 // meter polls. per-account lanes, never shared with zen lanes.
 
-const freePiBase = "https://api.freepi.ai"
+var freePiBase = "https://api.freepi.ai"
 
 // leaseGrace is how long a locally-claimed lease is treated as live before
 // a 409 is attributed to a crashed run instead of an in-flight request.
@@ -64,6 +64,28 @@ type freepiAcct struct {
 	catalog   []freepiCatalogEntry
 	stats     freepiStats
 	statsAt   time.Time
+	warming   bool
+	warmAt    time.Time
+}
+
+// warm refreshes the catalog and stats in the background so /status never
+// waits on api.freepi.ai. one flight per account, retried at most every 15s.
+func (fa *freepiAcct) warm() {
+	fa.mu.Lock()
+	stale := len(fa.catalog) == 0 || time.Since(fa.statsAt) >= time.Minute
+	if !stale || fa.warming || time.Since(fa.warmAt) < 15*time.Second {
+		fa.mu.Unlock()
+		return
+	}
+	fa.warming, fa.warmAt = true, time.Now()
+	fa.mu.Unlock()
+	go func() {
+		freepiCatalog(fa)
+		fa.refreshStats()
+		fa.mu.Lock()
+		fa.warming = false
+		fa.mu.Unlock()
+	}()
 }
 
 // freepiStats mirrors the /me/stats fields we display. cached 60s:
@@ -141,7 +163,9 @@ func freepiAccounts() []*freepiAcct {
 			fa = &freepiAcct{name: a.Name, sessionID: "fp-" + randHex(12)}
 			freepiAccts[a.Name] = fa
 		}
+		fa.mu.Lock()
 		fa.jwt = a.JWT
+		fa.mu.Unlock()
 		out = append(out, fa)
 	}
 	for name := range freepiAccts {
@@ -155,7 +179,10 @@ func freepiAccounts() []*freepiAcct {
 // freepiHeaders sets the exact official-client headers. no User-Agent:
 // fetch default is what the cli sends.
 func freepiHeaders(req *http.Request, fa *freepiAcct) {
-	req.Header.Set("Authorization", "Bearer "+fa.jwt)
+	fa.mu.Lock()
+	jwt := fa.jwt
+	fa.mu.Unlock()
+	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-session-id", fa.sessionID)
 	req.Header.Set("x-client-version", freepiVersion())
@@ -326,7 +353,12 @@ func freepiSnapshot() *freepiSummary {
 	sum := &freepiSummary{Enabled: true}
 	for _, fa := range freepiAccounts() {
 		st := freepiAcctStatus{Name: fa.name, Mults: map[string]string{}}
-		for _, e := range freepiCatalog(fa) {
+		fa.warm()
+		fa.mu.Lock()
+		cat, fst := fa.catalog, fa.stats
+		st.Inflight = fa.inflight > 0
+		fa.mu.Unlock()
+		for _, e := range cat {
 			st.Models = append(st.Models, e.ID)
 			if m := e.Mult; m != "" {
 				st.Mults[e.ID] = m
@@ -334,12 +366,8 @@ func freepiSnapshot() *freepiSummary {
 				st.Mults[e.ID] = m.Mult
 			}
 		}
-		fst := fa.refreshStats()
 		st.Tier, st.Credits, st.SpentPct, st.ReqToday =
 			fst.Tier, fst.Credits, fst.SpentPct, fst.ReqToday
-		fa.mu.Lock()
-		st.Inflight = fa.inflight > 0
-		fa.mu.Unlock()
 		ku := keyUsage("freepi:" + fa.name)
 		st.Requests = ku.Requests
 		st.Prompt = ku.Prompt

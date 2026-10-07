@@ -5,10 +5,17 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +55,7 @@ type antPeer struct {
 type antOffer struct {
 	peerID   string
 	hostPort string
+	fallback []string
 	provider string
 	service  string // seller's advertised service id
 	model    string // display id (service base form)
@@ -145,6 +153,181 @@ func antHostPort(addr string) string {
 	return addr
 }
 
+func antDHTValue(buf []byte, at, depth int) (any, int, bool) {
+	if at >= len(buf) || depth > 8 {
+		return nil, at, false
+	}
+	switch buf[at] {
+	case 'd', 'l':
+		dict := buf[at] == 'd'
+		at++
+		var entries map[string]any
+		var values []any
+		if dict {
+			entries = map[string]any{}
+		}
+		for at < len(buf) && buf[at] != 'e' {
+			if dict {
+				key, next, ok := antDHTValue(buf, at, depth+1)
+				if !ok {
+					return nil, at, false
+				}
+				name, ok := key.([]byte)
+				if !ok {
+					return nil, at, false
+				}
+				at = next
+				value, next, ok := antDHTValue(buf, at, depth+1)
+				if !ok {
+					return nil, at, false
+				}
+				entries[string(name)] = value
+				at = next
+			} else {
+				value, next, ok := antDHTValue(buf, at, depth+1)
+				if !ok {
+					return nil, at, false
+				}
+				values = append(values, value)
+				at = next
+			}
+		}
+		if at >= len(buf) {
+			return nil, at, false
+		}
+		if dict {
+			return entries, at + 1, true
+		}
+		return values, at + 1, true
+	case 'i':
+		end := at + 1
+		for end < len(buf) && buf[end] != 'e' {
+			end++
+		}
+		if end >= len(buf) {
+			return nil, at, false
+		}
+		n, err := strconv.ParseInt(string(buf[at+1:end]), 10, 64)
+		return n, end + 1, err == nil
+	default:
+		end := at
+		for end < len(buf) && buf[end] >= '0' && buf[end] <= '9' {
+			end++
+		}
+		if end == at || end >= len(buf) || buf[end] != ':' || end-at > 6 {
+			return nil, at, false
+		}
+		n, err := strconv.Atoi(string(buf[at:end]))
+		if err != nil || n > len(buf)-end-1 {
+			return nil, at, false
+		}
+		return buf[end+1 : end+1+n], end + 1 + n, true
+	}
+}
+
+func antDHTEndpoint(data []byte) string {
+	if len(data) != 6 && len(data) != 18 {
+		return ""
+	}
+	ip := net.IP(data[:len(data)-2])
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return ""
+	}
+	port := binary.BigEndian.Uint16(data[len(data)-2:])
+	if port == 0 {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
+}
+
+func antDHTLookup(peerID string) []string {
+	return antDHTLookupAt(peerID, []string{"dht1.antseed.com:6881", "dht2.antseed.com:6881"})
+}
+
+func antDHTLookupAt(peerID string, bootstrap []string) []string {
+	peer, err := hex.DecodeString(strings.TrimPrefix(peerID, "0x"))
+	if err != nil || len(peer) != 20 {
+		return nil
+	}
+	hash := sha1.Sum([]byte("antseed:peer:" + strings.ToLower(strings.TrimPrefix(peerID, "0x"))))
+	var id [20]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil
+	}
+	query := append([]byte("d1:ad2:id20:"), id[:]...)
+	query = append(query, []byte("9:info_hash20:")...)
+	query = append(query, hash[:]...)
+	query = append(query, []byte("e1:q9:get_peers1:t2:aa1:y1:qe")...)
+	queue := append([]string{}, bootstrap...)
+	seen := map[string]bool{}
+	found := []string{}
+	foundSet := map[string]bool{}
+	until := time.Now().Add(5 * time.Second)
+	for len(queue) > 0 && len(seen) < 32 && time.Now().Before(until) {
+		if len(seen) >= len(bootstrap) && len(found) > 0 {
+			break
+		}
+		addr := queue[0]
+		queue = queue[1:]
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		conn, err := net.DialTimeout("udp", addr, 500*time.Millisecond)
+		if err != nil {
+			continue
+		}
+		conn.SetDeadline(time.Now().Add(450 * time.Millisecond))
+		_, err = conn.Write(query)
+		var reply [65535]byte
+		var n int
+		if err == nil {
+			n, err = conn.Read(reply[:])
+		}
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		value, end, ok := antDHTValue(reply[:n], 0, 0)
+		if !ok || end != n {
+			continue
+		}
+		root, ok := value.(map[string]any)
+		if !ok || stringValue(root["y"]) != "r" || stringValue(root["t"]) != "aa" {
+			continue
+		}
+		response, ok := root["r"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if values, ok := response["values"].([]any); ok {
+			for _, value := range values {
+				if entry, ok := value.([]byte); ok {
+					if endpoint := antDHTEndpoint(entry); endpoint != "" && !foundSet[endpoint] {
+						found = append(found, endpoint)
+						foundSet[endpoint] = true
+					}
+				}
+			}
+		}
+		if nodes, ok := response["nodes"].([]byte); ok {
+			for i := 0; i+26 <= len(nodes) && len(queue)+len(seen) < 32; i += 26 {
+				if endpoint := antDHTEndpoint(nodes[i+20 : i+26]); endpoint != "" && !seen[endpoint] {
+					queue = append(queue, endpoint)
+				}
+			}
+		}
+	}
+	return found
+}
+
+func stringValue(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return ""
+}
+
 // antRefresh polls the stats snapshot and rebuilds offers. stale cache is
 // served when the poll fails; one flight at a time.
 func antRefresh() {
@@ -178,6 +361,10 @@ func antRefresh() {
 
 // antPoll fetches the snapshot and extracts free text offers.
 func antPoll() ([]antOffer, []string) {
+	return antPollWithLookup(antDHTLookup)
+}
+
+func antPollWithLookup(lookup func(string) []string) ([]antOffer, []string) {
 	url := cfg().Antseed.StatsURL
 	if url == "" {
 		url = antseedStatsDefault
@@ -203,9 +390,8 @@ func antPoll() ([]antOffer, []string) {
 	seenOffer := map[string]bool{} // peerID|service: cheapest-shape dedupe
 	for _, peer := range snap.Peers {
 		hp := antHostPort(peer.Addr)
-		if hp == "" {
-			continue
-		}
+		var fallback []string
+		resolved := false
 		rep := 0.0
 		if peer.EffRep != nil {
 			rep = *peer.EffRep
@@ -221,6 +407,15 @@ func antPoll() ([]antOffer, []string) {
 				if !antTextProto(p.Protocols[svc]) {
 					continue
 				}
+				if hp == "" && !resolved {
+					if eps := lookup(pid); len(eps) > 0 {
+						hp, fallback = eps[0], eps[1:]
+					}
+					resolved = true
+				}
+				if hp == "" {
+					continue
+				}
 				key := pid + "|" + antCanon(svc)
 				if seenOffer[key] {
 					continue
@@ -228,7 +423,7 @@ func antPoll() ([]antOffer, []string) {
 				seenOffer[key] = true
 				model := antBase(svc)
 				offers = append(offers, antOffer{
-					peerID: pid, hostPort: hp,
+					peerID: pid, hostPort: hp, fallback: fallback,
 					provider: p.Provider, service: svc,
 					model: model, rep: rep,
 				})
@@ -306,7 +501,12 @@ func antConnFor(o antOffer) (*antConn, error) {
 	if c != nil {
 		return c, nil
 	}
-	c, err := antOpen(o.peerID, o.hostPort, antProxy(), 15*time.Second)
+	var err error
+	for _, hp := range append([]string{o.hostPort}, o.fallback...) {
+		if c, err = antOpen(o.peerID, hp, antProxy(), 15*time.Second); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -540,9 +740,22 @@ type antseedSummary struct {
 	StaleFor string   `json:"stale_for,omitempty"`
 }
 
+func antSortedModels(models []string) []string {
+	_, _, _, usage := usageSnapshot()
+	sort.Slice(models, func(i, j int) bool {
+		a := usage["antseed/"+models[i]].Requests
+		b := usage["antseed/"+models[j]].Requests
+		if a != b {
+			return a > b
+		}
+		return models[i] < models[j]
+	})
+	return models
+}
+
 func antseedSnapshot() *antseedSummary {
+	go antRefresh()
 	antMu2.Lock()
-	defer antMu2.Unlock()
 	peers := map[string]bool{}
 	for _, o := range antOffers {
 		peers[o.peerID] = true
@@ -552,11 +765,13 @@ func antseedSnapshot() *antseedSummary {
 	if !antFetched.IsZero() {
 		sum.StaleFor = time.Since(antFetched).Round(time.Second).String()
 	}
+	antMu2.Unlock()
 	antBornMu.Lock()
 	if !antIDBorn.IsZero() {
 		sum.IDAge = time.Since(antIDBorn).Round(time.Second).String()
 	}
 	antBornMu.Unlock()
+	sum.Models = antSortedModels(sum.Models)
 	return sum
 }
 
@@ -571,7 +786,7 @@ func appendAntseedModels(out *struct {
 	antMu2.Lock()
 	models := append([]string{}, antModels...)
 	antMu2.Unlock()
-	for _, m := range models {
+	for _, m := range antSortedModels(models) {
 		id := "antseed/" + m
 		if seenIDs[id] {
 			continue

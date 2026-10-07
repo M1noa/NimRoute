@@ -972,6 +972,12 @@ func convertToResponses(m map[string]any) {
 	}
 	// mirror upstream toOpenaiRequest defaults. responses 400s without them
 	// on some models and the free-tier fingerprint expects the real shape.
+	// zen's responses validator only accepts tool_choice "auto": the "none"
+	// ensureZenTools puts on tool-less bodies would 400, so drop it (the
+	// gate stubs stay, auto by default). chat keeps "none".
+	if tc, ok := m["tool_choice"]; ok && tc == "none" {
+		delete(m, "tool_choice")
+	}
 	delete(m, "stream_options")
 	if _, ok := m["text"]; !ok {
 		m["text"] = map[string]any{"verbosity": "low"}
@@ -3704,9 +3710,11 @@ func zenGateTool(name string) any {
 // lowercase names, so a client Bash does not satisfy a gate bash: the
 // lowercase stub is added beside the client's own spelling and response
 // translators map the call back via tnames.resolve.
-// bodies with no tools at all (title gen, compact summaries) are left alone:
-// giving the summarizer a callable read stub makes it emit tool calls that
-// opencode rejects with "tool call not allowed while generating summary".
+// bodies with no tools at all (plain chat clients, title gen, summaries)
+// still need the gate or zen 403s FreeTierError, but a callable stub makes
+// a summarizer emit calls opencode rejects ("tool call not allowed while
+// generating summary"). so they get the stubs with tool_choice "none":
+// the gate passes and the model cannot call them.
 func ensureZenTools(m map[string]any) {
 	t, _ := m["tools"].([]any)
 	// a client that posts a single anthropic-shaped tool object rather than an
@@ -3716,6 +3724,11 @@ func ensureZenTools(m map[string]any) {
 		m["tools"] = t
 	}
 	if len(t) == 0 {
+		for _, n := range zenGateNames {
+			t = append(t, zenGateTool(n))
+		}
+		m["tools"] = t
+		m["tool_choice"] = "none"
 		return
 	}
 	have := make(map[string]bool, len(t))
@@ -4221,6 +4234,9 @@ func serverMain() {
 	cpath := configPath()
 	c := loadOrCreateConfig(cpath)
 	applyConfig(c)
+	if c.Antseed.Enabled {
+		go antRefresh()
+	}
 	// must follow applyConfig: usage.path/enabled come from the config, so
 	// opening the file earlier silently used the defaults.
 	initUsageLog()

@@ -1219,10 +1219,12 @@ func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel s
 }
 
 // toolsOffered reports whether a /responses-shaped request body offers any
-// non-empty-named function tools.
+// non-empty-named function tools. tool_choice "none" offers nothing: the
+// gate stubs on tool-less bodies must never trigger a nudge.
 func toolsOffered(body []byte) bool {
 	var m struct {
-		Tools []struct {
+		ToolChoice any `json:"tool_choice"`
+		Tools      []struct {
 			Type     string `json:"type"`
 			Name     string `json:"name"`
 			Function *struct {
@@ -1231,6 +1233,9 @@ func toolsOffered(body []byte) bool {
 		} `json:"tools"`
 	}
 	if err := json.Unmarshal(body, &m); err != nil {
+		return false
+	}
+	if m.ToolChoice == "none" {
 		return false
 	}
 	for _, t := range m.Tools {

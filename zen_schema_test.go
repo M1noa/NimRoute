@@ -474,6 +474,38 @@ func TestEnsureZenToolsSingleObject(t *testing.T) {
 	}
 }
 
+// zen 403s FreeTierError on any body without the gate tools, so a tool-less
+// body (plain openai client, title gen) gets the stubs but tool_choice
+// "none": the gate passes and the model cannot call them. a body with
+// client tools keeps its own tool_choice.
+func TestEnsureZenToolsToolless(t *testing.T) {
+	m := map[string]any{"messages": []any{}}
+	ensureZenTools(m)
+	ts, _ := m["tools"].([]any)
+	if len(ts) != len(zenGateNames) {
+		t.Fatalf("tool-less body must get %d gate stubs, got %v", len(zenGateNames), m["tools"])
+	}
+	if m["tool_choice"] != "none" {
+		t.Fatalf("gate stubs on a tool-less body must be uncallable, tool_choice=%v", m["tool_choice"])
+	}
+	b, _ := json.Marshal(m)
+	if toolsOffered(b) {
+		t.Fatal("tool_choice none must not count as offered tools (nudge would fire)")
+	}
+
+	withTools := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}},
+	}}
+	ensureZenTools(withTools)
+	if _, set := withTools["tool_choice"]; set {
+		t.Fatalf("client tools must keep their own tool_choice, got %v", withTools["tool_choice"])
+	}
+	b, _ = json.Marshal(withTools)
+	if !toolsOffered(b) {
+		t.Fatal("client tools must count as offered")
+	}
+}
+
 func TestEnsureZenToolsNullParameters(t *testing.T) {
 	m := map[string]any{
 		"tools": []any{map[string]any{
