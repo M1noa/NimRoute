@@ -42,14 +42,14 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           [ "${GITHUB_REF_TYPE}" = "tag" ] || VERSION="dev"
-          OUT="nvidia-nim-proxy-${GOOS}-${GOARCH}"
+          OUT="nvidia-nimroute-${GOOS}-${GOARCH}"
           [ "$GOOS" = "windows" ] && OUT="$OUT.exe"
           go build -trimpath -ldflags "-s -w -X main.versionStr=$VERSION" -o "$OUT" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: nvidia-nim-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: nvidia-nim-proxy-${{ matrix.goos }}-${{ matrix.goarch }}*
+          name: nvidia-nimroute-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: nvidia-nimroute-${{ matrix.goos }}-${{ matrix.goarch }}*
           retention-days: 7
 
   release:
@@ -61,15 +61,15 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: nvidia-nim-proxy-*
+          pattern: nvidia-nimroute-*
           merge-multiple: true
 
       - name: checksums
-        run: sha256sum nvidia-nim-proxy-* > checksums.txt
+        run: sha256sum nvidia-nimroute-* > checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            nvidia-nim-proxy-*
+            nvidia-nimroute-*
             checksums.txt
           generate_release_notes: true

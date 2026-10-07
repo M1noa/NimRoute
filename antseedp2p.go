@@ -11,6 +11,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -126,11 +127,15 @@ func antPrivKey(id *antseedIdentity) *secp256k1.PrivateKey {
 	return secp256k1.PrivKeyFromBytes(id.priv)
 }
 
-// antSignMsg is ethers personal_sign: keccak("\x19Ethereum Signed Message:\n"
-// + len + msg), secp256k1, eth r||s||v format.
-func antSignMsg(id *antseedIdentity, msg []byte) []byte {
+// antEthHash is the eip-191 personal_sign hash antSignMsg signs.
+func antEthHash(msg []byte) []byte {
 	pre := fmt.Sprintf("\x19Ethereum Signed Message:\n%d", len(msg))
-	h := antKeccak(append([]byte(pre), msg...))
+	return antKeccak(append([]byte(pre), msg...))
+}
+
+// antSignMsg is ethers personal_sign over msg, eth r||s||v format.
+func antSignMsg(id *antseedIdentity, msg []byte) []byte {
+	h := antEthHash(msg)
 	c := ecdsa.SignCompact(antPrivKey(id), h, false) // 27/28 || r || s
 	out := make([]byte, 65)
 	copy(out, c[1:])
@@ -754,7 +759,7 @@ func antOpen(peerID, hostPort, proxyURL string, timeout time.Duration) (*antConn
 	}
 	ackPayload := fmt.Sprintf("enc-ack|%s|%d|%s|%s|%s",
 		strings.ToLower(ack.PeerID), ack.Ts, ack.Nonce, ack.Pub, nonceHex)
-	ackHash := antKeccak(append([]byte(antMsgDomain), ackPayload...))
+	ackHash := antEthHash(append([]byte(antMsgDomain), ackPayload...))
 	// verify by recovery: signer must be the dialed peer.
 	signer, ok := antRecoverAddr(ackHash, ackSig)
 	if !ok || !strings.EqualFold(strings.TrimPrefix(signer, "0x"), peerID) {
@@ -770,7 +775,8 @@ func antOpen(peerID, hostPort, proxyURL string, timeout time.Duration) (*antConn
 		myID, strings.ToLower(peerID),
 		nonceHex, strings.ToLower(ack.Nonce), pubHex, strings.ToLower(ack.Pub))
 	okm := make([]byte, 64)
-	if _, err := io.ReadFull(hkdf.New(sha3.New256, shared, antKeccak([]byte(tr)), []byte(antHKDFInfo)), okm); err != nil {
+	salt := sha256.Sum256([]byte(tr))
+	if _, err := io.ReadFull(hkdf.New(sha256.New, shared, salt[:], []byte(antHKDFInfo)), okm); err != nil {
 		raw.Close()
 		return nil, err
 	}

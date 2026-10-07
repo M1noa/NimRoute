@@ -77,7 +77,7 @@ func vaultKey() []byte {
 	// per-process secret: stable across restarts is NOT wanted for the
 	// hmac key itself (surrogate stability comes from the map, which
 	// lives in-process per session). fixed process key is fine.
-	return []byte("nim-proxy-pii-v1")
+	return []byte("nimroute-pii-v1")
 }
 
 // ForRequest returns the session guard, or nil when disabled (zero

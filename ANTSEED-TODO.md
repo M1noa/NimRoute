@@ -30,16 +30,23 @@ offer failover only (no lanes — 28/28 no-429 experiment killed that).
 
 ## to do
 
-- [ ] unit tests (antseed_test.go): canon/base, textproto filter,
-      free pricing (incl. cached fallback), hostport default, ranking
-      order + trust gate + cooldown skip, failover cools + rotates
-- [ ] full test suite green: `go test ./...`
-- [ ] scratch-port e2e: enable antseed on :5420 scratch config,
-      /v1/models lists antseed/<id>, chat completion ok, /status
-      antseed section shows offers/peers/identity age
-- [ ] teardown: delete scratch config/usage, confirm only intended
-      files changed (`git status --porcelain`)
+- [x] unit tests (antseed_test.go): 11 tests — canon/base,
+      textproto filter, free pricing (incl. cached fallback),
+      hostport default, ranking + trust gate + cooldown skip,
+      prefer_free default, failover cools + rotates
+- [x] full test suite green: `go test ./...` (nimroute + pii)
+- [x] scratch-port e2e on :5420: /v1/models lists antseed/*, openai
+      chat + anthropic /v1/messages + streaming ok, /status antseed
+      section ok, burst8 + rapid12 = 20/20 200, zero failovers
+- [x] teardown: scratch config/usage/binary removed
 - [ ] live restart of primary (:5419) — left to user
+
+## bugs found in e2e (fixed)
+
+- enc-ack sig was verified against raw keccak; seller signs eip-191
+  prefixed (`antEthHash`, regression test `TestAntSignRecover`)
+- hkdf used sha3-256 + keccak transcript salt; reference is plain
+  sha256 for both (`crypto/sha256` now)
 
 ## notes
 

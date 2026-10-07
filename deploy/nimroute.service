@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=REPLACE_WITH_PATH
-ExecStart=REPLACE_WITH_PATH/nim-proxy
+ExecStart=REPLACE_WITH_PATH/nimroute
 Restart=always
 RestartSec=3
 Environment=PORT=5419

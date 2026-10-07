@@ -316,6 +316,40 @@ func TestExtraFreeModelsGatedOnLiveAPI(t *testing.T) {
 	}
 }
 
+// baseModelID strips the claude code 1m alias, nothing else.
+func TestBaseModelID(t *testing.T) {
+	for id, want := range map[string]string{
+		"opencode/space-bunny-free[1m]": "opencode/space-bunny-free",
+		"freeepi/glm-5.3-flash[1m]":     "freeepi/glm-5.3-flash",
+		"opencode/space-bunny-free":     "",
+		"opencode/[1m]":                 "opencode/",
+		"":                              "",
+	} {
+		if got, ok := baseModelID(id); (want == "" && ok) || (want != "" && (!ok || got != want)) {
+			t.Errorf("baseModelID(%q) = %q, %v; want %q", id, got, ok, want)
+		}
+	}
+}
+
+// lookupModelInfo resolves the [1m] alias only when the suffixed id is
+// unknown and the base is known; a real [1m] catalog entry wins.
+func TestLookupModelInfoStrips1M(t *testing.T) {
+	setModelInfo(map[string]modelInfoEntry{
+		"opencode/space-bunny-free": {Ctx: 1048576},
+		"opencode/real-1m[1m]":      {Ctx: 1},
+	})
+	t.Cleanup(func() { setModelInfo(loadModelInfo(modelInfoPath())) })
+	if e := lookupModelInfo("opencode/space-bunny-free[1m]"); e == nil || e.Ctx != 1048576 {
+		t.Errorf("aliased lookup missed the base entry: %+v", e)
+	}
+	if e := lookupModelInfo("opencode/real-1m[1m]"); e == nil || e.Ctx != 1 {
+		t.Errorf("real [1m] entry should win over the base: %+v", e)
+	}
+	if e := lookupModelInfo("opencode/nope[1m]"); e != nil {
+		t.Errorf("unknown base should stay unknown: %+v", e)
+	}
+}
+
 func TestUnlistedFreeModelsExcludedFromListing(t *testing.T) {
 	// zen still serves these; the proxy keeps them out of /v1/models.
 	live := []string{
@@ -364,6 +398,12 @@ func TestExoFreeModelInfo(t *testing.T) {
 	}
 	if got := modelModality("opencode/exo-free"); got != "text+image->text" {
 		t.Errorf("exo modality = %q, want text+image->text", got)
+	}
+	if lv := modelEffortLevels("opencode/exo-free"); len(lv) != 1 || lv[0] != "high" {
+		t.Errorf("exo effort levels = %v, want [high]", lv)
+	}
+	if got := modelDefaultEffort("opencode/exo-free"); got != "high" {
+		t.Errorf("exo default effort = %q, want high", got)
 	}
 }
 

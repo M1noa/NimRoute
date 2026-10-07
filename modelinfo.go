@@ -106,7 +106,9 @@ func setModelInfo(m map[string]modelInfoEntry) {
 }
 
 // lookupModelInfo finds an entry for a full or bare model id: exact, then
-// with the nvidia/ prefix stripped (file keys nim ids bare).
+// with the nvidia/ prefix stripped (file keys nim ids bare), then with a
+// trailing [1m] stripped when the suffixed id is unknown (claude code 1m
+// context alias: the base model serves it).
 func lookupModelInfo(id string) *modelInfoEntry {
 	modelInfoMu.RLock()
 	defer modelInfoMu.RUnlock()
@@ -118,7 +120,21 @@ func lookupModelInfo(id string) *modelInfoEntry {
 			return &e
 		}
 	}
+	if s, ok := baseModelID(id); ok {
+		if e, ok := modelInfo[s]; ok {
+			return &e
+		}
+	}
 	return nil
+}
+
+// baseModelID strips the trailing [1m] context alias: ("<id>[1m]", "<id>",
+// true), "" when the id carries no such suffix.
+func baseModelID(id string) (string, bool) {
+	if s := strings.TrimSuffix(id, "[1m]"); s != id {
+		return s, true
+	}
+	return "", false
 }
 
 // modelCtx returns the info context length, 0 when unknown.

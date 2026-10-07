@@ -1,4 +1,4 @@
-# nim-proxy config. copied to config.yml on first run, then hot-reloaded:
+# nimroute config. copied to config.yml on first run, then hot-reloaded:
 # edit this file (or config.yml), changes apply in seconds, no restart.
 # env overrides: PORT=5419, CONFIG_FILE=/path/to/config.yml
 

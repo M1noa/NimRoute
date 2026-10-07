@@ -6,12 +6,12 @@ restarts), then lanes/pool, status UI, freepi last (biggest).
 ## 0. service restart/stop broken [bug, first]
 
 symptom: `./nim restart|stop` leaves the proxy running.
-cause: launchd still runs old label `com.user.nvidia-nim-proxy`
+cause: launchd still runs old label `com.user.nvidia-nimroute`
 (`launchctl list` shows it); `nim` bootouts `com.user.nimroute`
 after the rename, which matches nothing.
 fix: `svc_stop` bootouts BOTH labels (old + new). one-line change
 in `nim`, plus `deploy/` note. verify: restart kills old PID, new
-PID serves, no orphans (`pgrep -af nim-proxy` shows one).
+PID serves, no orphans (`pgrep -af nimroute` shows one).
 touches: `nim`.
 
 ## 1. lanes + pool perf [go]
@@ -29,7 +29,7 @@ falls to the shared pool, never pins a lane. explicit, cheap.
 1.4 skip `/status` access logs: `ServeHTTP` doesn't `acclog` the
 `-->` line for `/status`+`/health`. kills the 2/sec spam from
 `status tail`.
-1.5 clear log on start: `os.Truncate(nim-proxy.log)` in
+1.5 clear log on start: `os.Truncate(nimroute.log)` in
 `serverMain` (go-side, survives manual runs too).
 1.6 memory audit (read-only first): `lanes` (cap+TTL), `burned`
 map (deletes on read only — add sweep for never-read entries),

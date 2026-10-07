@@ -6,12 +6,19 @@ proxies.txt
 .env
 
 # binaries
+nimroute
 nim-proxy
 nvidia-nim-proxy
 nvidia-nim-proxy-*
+nimroute-*
 *.exe
 
 # logs / runtime
+nimroute.log
+nimroute.err.log
+nimroute-debug.log
+nimroute.log.pre-rotate
+nimroute.err.log.pre-rotate
 nim-proxy.log
 nim-proxy.err.log
 nim-proxy-debug.log

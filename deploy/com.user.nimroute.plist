@@ -6,7 +6,7 @@
   <string>com.user.nimroute</string>
   <key>ProgramArguments</key>
   <array>
-    <string>REPLACE_WITH_PATH/nim-proxy</string>
+    <string>REPLACE_WITH_PATH/nimroute</string>
   </array>
   <key>WorkingDirectory</key>
   <string>REPLACE_WITH_PATH</string>
@@ -15,8 +15,8 @@
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>REPLACE_WITH_PATH/nim-proxy.log</string>
+  <string>REPLACE_WITH_PATH/nimroute.log</string>
   <key>StandardErrorPath</key>
-  <string>REPLACE_WITH_PATH/nim-proxy.err.log</string>
+  <string>REPLACE_WITH_PATH/nimroute.err.log</string>
 </dict>
 </plist>

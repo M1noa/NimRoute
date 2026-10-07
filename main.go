@@ -742,15 +742,15 @@ func refreshOpencodeModels() {
 
 func initLogging() {
 	acclog = log.New(os.Stdout, "", log.LstdFlags)
-	// fresh log per boot: stdout is redirected to nim-proxy.log by the
+	// fresh log per boot: stdout is redirected to nimroute.log by the
 	// service scripts, so truncate it here instead of appending forever.
 	// stat first: never create it in a foreign cwd, only reset our own.
-	if _, err := os.Stat("nim-proxy.log"); err == nil {
-		if f, err := os.OpenFile("nim-proxy.log", os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+	if _, err := os.Stat("nimroute.log"); err == nil {
+		if f, err := os.OpenFile("nimroute.log", os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
 			f.Close()
 		}
 	}
-	df := "nim-proxy-debug.log"
+	df := "nimroute-debug.log"
 	if e := os.Getenv("DEBUG_FILE"); e != "" {
 		df = e
 	}
@@ -2883,6 +2883,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	model := reqModel(body)
+	// claude code 1m alias: resolve to the base model only when the
+	// suffixed id is unknown and the base resolves. a backend that
+	// genuinely serves a [1m] id keeps its own.
+	if lookupModelInfo(model) == nil {
+		if base, ok := baseModelID(model); ok && lookupModelInfo(base) != nil {
+			if b, err := setReqModel(body, base); err == nil {
+				body = b
+			}
+			model = base
+		}
+	}
 	acclog.Printf("%s -> %s %s model=%s stream=%v bytes=%d", reqID, r.Method, r.URL.Path, model, isStream, len(body))
 
 	if strings.HasPrefix(model, "opencode/") {

@@ -4,8 +4,8 @@
 OpenAI-compatible proxy with two backends: **NVIDIA NIM** (key pool, needs keys) and **opencode zen free models** (`opencode/<model>`, works keyless).
 
 ```sh
-go build -o nim-proxy .
-./nim-proxy          # :5419, creates config.yml on first run
+go build -o nimroute .
+./nimroute          # :5419, creates config.yml on first run
 ```
 
 ```sh

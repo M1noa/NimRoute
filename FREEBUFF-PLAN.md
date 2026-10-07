@@ -56,7 +56,7 @@ freebuff:
 - concurrent callers share one session per model (mutex), no admission stampede.
 
 ## 7. test protocol (separate port, main untouched)
-1. build `nim-proxy-test` from clean tree + new file, run with `config-test.yml` (port 5420, `enabled:true`, 1 token).
+1. build `nimroute-test` from clean tree + new file, run with `config-test.yml` (port 5420, `enabled:true`, 1 token).
 2. `GET /status` → freebuff block present, no ads text leak when `show_ads:false`.
 3. `GET /v1/models` → `freebuff/*` listed.
 4. openai: `POST :5420/v1/chat/completions {model: freebuff/z-ai/glm-5.3-flash, stream:true}` → 200 SSE, text flows.

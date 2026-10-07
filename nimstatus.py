@@ -317,7 +317,7 @@ def main():
                 pass
     elif cmd == "logs":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-        log = os.path.join(ROOT, "nim-proxy.log")
+        log = os.path.join(ROOT, "nimroute.log")
         try:
             with open(log) as f:
                 lines = f.readlines()[-n:]

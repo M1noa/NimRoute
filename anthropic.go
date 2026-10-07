@@ -159,8 +159,19 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 		return nil, "", "", nil, false, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	clientModel = strings.TrimSuffix(req.Model, "[1m]")
+	clientModel = req.Model
 	upstreamModel = mapClaudeModel(clientModel)
+	// claude code 1m alias: strip only when the suffixed id is unknown
+	// and the base resolves (catalog or claude_map). a backend that
+	// genuinely serves a [1m] id keeps its own.
+	if lookupModelInfo(upstreamModel) == nil {
+		if base, ok := baseModelID(upstreamModel); ok {
+			remapped := mapClaudeModel(base)
+			if lookupModelInfo(remapped) != nil || remapped != base {
+				upstreamModel = remapped
+			}
+		}
+	}
 	isStream = req.Stream
 
 	messages := make([]map[string]any, 0)

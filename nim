@@ -1,9 +1,9 @@
 #!/bin/sh
-# nim: run nim-proxy in foreground, as a service, or show status.
+# nim: run nimroute in foreground, as a service, or show status.
 # usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth]
 PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOGFILE="$PROXY_DIR/nim-proxy.log"
-BINARY="$PROXY_DIR/nim-proxy"
+LOGFILE="$PROXY_DIR/nimroute.log"
+BINARY="$PROXY_DIR/nimroute"
 SVC="com.user.nimroute"
 PLIST="$HOME/Library/LaunchAgents/$SVC.plist"
 SYSTEMD="$HOME/.config/systemd/user/nimroute.service"
@@ -26,7 +26,7 @@ svc_running() {
   case "$SVC_CMD" in
     launchd) launchctl list "$SVC" 2>/dev/null | grep '"PID"' | grep -qv '= 0' ;;
     systemd) systemctl --user is-active -q nimroute 2>/dev/null ;;
-    nohup)   [ -f /tmp/nim-proxy.pid ] && kill -0 "$(cat /tmp/nim-proxy.pid)" 2>/dev/null ;;
+    nohup)   [ -f /tmp/nimroute.pid ] && kill -0 "$(cat /tmp/nimroute.pid)" 2>/dev/null ;;
   esac
 }
 
@@ -49,7 +49,7 @@ svc_start() {
       systemctl --user daemon-reload && systemctl --user enable --now nimroute ;;
     nohup)
       cd "$PROXY_DIR" && nohup "$BINARY" >>"$LOGFILE" 2>&1 &
-      echo $! > /tmp/nim-proxy.pid ;;
+      echo $! > /tmp/nimroute.pid ;;
   esac
 }
 
@@ -57,13 +57,13 @@ svc_stop() {
   case "$SVC_CMD" in
     launchd)
       # bootout both labels: pre-rename instances still run as
-      # com.user.nvidia-nim-proxy, current as com.user.nimroute.
+      # com.user.nvidia-nimroute, current as com.user.nimroute.
       launchctl bootout "gui/$(id -u)/$SVC" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
-      launchctl bootout "gui/$(id -u)/com.user.nvidia-nim-proxy" 2>/dev/null
-      pkill -f "nim-proxy$" 2>/dev/null
+      launchctl bootout "gui/$(id -u)/com.user.nvidia-nimroute" 2>/dev/null
+      pkill -f "nimroute$" 2>/dev/null
       ;;
     systemd) systemctl --user disable --now nimroute 2>/dev/null ;;
-    nohup)   [ -f /tmp/nim-proxy.pid ] && kill "$(cat /tmp/nim-proxy.pid)" 2>/dev/null; rm -f /tmp/nim-proxy.pid ;;
+    nohup)   [ -f /tmp/nimroute.pid ] && kill "$(cat /tmp/nimroute.pid)" 2>/dev/null; rm -f /tmp/nimroute.pid ;;
   esac
 }
 
@@ -97,7 +97,7 @@ case "${1:-status}" in
   start)
     if port_alive; then pretty_status; exit 0; fi
     svc_start; sleep 2; pretty_status ;;
-  stop)    svc_stop; echo "nim-proxy stopped" ;;
+  stop)    svc_stop; echo "nimroute stopped" ;;
   restart) svc_stop; sleep 1; svc_start; sleep 2; pretty_status ;;
   status)  pretty_status; [ "$2" = "tail" ] && status_tail ;;
   status-tail) status_tail ;;
@@ -118,6 +118,6 @@ case "${1:-status}" in
     port_alive && { pretty_status; exit 0; }
     svc_start; sleep 2; pretty_status
     echo "installed ($SVC_CMD). see deploy/ for system-wide setup." ;;
-  uninstall) svc_stop; rm -f "$PLIST" "$SYSTEMD"; echo "nim-proxy uninstalled" ;;
+  uninstall) svc_stop; rm -f "$PLIST" "$SYSTEMD"; echo "nimroute uninstalled" ;;
   *) echo "Usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall]"; exit 1 ;;
 esac

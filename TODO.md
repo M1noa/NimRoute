@@ -182,6 +182,24 @@ but the churn is wasteful.
 - consider `lane_min_gap_ms` 1500 -> 2000 if single-lane bursts keep
   429ing the same exit (check: repeated 429s on one lane with distinct
   proxies = gap too tight; 429s across many lanes = pool stale).
+
+## 11. claude code fetch tool 403 FreeTierError, now 502 [medium]
+
+symptoms (2026-10-07): in claude code, the fetch tool (and a couple
+others, not all tools) historically 403 `FreeTierError`, now 502
+(`opencode zen: upstream unreachable`). tool-specific, not model-wide.
+
+- verify whether the 502 is the proxy's own failover exhausted (all
+  retries transport-fail) or an upstream 502 body passed through:
+  check the `!! opencode upstream 502` vs `zen error` lines for the
+  failing req id and whether `dropProxy` fired for the exit.
+- suspect: fetch pulls page content that trips a per-exit rule
+  (long body, redirect chain) so only exits that allow it succeed;
+  rotation should still land one, so a persistent 502 means the retry
+  loop or hedge is giving up early on this shape.
+- repro: same prompt via opencode (openai endpoint) vs claude code
+  (/v1/messages) against a scratch port; compare the forwarded bodies
+  (url shape, redirect following) and the upstream verdicts.
 - verify: unit test for cooldown skip + counter reset; live check that
   refreshes drop to ~1 per burst in the log.
 

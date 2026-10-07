@@ -17,7 +17,7 @@ func piiConfig() pii.Config {
 		ents[i] = pii.CustomTerm{Name: e.Name, Type: e.Type, Variations: e.Variations, Replacement: e.Replacement}
 	}
 	return pii.Config{
-		Enabled: true, Mode: c.Mode, Disclose: c.Disclose, DiscloseText: c.DiscloseText,
+		Enabled: c.Enabled, Mode: c.Mode, Disclose: c.Disclose, DiscloseText: c.DiscloseText,
 		Entities: ents, Terms: c.Terms, FuzzyThreshold: c.FuzzyThreshold,
 		DetectSecrets: c.DetectSecrets, DetectPII: c.DetectPII,
 		KeepLabels: c.KeepLabels, IncludeSystem: c.IncludeSystem,
@@ -57,10 +57,9 @@ func discloseLine() string {
 	return pii.DiscloseLine(piiConfigWithEnabled())
 }
 
+// piiConfigWithEnabled is discloseLine's config: same shape, caller-gated.
 func piiConfigWithEnabled() pii.Config {
-	c := piiConfig()
-	c.Enabled = cfg().Anonymize.Enabled
-	return c
+	return piiConfig()
 }
 
 // piiWriter restores surrogates in streaming response bytes, holding back

@@ -137,7 +137,7 @@ status hook once (P4).
    cases + antseed's own fixtures), frame/codec round-trips, free-vs-paid
    classification, ranking order, models builder conservative caps.
 3. scratch config: copy `config.yml` → `config.test.yml`, port **5420**, scratch
-   usage file, `antseed.enabled: true`; `CONFIG_FILE=config.test.yml ./nim-proxy`.
+   usage file, `antseed.enabled: true`; `CONFIG_FILE=config.test.yml ./nimroute`.
 4. e2e: `GET /v1/models` (antseed entries present, LLM-only), one non-streaming +
    one streaming `antseed/<model>` completion, a 429-failover test (or forced bad
    peer), table shows the curated order, `/status` hidden unless
