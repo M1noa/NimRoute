@@ -524,26 +524,27 @@ type KeyStatus struct {
 }
 
 type StatusResponse struct {
-	OK            bool           `json:"ok"`
-	Version       string         `json:"version"`
-	Uptime        string         `json:"uptime"`
-	Total         int            `json:"total"`
-	Available     int            `json:"available"`
-	Concurrent    int            `json:"concurrent"`
-	ConcurrentNV  int            `json:"concurrent_nvidia"`
-	ConcurrentZen int            `json:"concurrent_opencode"`
-	SemLimit      int            `json:"sem_limit"`
-	Keys          []KeyStatus    `json:"keys,omitempty"`
-	Locks         interface{}    `json:"model_locks,omitempty"`
-	Opencode      *OpencodeInfo  `json:"opencode,omitempty"`
-	ZenSession    string         `json:"zen_session,omitempty"`
-	ZenProxy      string         `json:"zen_proxy,omitempty"`
-	ZenAgo        string         `json:"zen_ago,omitempty"`
-	ZenLanes      []laneStatus   `json:"zen_lanes,omitempty"`
-	LaneCap       int            `json:"lane_cap,omitempty"`
-	Pool          *poolSummary   `json:"pool,omitempty"`
-	Usage         *usageSummary  `json:"usage,omitempty"`
-	Freepi        *freepiSummary `json:"freepi,omitempty"`
+	OK            bool            `json:"ok"`
+	Version       string          `json:"version"`
+	Uptime        string          `json:"uptime"`
+	Total         int             `json:"total"`
+	Available     int             `json:"available"`
+	Concurrent    int             `json:"concurrent"`
+	ConcurrentNV  int             `json:"concurrent_nvidia"`
+	ConcurrentZen int             `json:"concurrent_opencode"`
+	SemLimit      int             `json:"sem_limit"`
+	Keys          []KeyStatus     `json:"keys,omitempty"`
+	Locks         interface{}     `json:"model_locks,omitempty"`
+	Opencode      *OpencodeInfo   `json:"opencode,omitempty"`
+	ZenSession    string          `json:"zen_session,omitempty"`
+	ZenProxy      string          `json:"zen_proxy,omitempty"`
+	ZenAgo        string          `json:"zen_ago,omitempty"`
+	ZenLanes      []laneStatus    `json:"zen_lanes,omitempty"`
+	LaneCap       int             `json:"lane_cap,omitempty"`
+	Pool          *poolSummary    `json:"pool,omitempty"`
+	Usage         *usageSummary   `json:"usage,omitempty"`
+	Freepi        *freepiSummary  `json:"freepi,omitempty"`
+	Antseed       *antseedSummary `json:"antseed,omitempty"`
 }
 
 // freepiAcctStatus is one account's /status row. jwt never leaves config.
@@ -659,6 +660,9 @@ func (p *Pool) Status() StatusResponse {
 	}
 	if freepiEnabled() {
 		sr.Freepi = freepiSnapshot()
+	}
+	if antseedEnabled() && cfg().Status.ShowAntseed {
+		sr.Antseed = antseedSnapshot()
 	}
 	return sr
 }
@@ -784,6 +788,15 @@ type openRouterModel struct {
 // extraFreeModels are free models that don't end in "-free" (just
 // big-pickle). only listed when also present on the live /models endpoint.
 var extraFreeModels = []string{"big-pickle"}
+
+// unlistedFreeModels are free ids zen still serves but the proxy does not
+// list: jev only answers on /systemone, the other two are deprecated
+// upstream (upstream_status in model_info.jsonc). requests still route.
+var unlistedFreeModels = map[string]bool{
+	"jev-1.13-free":                   true,
+	"deepseek-v4-flash-free":          true,
+	"muse-spark-1.2-contributor-free": true,
+}
 
 // endpointForModel returns the Zen API endpoint path for a model.
 // Muse Spark models use /responses; all others use /chat/completions.
@@ -964,7 +977,13 @@ func convertToResponses(m map[string]any) {
 		m["text"] = map[string]any{"verbosity": "low"}
 	}
 	if _, ok := m["reasoning"]; !ok {
-		m["reasoning"] = map[string]any{"effort": "medium"}
+		// default high (or closest) for reasoning models, from the catalog:
+		// a request that names an effort keeps its own.
+		if mid, _ := m["model"].(string); mid != "" {
+			if eff := modelDefaultEffort(mid); eff != "" {
+				m["reasoning"] = map[string]any{"effort": eff}
+			}
+		}
 	}
 	if tools, ok := m["tools"].([]any); ok {
 		cleaned := make([]any, 0, len(tools))
@@ -994,11 +1013,24 @@ func convertToResponses(m map[string]any) {
 				if name, _ := tm["name"].(string); strings.TrimSpace(name) == "" {
 					continue
 				}
+				// an anthropic-shaped tool that skipped the openai rewrite
+				// (ensureZenTools runs before this): carry input_schema over,
+				// or spark receives a null schema and 400s.
+				if _, ok := tm["parameters"]; !ok {
+					if is, ok := tm["input_schema"]; ok {
+						tm["parameters"] = is
+						delete(tm, "input_schema")
+					}
+				}
 			}
-			// zen/spark 400 on null/non-object parameters.
+			// zen/spark 400 on null/non-object parameters, and on recursive
+			// schemas ("Recursive JSON schemas are not currently supported").
 			if pm, ok := tm["parameters"].(map[string]any); !ok || pm == nil {
 				tm["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+			} else {
+				tm["parameters"] = sanitizeZenSchema(pm)
 			}
+			delete(tm, "input_schema")
 			cleaned = append(cleaned, tm)
 		}
 		if len(cleaned) > 0 {
@@ -1175,6 +1207,104 @@ func chatToResponses(rb []byte) []byte {
 		return b
 	}
 	return rb
+}
+
+// writeResponsesSSE emits a buffered /responses body as a responses SSE
+// sequence. used when the client asked for stream=true but the model only
+// speaks chat upstream, so the chat result is folded first.
+func writeResponsesSSE(w http.ResponseWriter, body []byte) int64 {
+	fl, _ := w.(http.Flusher)
+	var written int64
+	flush := func() {
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	var r struct {
+		ID     string `json:"id"`
+		Model  string `json:"model"`
+		Output []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		n, _ := w.Write(body)
+		return int64(n)
+	}
+	if r.ID == "" {
+		r.ID = zenID(false)
+	}
+	emit := func(t string, v any) {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return
+		}
+		n, _ := w.Write([]byte("event: " + t + "\ndata: " + string(b) + "\n\n"))
+		written += int64(n)
+		flush()
+	}
+	inflight := map[string]any{
+		"id": r.ID, "object": "response", "status": "in_progress",
+		"model": r.Model, "output": []any{},
+	}
+	emit("response.created", map[string]any{"type": "response.created", "response": inflight})
+	emit("response.in_progress", map[string]any{"type": "response.in_progress", "response": inflight})
+	emit("response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "output_index": 0,
+		"item": map[string]any{"type": "message", "role": "assistant", "status": "in_progress", "id": r.ID},
+	})
+	for _, out := range r.Output {
+		for i, c := range out.Content {
+			if c.Type != "" && c.Type != "output_text" {
+				continue
+			}
+			emit("response.content_part.added", map[string]any{
+				"type": "response.content_part.added", "item_id": r.ID, "output_index": 0,
+				"content_index": i, "part": map[string]any{"type": "output_text", "text": ""},
+			})
+			emit("response.output_text.delta", map[string]any{
+				"type": "response.output_text.delta", "item_id": r.ID, "output_index": 0,
+				"content_index": i, "delta": c.Text,
+			})
+			emit("response.output_text.done", map[string]any{
+				"type": "response.output_text.done", "item_id": r.ID, "output_index": 0,
+				"content_index": i, "text": c.Text,
+			})
+			emit("response.content_part.done", map[string]any{
+				"type": "response.content_part.done", "item_id": r.ID, "output_index": 0,
+				"content_index": i,
+				"part":          map[string]any{"type": "output_text", "text": c.Text},
+			})
+		}
+	}
+	emit("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": 0,
+		"item": map[string]any{"type": "message", "role": "assistant", "status": "completed", "id": r.ID},
+	})
+	emit("response.completed", map[string]any{
+		"type": "response.completed",
+		"response": map[string]any{
+			"id": r.ID, "object": "response", "status": "completed", "model": r.Model,
+			"output": r.Output,
+			"usage": map[string]any{
+				"input_tokens": r.Usage.InputTokens, "output_tokens": r.Usage.OutputTokens,
+				"total_tokens": r.Usage.InputTokens + r.Usage.OutputTokens,
+			},
+		},
+	})
+	n, _ := w.Write([]byte("data: [DONE]\n\n"))
+	written += int64(n)
+	flush()
+	return written
 }
 
 // responsesToChat converts an OpenAI /responses body to /chat/completions shape.
@@ -1761,7 +1891,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		if err != nil {
 			return nil
 		}
-		setZenHeaders(req, *sessionID)
+		zenApplyHeaders(req, *sessionID, r.Header, "nudge", "nudge", target, proxy, reqModel(nb))
 		for k, v := range r.Header {
 			if zenHeaderForwarded(k) {
 				req.Header[k] = v
@@ -1831,10 +1961,14 @@ func nudgeEnabled(model string) bool {
 }
 
 func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []byte, sessionID *string, clientModel string, lane *zenLane) []byte {
+	sid := ""
+	if sessionID != nil {
+		sid = *sessionID
+	}
 	post := func(nb []byte) []byte {
 		return p.nudgePostResponses(r, target, nb, sessionID, lane)
 	}
-	if retry := tryNudgeResponses(clientModel, posted, rb, post); retry != nil {
+	if retry := tryNudgeResponses(sid, clientModel, posted, rb, post); retry != nil {
 		_, nHasCalls := scanResponsesSSE(retry)
 		acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d [oai]", clientModel, nHasCalls, len(retry))
 		return mergeResponsesSSE([][]byte{rb, retry})
@@ -1896,7 +2030,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	if len(out.Data) == 0 && nvidiaEnabled() {
 		modelInfoMu.RLock()
 		for id := range modelInfo {
-			if strings.HasPrefix(id, "opencode/") || strings.HasPrefix(id, "freeepi/") {
+			if strings.HasPrefix(id, "opencode/") || strings.HasPrefix(id, "freeepi/") || strings.HasPrefix(id, "antseed/") {
 				continue
 			}
 			pl := strings.ToLower(id)
@@ -1921,7 +2055,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	ocSeen := make(map[string]bool)
 	for _, m := range liveIDs {
-		if (!strings.HasSuffix(m, "-free") && m != "big-pickle") || ocSeen[m] {
+		if (!strings.HasSuffix(m, "-free") && m != "big-pickle") || ocSeen[m] || unlistedFreeModels[m] {
 			continue
 		}
 		ocSeen[m] = true
@@ -1949,6 +2083,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 		out.Data = append(out.Data, infoModel("opencode/"+id, "opencode/"+id))
 	}
 	appendFreepiModels(&out, seenIDs)
+	appendAntseedModels(&out, seenIDs)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -1980,15 +2115,16 @@ func appendFreepiModels(out *struct {
 }
 
 // infoModel builds the /v1/models entry from the catalog file: name,
-// description, context, max output, and modality all come from model_info.
-// unknown ids get the derived name and a default context.
+// description, served context, served max output, and modality all come from
+// model_info. freepi entries advertise the gateway's own limits, not the
+// upstream model's. unknown ids get the derived name and a default context.
 func infoModel(displayID, infoID string) openRouterModel {
-	cl := modelCtx(infoID)
+	cl := modelServedCtx(infoID)
 	if cl == 0 {
 		cl = 131072
 	}
 	var maxOut any
-	if mo := modelMaxOut(infoID); mo > 0 {
+	if mo := modelServedMaxOut(infoID); mo > 0 {
 		maxOut = mo
 	}
 	mod := modelModality(infoID)
@@ -2684,8 +2820,22 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.semRelease()
 	}()
 
+	// bound the body read: a client that stalls mid-upload otherwise pins
+	// this goroutine before the "-> model=" log, which reads as a hang
+	// with no trace past "--> POST". closing the body unblocks the read.
+	readCtx, readCancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer readCancel()
+	go func() {
+		<-readCtx.Done()
+		r.Body.Close()
+	}()
 	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	if err != nil {
+		if readCtx.Err() != nil {
+			acclog.Printf("!! 408 body-read-timeout %s %s", r.Method, r.URL.Path)
+			http.Error(w, `{"error":"request body read timed out"}`, http.StatusRequestTimeout)
+			return
+		}
 		acclog.Printf("!! 400 bad-request-body %s %s: %v", r.Method, r.URL.Path, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
 		return
@@ -2756,6 +2906,17 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		acclog.Printf("%s routed to freepi model=%s", reqID, model)
 		p.handleFreepi(w, r, body, model, isStream, start, reqID)
+		return
+	}
+
+	if strings.HasPrefix(model, "antseed/") {
+		if !antseedEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (antseed disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"antseed is disabled; set antseed.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		acclog.Printf("%s routed to antseed model=%s", reqID, model)
+		p.handleAntseed(w, r, body, model, isStream, start, reqID)
 		return
 	}
 
@@ -3074,6 +3235,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		target += "?" + r.URL.RawQuery
 	}
 	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, realModel, endpoint)
+	if zenDebugDir() != "" {
+		zenDebugCapture("in", map[string]any{"side": "chat", "req_id": reqID, "url": r.URL.String(), "headers": r.Header, "model": realModel, "stream": isStream})
+	}
 
 	cl := &http.Client{Timeout: 300 * time.Second}
 	var resp *http.Response
@@ -3138,7 +3302,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			os.WriteFile(dp, body, 0o644)
 			acclog.Printf("ZEN_DUMP oai request %d bytes -> %s", len(body), dp)
 		}
-		setZenHeaders(req, sessionID)
+		zenApplyHeaders(req, sessionID, r.Header, reqID, zenRetries, target, usedProxy, realModel)
 		if zenRetries > 0 {
 			acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 		}
@@ -3167,7 +3331,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if herr != nil {
 				return nil, herr
 			}
-			setZenHeaders(hreq, laneSession(hl))
+			zenApplyHeaders(hreq, laneSession(hl), r.Header, reqID, "hedge", target, hp, realModel)
 			for k, v := range r.Header {
 				if zenHeaderForwarded(k) {
 					hreq.Header[k] = v
@@ -3197,6 +3361,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if fb > 6*time.Second {
 				noteExitSlow(proxy)
 			}
+		}
+		if resp != nil {
+			zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": resp.StatusCode, "headers": resp.Header, "attempt": zenRetries, "model": realModel})
 		}
 		if err != nil {
 			dropProxy(proxy)
@@ -3346,7 +3513,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			post := func(nb []byte) []byte {
 				return p.nudgePostResponses(r, target, nb, &sessionID, lane)
 			}
-			if retry := tryNudgeResponses(model, body, rb, post); retry != nil {
+			if retry := tryNudgeResponses(sessionID, model, body, rb, post); retry != nil {
 				_, nHasCalls := scanResponsesSSE(retry)
 				acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d [oai]", model, nHasCalls, len(retry))
 				rb = mergeResponsesSSE([][]byte{rb, retry})
@@ -3426,16 +3593,14 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 		} else if wrapBack {
 			// responses client on a chat model with stream=true: fold the
-			// upstream chat SSE to one chat body, wrap to responses shape,
-			// and return it buffered (no true responses stream exists).
+			// upstream chat SSE to one chat body, then emit it as a responses
+			// SSE sequence. buffered json under a text/event-stream
+			// content-type breaks every streaming responses client.
 			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 			resp.Body.Close()
 			folded := sseToNonStream(rb, realModel, tnames)
 			prompT, compT, _ = respTokens(folded)
-			rb = chatToResponses(folded)
-			w.Header().Set("Content-Type", "application/json")
-			n, _ := w.Write(rb)
-			written = int64(n)
+			written = writeResponsesSSE(w, chatToResponses(folded))
 		} else if _, ok := w.(http.Flusher); ok {
 			written, prompT, compT = copyZenChatStream(r.Context(), w, resp, nil, prompT, compT)
 		} else {
@@ -3533,6 +3698,12 @@ func zenGateTool(name string) any {
 // opencode rejects with "tool call not allowed while generating summary".
 func ensureZenTools(m map[string]any) {
 	t, _ := m["tools"].([]any)
+	// a client that posts a single anthropic-shaped tool object rather than an
+	// array: normalize to a one-element array or it reaches zen as-is.
+	if tm, ok := m["tools"].(map[string]any); ok {
+		t = []any{tm}
+		m["tools"] = t
+	}
 	if len(t) == 0 {
 		return
 	}
@@ -3550,7 +3721,24 @@ func ensureZenTools(m map[string]any) {
 				fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
 		} else if n, ok := xm["name"].(string); ok {
+			// anthropic-shaped tool ({name, input_schema}) reaching us
+			// unconverted, e.g. a client that posts it to /v1/chat/completions.
+			// rewrite to the openai shape zen expects, or it forwards with a
+			// null name and zen 400s the whole request.
 			name = n
+			fn := map[string]any{"name": n}
+			if d, ok := xm["description"].(string); ok && d != "" {
+				fn["description"] = d
+			}
+			if p, ok := xm["input_schema"]; ok {
+				fn["parameters"] = p
+			}
+			if _, ok := fn["parameters"]; !ok {
+				fn["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			xm["type"] = "function"
+			delete(xm, "input_schema")
+			xm["function"] = fn
 		}
 		if name != "" {
 			have[name] = true
@@ -3561,7 +3749,212 @@ func ensureZenTools(m map[string]any) {
 			t = append(t, zenGateTool(n))
 		}
 	}
+	// sanitize every schema, not just ours: zen 400s the whole request with
+	// "Recursive JSON schemas are not currently supported" when a client tool
+	// ships $defs/$ref cycles, which Claude Code's own tools do.
+	for _, raw := range t {
+		if tm, ok := raw.(map[string]any); ok {
+			if fn, ok := tm["function"].(map[string]any); ok {
+				if p, ok := fn["parameters"]; ok {
+					fn["parameters"] = sanitizeZenSchema(p)
+				}
+			}
+		}
+	}
 	m["tools"] = t
+}
+
+// sanitizeZenSchema lowers a JSON schema to what zen's tool api accepts,
+// mirroring sanitizeOpenAISchema in the real client
+// (packages/opencode/src/provider/transform.ts). keyword-whitelisted, so
+// exotic keywords are dropped rather than forwarded. $defs/definitions are
+// dropped because zen resolves nothing: a $ref left pointing into a deleted
+// $defs reads as a recursive schema and 400s the whole request.
+//
+// the live console validator counts nested object maps: the
+// reorganize_notes tool 400s with 11 nested maps and passes trimmed to
+// 10, while enum values and array wrappers pass untouched. so the budget
+// is on maps: parameters bodies nest at most 9 maps, 10 with the tool
+// wrapper. the root parameters map sits at 1 and is never omitted.
+func sanitizeZenSchema(v any) any { return sanitizeZenSchemaSegs(v, 1) }
+
+// zenSchemasMaxDepth is the validator's nesting budget in nested object
+// maps from the parameters root (see sanitizeZenSchema). with the holder
+// map charged, cutoff keeps bodies at 8 content maps; the wrapper adds the
+// tool map for 9 total, one inside the limit.
+const zenSchemasMaxDepth = 9
+
+// zenOmit marks a subtree cut by the depth budget; parents drop it instead
+// of nesting a replacement.
+type zenOmitType struct{}
+
+var zenOmit zenOmitType
+
+func isZenOmit(v any) bool { _, ok := v.(zenOmitType); return ok }
+
+func sanitizeZenSchemaDepth(v any, depth int) any {
+	return sanitizeZenSchemaSegs(v, depth+1)
+}
+
+// sanitizeZenSchemaSegs bounds map-nesting from the parameters root at 1:
+// every object map nests one level deeper, arrays cost nothing (their
+// elements sit at the array's own level), and scalars cost nothing. the
+// console validator counts object maps this way and ignores the rest:
+// the live reorganize_notes tool 400s with 11 nested maps and passes once
+// trimmed to 10, while its enum values and array wrappers pass through
+// untouched at any count. maps at zenSchemasMaxDepth are omitted; their
+// parents drop the property (dangling required is pruned) so no phantom
+// level survives. $defs/$refs never cross the keyword whitelist, so the
+// walk only descends the finite input tree and always terminates.
+func sanitizeZenSchemaSegs(v any, seg int) any {
+	if seg >= zenSchemasMaxDepth {
+		switch v.(type) {
+		case map[string]any, bool:
+			return zenOmit
+		}
+	}
+	switch t := v.(type) {
+	case bool:
+		return map[string]any{"type": "string"}
+	case []any:
+		// arrays cost nothing: every element sits at the array's level.
+		out := make([]any, 0, len(t))
+		for _, e := range t {
+			if s := sanitizeZenSchemaSegs(e, seg); !isZenOmit(s) {
+				out = append(out, s)
+			}
+		}
+		return out
+	case map[string]any:
+		r := map[string]any{}
+		// $ref is dropped along with $defs below: zen resolves nothing, so a
+		// $ref left pointing into a deleted $defs is exactly the "recursive
+		// JSON schema" it rejects. the surrounding node keeps its inferred
+		// type so the tool stays callable.
+		if s, ok := t["description"].(string); ok {
+			r["description"] = s
+		}
+		if c, ok := t["const"]; ok {
+			r["enum"] = []any{c}
+		} else if e, ok := t["enum"].([]any); ok {
+			r["enum"] = e
+		}
+		hadProps := false
+		np := map[string]any{}
+		if p, ok := t["properties"].(map[string]any); ok {
+			hadProps = true
+			// values sit under the properties holder map: they enter two
+			// levels deeper (holder + child), not one.
+			for k, item := range p {
+				if s := sanitizeZenSchemaSegs(item, seg+2); !isZenOmit(s) {
+					np[k] = s
+				}
+			}
+			if len(np) > 0 {
+				r["properties"] = np
+			}
+		}
+		// the real client keeps `title` alongside description; zen tolerates it.
+		if s, ok := t["title"].(string); ok {
+			r["title"] = s
+		}
+		if req, ok := t["required"].([]any); ok {
+			nr := []any{}
+			for _, item := range req {
+				s, ok := item.(string)
+				if !ok {
+					continue
+				}
+				if hadProps {
+					if _, still := np[s]; !still {
+						// property cut by the depth budget: a dangling required
+						// would be the next 400
+						continue
+					}
+				}
+				nr = append(nr, s)
+			}
+			if len(nr) > 0 {
+				r["required"] = nr
+			}
+		}
+		if it, ok := t["items"]; ok {
+			if s := sanitizeZenSchemaSegs(it, seg+1); !isZenOmit(s) {
+				r["items"] = s
+			}
+		}
+		if ap, ok := t["additionalProperties"]; ok {
+			if b, isBool := ap.(bool); isBool {
+				r["additionalProperties"] = b
+			} else if s := sanitizeZenSchemaSegs(ap, seg+1); !isZenOmit(s) {
+				r["additionalProperties"] = s
+			}
+		}
+		for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+			if c, ok := t[k].([]any); ok {
+				nc := make([]any, 0, len(c))
+				for _, e := range c {
+					// the branch array is charged by the []any case; the
+					// element sits one segment under the schema node.
+					if s := sanitizeZenSchemaSegs(e, seg+1); !isZenOmit(s) {
+						nc = append(nc, s)
+					}
+				}
+				if len(nc) > 0 {
+					r[k] = nc
+				}
+			}
+		}
+		types := []string{"string", "number", "boolean", "integer", "object", "array", "null"}
+		var st []string
+		switch tv := t["type"].(type) {
+		case string:
+			for _, x := range types {
+				if tv == x {
+					st = []string{tv}
+				}
+			}
+		case []any:
+			for _, x := range tv {
+				if s, ok := x.(string); ok {
+					for _, y := range types {
+						if s == y {
+							st = append(st, s)
+						}
+					}
+				}
+			}
+		}
+		hasComp := false
+		for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+			if _, ok := r[k]; ok {
+				hasComp = true
+			}
+		}
+		// a $ref-stripped node keeps its empty shape so the parent holds
+		// its position: the walker truncates through properties instead,
+		// which terminates on any finite schema without dropping the slot
+		// (see the Recursion test).
+		if len(st) > 0 {
+			if len(st) == 1 {
+				r["type"] = st[0]
+			} else {
+				r["type"] = st
+			}
+			return r
+		}
+		if hasComp {
+			return r
+		}
+		switch {
+		case r["properties"] != nil || r["required"] != nil || r["additionalProperties"] != nil:
+			r["type"] = "object"
+		case r["items"] != nil:
+			r["type"] = "array"
+		}
+		return r
+	}
+	return v
 }
 
 // sanitizeZenChatMessages repairs tool call/result pairing for zen's

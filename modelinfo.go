@@ -18,14 +18,38 @@ type modelInfoEntry struct {
 	Ctx       int      `json:"ctx,omitempty"`
 	MaxOut    int      `json:"maxout,omitempty"`
 	Inputs    []string `json:"inputs,omitempty"`
-	Reasoning bool     `json:"reasoning,omitempty"`
-	Tools     bool     `json:"tools,omitempty"`
-	Temp      bool     `json:"supports_temperature,omitempty"`
-	Params    string   `json:"params,omitempty"`
-	Nudge     *bool    `json:"nudge_no_tools,omitempty"`
-	Mult      string   `json:"freepi_mult,omitempty"`
-	Free      bool     `json:"free,omitempty"`
-	Source    string   `json:"source,omitempty"`
+	OutMods   []string `json:"output_modalities,omitempty"`
+	Reasoning *bool    `json:"reasoning,omitempty"`
+	// EffortLevels are the accepted reasoning_effort values, in order.
+	EffortLevels []string `json:"reasoning_effort_levels,omitempty"`
+	// ReasoningToggle marks models with an on/off switch instead of levels.
+	ReasoningToggle bool `json:"reasoning_toggle,omitempty"`
+	// ReasoningBudget marks models that take a token budget, not levels.
+	ReasoningBudget  bool   `json:"reasoning_budget,omitempty"`
+	InterleavedField string `json:"interleaved_reasoning_field,omitempty"`
+	Tools            bool   `json:"tools,omitempty"`
+	Structured       bool   `json:"structured_output,omitempty"`
+	Attachment       bool   `json:"attachment,omitempty"`
+	Temp             bool   `json:"supports_temperature,omitempty"`
+	// SupportedParams is the request-parameter list (openrouter). empty =
+	// no record, not "nothing supported".
+	SupportedParams []string `json:"supported_parameters,omitempty"`
+	Params          string   `json:"params,omitempty"`
+	Nudge           *bool    `json:"nudge_no_tools,omitempty"`
+	Mult            string   `json:"freepi_mult,omitempty"`
+	// freepi served contract from the free-pi-cli provider config: the
+	// free-pi proxy layer's own window, not the underlying model's.
+	FreepiCtx       int      `json:"freepi_context,omitempty"`
+	FreepiMaxOut    int      `json:"freepi_maxout,omitempty"`
+	FreepiReasoning bool     `json:"freepi_declared_reasoning,omitempty"`
+	FreepiInputs    []string `json:"freepi_declared_inputs,omitempty"`
+	Free            bool     `json:"free,omitempty"`
+	Knowledge       string   `json:"knowledge_cutoff,omitempty"`
+	Released        string   `json:"released,omitempty"`
+	OpenWeights     bool     `json:"open_weights,omitempty"`
+	Family          string   `json:"family,omitempty"`
+	UpstreamStatus  string   `json:"upstream_status,omitempty"`
+	Source          string   `json:"source,omitempty"`
 }
 
 var (
@@ -140,6 +164,91 @@ func modelModality(id string) string {
 		}
 	}
 	return "text->text"
+}
+
+// modelSupportsParam reports whether the model accepts a request parameter
+// (openrouter list). false when no record exists, so callers must not treat
+// it as "rejected upstream".
+func modelSupportsParam(id, param string) bool {
+	e := lookupModelInfo(id)
+	if e == nil || len(e.SupportedParams) == 0 {
+		return false
+	}
+	for _, p := range e.SupportedParams {
+		if p == param {
+			return true
+		}
+	}
+	return false
+}
+
+// modelServedCtx is the window the proxy layer itself serves: freepi runs
+// its own gateway with its own limit, so the free-pi contract wins there.
+// otherwise the upstream model's own context.
+func modelServedCtx(id string) int {
+	if e := lookupModelInfo(id); e != nil && e.FreepiCtx > 0 {
+		return e.FreepiCtx
+	}
+	return modelCtx(id)
+}
+
+// modelServedMaxOut is the output ceiling the proxy layer serves.
+func modelServedMaxOut(id string) int {
+	if e := lookupModelInfo(id); e != nil && e.FreepiMaxOut > 0 {
+		return e.FreepiMaxOut
+	}
+	return modelMaxOut(id)
+}
+
+// modelIsReasoning reports whether the model reasons. an explicit false or a
+// null (unknown-provider entry) both mean "not a reasoning model"; the
+// zero value from a missing entry is unknown, so check the entry too.
+func modelIsReasoning(id string) bool {
+	if e := lookupModelInfo(id); e != nil && e.Reasoning != nil {
+		return *e.Reasoning
+	}
+	return false
+}
+
+// modelEffortLevels returns the accepted reasoning_effort values, in order.
+// empty for models that take a toggle or a token budget instead.
+func modelEffortLevels(id string) []string {
+	if e := lookupModelInfo(id); e != nil {
+		return e.EffortLevels
+	}
+	return nil
+}
+
+// modelReasoningControl describes how thinking is selected: levels, an
+// on/off toggle, a token budget, or nothing (not a reasoning model).
+func modelReasoningControl(id string) (levels []string, toggle, budget bool) {
+	e := lookupModelInfo(id)
+	if e == nil || e.Reasoning == nil || !*e.Reasoning {
+		return nil, false, false
+	}
+	return e.EffortLevels, e.ReasoningToggle, e.ReasoningBudget
+}
+
+// modelDefaultEffort is the reasoning effort injected when the request
+// names none: "high" when listed, else the closest level to high, else
+// "medium" for toggle/budget reasoning models. "" for non-reasoning models
+// (caller skips the reasoning block then) and unknown ids.
+func modelDefaultEffort(id string) string {
+	levels, toggle, budget := modelReasoningControl(id)
+	if len(levels) > 0 {
+		for _, want := range []string{"high", "medium", "low"} {
+			for _, l := range levels {
+				if l == want {
+					return l
+				}
+			}
+		}
+		return levels[len(levels)-1]
+	}
+	if e := lookupModelInfo(id); e != nil && e.Reasoning != nil && *e.Reasoning && (toggle || budget) {
+		return "medium"
+	}
+	return ""
 }
 
 // nudge overrides come from config.yml models.nudge (glob, first match

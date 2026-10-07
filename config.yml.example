@@ -300,9 +300,27 @@ freepi:
   enabled: false
   client_version: "0.2.19"  # below server min = 426 on completions
   ad_inline_every: 5        # inline impression every Nth turn
+  # default reasoning effort for reasoning-capable models when the client
+  # sends none ("max", "high", ...). clamped to the highest level the model
+  # lists in model_info.jsonc; models without a level list are untouched.
+  reasoning_effort: ""
   accounts:
     # - name: "main"
     #   jwt: "<jwt from ./nim freepi auth>"
+
+# --- antseed: p2p free models (https://github.com/Antseed/antseed) ---
+# models are `antseed/<id>` (catalog from the network stats snapshot).
+# keyless by design: identity is minted fresh in memory every run, never
+# saved; it rotates on 429. no accounts, no wallet, no deposits for free
+# offers (paid 402s surface as errors). direct tcp to sellers by default.
+antseed:
+  enabled: false
+  stats_url: ""       # "" = https://network.antseed.com/stats
+  refresh_secs: 300   # snapshot poll interval, 0 = 300
+  trust_min: 0        # min effective reputation for an offer, 0 = no gate
+  prefer_free: true   # +25 route score for zero-price offers
+  proxies: []         # force all peer tcp via these (http connect/socks5),
+                      # e.g. ["socks5://127.0.0.1:1080"]. "" = direct.
 
 # --- status: what /status shows ---
 # when auth.tokens is set AND the /status request has no valid token,
@@ -315,6 +333,7 @@ status:
   show_locks: true            # per-key model lockouts
   show_usage: true            # request + token totals from usage tracking
   show_pool: true             # proxy pool: verified count, per-exit rows
+  show_antseed: false         # antseed section: peers, free models, identity age
 
 # --- usage: per-request token tracker ---
 # every model request appends one json line (model, tokens, latency,

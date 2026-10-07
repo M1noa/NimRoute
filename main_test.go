@@ -316,6 +316,57 @@ func TestExtraFreeModelsGatedOnLiveAPI(t *testing.T) {
 	}
 }
 
+func TestUnlistedFreeModelsExcludedFromListing(t *testing.T) {
+	// zen still serves these; the proxy keeps them out of /v1/models.
+	live := []string{
+		"big-pickle", "exo-free", "space-bunny-free", "longcat-2.5-preview-free",
+		"fledge-alpha-free", "mimo-v2.6-flash-free", "mimo-v2.5-free",
+		"ling-3.1-flash-free", "ling-3.0-flash-fin-free",
+		"nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
+		"muse-spark-1.3-contributor-free",
+		"jev-1.13-free", "deepseek-v4-flash-free", "muse-spark-1.2-contributor-free",
+		"gpt-5.5",
+	}
+	want := []string{
+		"big-pickle", "exo-free", "space-bunny-free", "longcat-2.5-preview-free",
+		"fledge-alpha-free", "mimo-v2.6-flash-free", "mimo-v2.5-free",
+		"ling-3.1-flash-free", "ling-3.0-flash-fin-free",
+		"nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
+		"muse-spark-1.3-contributor-free",
+	}
+	listed := []string{}
+	seen := map[string]bool{}
+	for _, id := range live {
+		if (!strings.HasSuffix(id, "-free") && id != "big-pickle") || seen[id] || unlistedFreeModels[id] {
+			continue
+		}
+		seen[id] = true
+		listed = append(listed, id)
+	}
+	if len(listed) != len(want) {
+		t.Fatalf("listed = %v, want %v", listed, want)
+	}
+	for i, id := range want {
+		if listed[i] != id {
+			t.Fatalf("listed = %v, want %v", listed, want)
+		}
+	}
+}
+
+func TestExoFreeModelInfo(t *testing.T) {
+	loadModelInfo("model_info.jsonc")
+	e := lookupModelInfo("opencode/exo-free")
+	if e == nil {
+		t.Fatal("opencode/exo-free missing from catalog")
+	}
+	if e.Ctx != 1048576 || e.MaxOut != 131072 {
+		t.Errorf("exo ctx/maxout = %d/%d, want 1048576/131072", e.Ctx, e.MaxOut)
+	}
+	if got := modelModality("opencode/exo-free"); got != "text+image->text" {
+		t.Errorf("exo modality = %q, want text+image->text", got)
+	}
+}
+
 func TestHandleOpenCodeUsesCorrectEndpoint(t *testing.T) {
 	// Verify endpointForModel is called correctly in handleOpenCode
 	// by checking that Muse Spark models route to /responses
@@ -625,7 +676,7 @@ func TestTryNudgeResponsesMerges(t *testing.T) {
 		}
 		return retry
 	}
-	got := tryNudgeResponses("opencode/muse-spark-1.3", posted, first, post)
+	got := tryNudgeResponses("", "opencode/muse-spark-1.3", posted, first, post)
 	if got == nil {
 		t.Fatal("want retry body, got nil")
 	}
@@ -642,7 +693,7 @@ func TestTryNudgeResponsesMerges(t *testing.T) {
 			"data: {\"type\":\"response.completed\",\"response\":{}}\n\n" +
 			"data: [DONE]\n\n")
 	}
-	if out := tryNudgeResponses("opencode/muse-spark-1.3", posted, first, postWait); out != nil {
+	if out := tryNudgeResponses("", "opencode/muse-spark-1.3", posted, first, postWait); out != nil {
 		t.Fatalf("wait-only retry must yield nil, got %s", out)
 	}
 	// question text: no exemption anymore (the waitSentinel reprompt makes
@@ -651,7 +702,7 @@ func TestTryNudgeResponsesMerges(t *testing.T) {
 	called := false
 	postNo := func(nb []byte) []byte { called = true; return retry }
 	q := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Which file?\"}\n\ndata: [DONE]\n\n")
-	if out := tryNudgeResponses("opencode/muse-spark-1.3", posted, q, postNo); out == nil {
+	if out := tryNudgeResponses("", "opencode/muse-spark-1.3", posted, q, postNo); out == nil {
 		t.Fatalf("question should still nudge")
 	}
 	if !called {
@@ -3127,6 +3178,57 @@ func TestFreepiMultFromName(t *testing.T) {
 	}
 }
 
+func TestApplyFreepiReasoning(t *testing.T) {
+	yes := true
+	// setCatalog after useConfig: applyConfig reloads the real catalog.
+	setCatalog := func() {
+		setModelInfo(map[string]modelInfoEntry{
+			"freeepi/with-max":  {Reasoning: &yes, EffortLevels: []string{"low", "high", "max"}},
+			"freeepi/no-max":    {Reasoning: &yes, EffortLevels: []string{"minimal", "low", "medium", "high", "xhigh"}},
+			"freeepi/no-levels": {Reasoning: &yes},
+		})
+	}
+	t.Cleanup(func() { setModelInfo(loadModelInfo(modelInfoPath())) })
+
+	cases := []struct {
+		name   string
+		effort string
+		model  string
+		body   map[string]any
+		want   any
+	}{
+		{"knob off = untouched", "", "with-max", nil, nil},
+		{"injects max when listed", "max", "with-max", nil, "max"},
+		{"clamps to highest listed", "max", "no-max", nil, "xhigh"},
+		{"no level list = untouched", "max", "no-levels", nil, nil},
+		{"client effort wins", "max", "with-max", map[string]any{"reasoning_effort": "low"}, "low"},
+		{"reasoning object wins", "max", "with-max", map[string]any{"reasoning": map[string]any{"effort": "low"}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testConfig()
+			c.Freepi.ReasoningEffort = tc.effort
+			useConfig(t, c)
+			setCatalog()
+			m := map[string]any{"model": tc.model}
+			for k, v := range tc.body {
+				m[k] = v
+			}
+			applyFreepiReasoning(m, tc.model)
+			got, ok := m["reasoning_effort"]
+			if tc.want == nil {
+				if ok {
+					t.Errorf("reasoning_effort = %v, want absent", got)
+				}
+				return
+			}
+			if !ok || got != tc.want {
+				t.Errorf("reasoning_effort = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestInfoModelEntry(t *testing.T) {
 	prev := cfg()
 	defer applyConfig(prev)
@@ -3180,5 +3282,280 @@ func TestNudgeConfigOverride(t *testing.T) {
 	applyConfig(c)
 	if !nudgeEnabled("opencode/muse-spark-1.3-contributor-free") {
 		t.Fatal("catalog true must apply without override")
+	}
+}
+
+// reasoning levels, supported params, and the freepi served contract.
+func TestModelInfoReasoningAndParams(t *testing.T) {
+	prev := cfg()
+	defer applyConfig(prev)
+	f, _ := os.CreateTemp("", "modelinfo*.jsonc")
+	defer os.Remove(f.Name())
+	f.WriteString(`{
+  "opencode/muse-spark-1.3-contributor-free": {
+    "ctx": 1048576, "maxout": 131072,
+    "reasoning": true, "reasoning_effort_levels": ["minimal","low","medium","high","xhigh"],
+    "tools": true, "structured_output": true,
+    "supported_parameters": ["max_tokens","reasoning_effort","temperature","top_k","top_p"]
+  },
+  "opencode/big-pickle": {"reasoning": true, "reasoning_toggle": true, "supported_parameters": []},
+  "opencode/jev-1.13-free": {"reasoning": null},
+  "opencode/ling-3.0-flash-fin-free": {"reasoning": true, "reasoning_toggle": true,
+    "supported_parameters": ["temperature","top_p","seed"]},
+  "freeepi/solar-pro-4": {"ctx": 524288, "maxout": 131072, "freepi_context": 1048576, "freepi_maxout": 8192}
+}`)
+	f.Close()
+	t.Setenv("MODEL_INFO_FILE", f.Name())
+	applyConfig(testConfig())
+
+	levels, toggle, budget := modelReasoningControl("opencode/muse-spark-1.3-contributor-free")
+	if len(levels) != 5 || levels[0] != "minimal" || levels[4] != "xhigh" || toggle || budget {
+		t.Errorf("spark levels = %v toggle=%v budget=%v", levels, toggle, budget)
+	}
+	if !modelIsReasoning("opencode/muse-spark-1.3-contributor-free") {
+		t.Error("spark must report reasoning")
+	}
+	// toggle model: no level list, toggle set
+	levels, toggle, _ = modelReasoningControl("opencode/big-pickle")
+	if len(levels) != 0 || !toggle {
+		t.Errorf("big-pickle levels = %v toggle = %v", levels, toggle)
+	}
+	// null reasoning: unknown, not a reasoning model, no control
+	levels, toggle, budget = modelReasoningControl("opencode/jev-1.13-free")
+	if modelIsReasoning("opencode/jev-1.13-free") || len(levels) != 0 || toggle || budget {
+		t.Errorf("jev must report unknown reasoning: %v %v %v", levels, toggle, budget)
+	}
+	// supported params: hit, miss, and no-record
+	if !modelSupportsParam("opencode/muse-spark-1.3-contributor-free", "top_k") {
+		t.Error("top_k must be supported for spark")
+	}
+	if modelSupportsParam("opencode/muse-spark-1.3-contributor-free", "seed") {
+		t.Error("seed must not be supported for spark")
+	}
+	if modelSupportsParam("opencode/big-pickle", "temperature") {
+		t.Error("empty list means no record, not support")
+	}
+	if !modelSupportsParam("opencode/ling-3.0-flash-fin-free", "seed") {
+		t.Error("seed supported for ling")
+	}
+	// freepi serves its own gateway limits, not the upstream model's
+	if got := modelServedCtx("freeepi/solar-pro-4"); got != 1048576 {
+		t.Errorf("served ctx = %d, want the free-pi contract 1048576", got)
+	}
+	if got := modelServedMaxOut("freeepi/solar-pro-4"); got != 8192 {
+		t.Errorf("served maxout = %d, want the free-pi contract 8192", got)
+	}
+	if modelCtx("freeepi/solar-pro-4") != 524288 {
+		t.Error("upstream ctx must stay untouched")
+	}
+	// non-freepi keeps its own values
+	if modelServedCtx("opencode/muse-spark-1.3-contributor-free") == 0 {
+		t.Error("non-freepi served ctx must come from upstream")
+	}
+}
+
+// reasoning and reasoning_content both become Anthropic thinking blocks,
+// ahead of the text, in the buffered and streaming paths alike.
+func TestOpenAIReasoningToThinkingBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"reasoning", `{"choices":[{"message":{"reasoning":"thinking hard","content":"answer"}}]}`},
+		{"reasoning_content", `{"choices":[{"message":{"reasoning_content":"thinking hard","content":"answer"}}]}`},
+	}
+	for _, c := range cases {
+		out, errMsg, _ := openAIToAnthropic([]byte(c.body), "m", nil)
+		if errMsg != "" {
+			t.Fatalf("%s: %s", c.name, errMsg)
+		}
+		var got struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if len(got.Content) != 2 {
+			t.Fatalf("%s: want thinking+text, got %d blocks: %s", c.name, len(got.Content), out)
+		}
+		if got.Content[0].Type != "thinking" || got.Content[0].Thinking != "thinking hard" {
+			t.Errorf("%s: first block = %+v, want thinking", c.name, got.Content[0])
+		}
+		if got.Content[1].Type != "text" || got.Content[1].Text != "answer" {
+			t.Errorf("%s: second block = %+v, want text", c.name, got.Content[1])
+		}
+	}
+	// reasoning only: still a thinking block, no empty text fallback
+	out, _, _ := openAIToAnthropic([]byte(`{"choices":[{"message":{"reasoning":"just thinking"}}]}`), "m", nil)
+	if !strings.Contains(string(out), `"type":"thinking"`) || strings.Contains(string(out), `"text":"just thinking"`) {
+		t.Errorf("reasoning must not fall back to text: %s", out)
+	}
+}
+
+func TestStreamAnthropicThinkingBlockOrder(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think1\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think2\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n"
+
+	rec := httptest.NewRecorder()
+	written, promptT, compT := streamAnthropic(rec, []byte(sse), "m", nil)
+	if written == 0 {
+		t.Fatal("nothing written")
+	}
+	if promptT != 5 || compT != 7 {
+		t.Errorf("usage = %d/%d, want 5/7", promptT, compT)
+	}
+	body := rec.Body.String()
+
+	// thinking block opens at index 0 and precedes the text block
+	startThink := strings.Index(body, `"type":"content_block_start","index":0,"content_block":{"type":"thinking"`)
+	startText := strings.Index(body, `"type":"content_block_start","index":1,"content_block":{"type":"text"`)
+	if startThink < 0 || startText < 0 {
+		t.Fatalf("missing thinking or text block start:\n%s", body)
+	}
+	if startThink > startText {
+		t.Error("thinking block must open before the text block")
+	}
+	if !strings.Contains(body, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think1"}}`) {
+		t.Errorf("missing thinking_delta for reasoning spelling:\n%s", body)
+	}
+	if !strings.Contains(body, `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think2"}}`) {
+		t.Errorf("missing thinking_delta for reasoning_content spelling:\n%s", body)
+	}
+	// text deltas land on index 1
+	if !strings.Contains(body, `"index":1,"delta":{"type":"text_delta","text":"hello"}`) {
+		t.Errorf("text delta not on index 1:\n%s", body)
+	}
+	// both blocks close
+	if !strings.Contains(body, `"content_block_stop","index":0`) || !strings.Contains(body, `"content_block_stop","index":1`) {
+		t.Errorf("both blocks must close:\n%s", body)
+	}
+}
+
+// no reasoning: behavior is unchanged, text still opens at index 0.
+func TestStreamAnthropicNoThinkingUnchanged(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamAnthropic(rec, []byte(sse), "m", nil)
+	body := rec.Body.String()
+	if !strings.Contains(body, `"content_block_start","index":0,"content_block":{"type":"text"`) {
+		t.Errorf("text must stay at index 0 without reasoning:\n%s", body)
+	}
+	if strings.Contains(body, "thinking") {
+		t.Errorf("no thinking block expected:\n%s", body)
+	}
+}
+
+// a buffered upstream body (freepi asks for stream=false and converts here)
+// must still produce content blocks, not an empty stream.
+func TestStreamAnthropicBufferedJSONBody(t *testing.T) {
+	body := []byte(`{"choices":[{"message":{"content":"hello there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}`)
+
+	rec := httptest.NewRecorder()
+	written, promptT, compT := streamAnthropic(rec, body, "m", nil)
+	if written == 0 {
+		t.Fatal("nothing written")
+	}
+	if promptT != 9 || compT != 4 {
+		t.Errorf("usage = %d/%d, want 9/4", promptT, compT)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"type":"text_delta","text":"hello there"`) {
+		t.Errorf("buffered body text never emitted:\n%s", out)
+	}
+	if !strings.Contains(out, `"content_block_start","index":0,"content_block":{"type":"text"`) {
+		t.Errorf("text block never opened:\n%s", out)
+	}
+	if strings.Contains(out, "[DONE]") == false {
+		t.Errorf("stream never terminated:\n%s", out)
+	}
+}
+
+func TestZenUserAgentMatchesClientShape(t *testing.T) {
+	ua := zenUserAgent()
+	if !strings.HasPrefix(ua, "opencode/"+zenVersionStr()+" ") {
+		t.Fatalf("user agent %q missing opencode version prefix", ua)
+	}
+	if !strings.Contains(ua, " ai-sdk/provider-utils/4.0.23 ") {
+		t.Fatalf("user agent %q missing ai-sdk provider-utils suffix", ua)
+	}
+	if !strings.HasSuffix(ua, " runtime/bun/1.3.14") {
+		t.Fatalf("user agent %q missing runtime suffix", ua)
+	}
+}
+
+func TestSetZenHeadersSendsUserAgent(t *testing.T) {
+	req, err := http.NewRequest("POST", "https://opencode.ai/zen/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setZenHeaders(req, "ses_uatest")
+	if got := req.Header.Get("User-Agent"); got != zenUserAgent() {
+		t.Fatalf("User-Agent = %q, want %q", got, zenUserAgent())
+	}
+}
+
+func TestWriteResponsesSSEEmitsSequence(t *testing.T) {
+	body := []byte(`{"id":"resp_abc","model":"space-bunny-free",
+	 "output":[{"type":"message","role":"assistant",
+	   "content":[{"type":"output_text","text":"ok"}]}],
+	 "usage":{"input_tokens":11,"output_tokens":3}}`)
+	rec := httptest.NewRecorder()
+	n := writeResponsesSSE(rec, body)
+	if n == 0 {
+		t.Fatal("wrote 0 bytes")
+	}
+	out := rec.Body.String()
+	for _, ev := range []string{
+		"event: response.created",
+		"event: response.in_progress",
+		"event: response.output_item.added",
+		"event: response.output_text.delta",
+		"event: response.output_text.done",
+		"event: response.output_item.done",
+		"event: response.completed",
+	} {
+		if !strings.Contains(out, ev) {
+			t.Errorf("missing %s in:\n%s", ev, out)
+		}
+	}
+	if !strings.Contains(out, `"delta":"ok"`) {
+		t.Errorf("text delta never emitted:\n%s", out)
+	}
+	if !strings.Contains(out, `"input_tokens":11`) || !strings.Contains(out, `"output_tokens":3`) {
+		t.Errorf("usage not carried into response.completed:\n%s", out)
+	}
+	if !strings.HasSuffix(out, "data: [DONE]\n\n") {
+		t.Errorf("stream not terminated with [DONE]:\n%q", out[len(out)-40:])
+	}
+	// every data line must be valid json, not a buffered body
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		d := strings.TrimPrefix(line, "data: ")
+		if d == "[DONE]" {
+			continue
+		}
+		var probe map[string]any
+		if err := json.Unmarshal([]byte(d), &probe); err != nil {
+			t.Errorf("non-json data frame %q: %v", d, err)
+		}
+	}
+}
+
+func TestWriteResponsesSSEPassesThroughUnparseable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if n := writeResponsesSSE(rec, []byte("not json")); n != 8 {
+		t.Fatalf("wrote %d bytes, want 8 (raw passthrough)", n)
+	}
+	if rec.Body.String() != "not json" {
+		t.Fatalf("body = %q, want raw passthrough", rec.Body.String())
 	}
 }

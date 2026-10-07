@@ -172,6 +172,9 @@ func freepiGet(fa *freepiAcct, path string, timeout time.Duration) (int, []byte)
 	if err != nil {
 		return 0, nil
 	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		acclog.Printf("!! freepi GET %s: 401, jwt rejected (re-auth the account)", path)
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, b
@@ -346,6 +349,34 @@ func freepiSnapshot() *freepiSummary {
 	return sum
 }
 
+// applyFreepiReasoning injects the configured default reasoning effort
+// when the client sent none. only models with an explicit level list in
+// model_info.jsonc are touched; a value the model doesn't list clamps to
+// its highest level.
+func applyFreepiReasoning(m map[string]any, realModel string) {
+	want := cfg().Freepi.ReasoningEffort
+	if want == "" {
+		return
+	}
+	if _, ok := m["reasoning_effort"]; ok {
+		return
+	}
+	if _, ok := m["reasoning"]; ok {
+		return
+	}
+	levels := modelEffortLevels("freeepi/" + realModel)
+	if len(levels) == 0 {
+		return
+	}
+	for _, l := range levels {
+		if l == want {
+			m["reasoning_effort"] = want
+			return
+		}
+	}
+	m["reasoning_effort"] = levels[len(levels)-1]
+}
+
 // handleFreepiAnthropic serves /v1/messages for freeepi/<model>: same
 // account rotation, then converts the openai answer back to the
 // Anthropic Messages shape (stream or not).
@@ -355,6 +386,7 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 	if json.Unmarshal(oaiBody, &m) == nil {
 		m["model"] = realModel
 		stripCacheFields(m)
+		applyFreepiReasoning(m, realModel)
 		m["stream"] = false // fetch the whole answer, convert here
 		if b, err := json.Marshal(m); err == nil {
 			oaiBody = b
@@ -551,6 +583,7 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
 		stripCacheFields(m)
+		applyFreepiReasoning(m, realModel)
 		if b, err := json.Marshal(m); err == nil {
 			body = b
 		}

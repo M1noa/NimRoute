@@ -87,6 +87,17 @@ func zenVersionStr() string {
 	return zenVersion
 }
 
+// the ai-sdk suffix the real client appends to its own User-Agent: the
+// provider-utils version it runs and the js runtime underneath it.
+const (
+	zenSDKVersion = "4.0.23"
+	zenRuntime    = "bun/1.3.14"
+)
+
+func zenUserAgent() string {
+	return "opencode/" + zenVersionStr() + " ai-sdk/provider-utils/" + zenSDKVersion + " runtime/" + zenRuntime
+}
+
 // fetchOpenCodeVersion pulls the latest opencode release tag from the GitHub
 // API, falling back to the default on any error.
 func fetchOpenCodeVersion() {
@@ -369,9 +380,9 @@ func sampleWeighted(pool []string, n int) []string {
 }
 
 // probeProxyFull verifies the full path to zen's front door through the
-// proxy: socks dials opencode.ai:443, http issues a CONNECT. used only by
-// the pool verifier, never on the request hot path (verified-on-success +
-// live rtt weights keep the pool fresh without per-request probes).
+// proxy: socks dials opencode.ai:443, http issues a CONNECT. unused (the
+// verifier does GET /v1/models and dead exits die on real sends); kept as
+// the documented full-path probe if verification ever needs to go deeper.
 func probeProxyFull(proxyURL string, timeout time.Duration) bool {
 	if proxyURL == "" {
 		return true

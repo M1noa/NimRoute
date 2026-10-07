@@ -1,6 +1,12 @@
 # TODO
 
-sorted simplest first. each item keeps current defaults unchanged.
+merged from TODO.md + IMPROV_TODO.md (lanes, ttft, proxy rotation).
+open items first, done work and notes at the bottom. numbering stays
+stable — AGENTS.md references items 9 and 10 — so new items append at
+the end instead of re-sorting by size.
+
+sorted simplest first within that constraint. each item keeps current
+defaults unchanged.
 
 ## 1. config: merge new keys on update, never wipe user config [small] DONE
 
@@ -178,3 +184,270 @@ but the churn is wasteful.
   proxies = gap too tight; 429s across many lanes = pool stale).
 - verify: unit test for cooldown skip + counter reset; live check that
   refreshes drop to ~1 per burst in the log.
+
+## 11. cli flags that override config [small]
+
+no flag parsing exists today: `os.Args[1] == "probe"` (main.go:4453) and
+the `CONFIG_FILE` env var (config.go:387) are the only knobs. flags are
+for easy testing without editing `config.yml`.
+
+- parse with the stdlib `flag` package at entry: `--config`,
+  `--port`, `--lanes`, `--verbose` / `--debug` (log level), `--monitor`
+  (wires into item 12). whatever else turns out to be needed while
+  testing, keep the list short.
+- flags win over config values: apply after config load, before listen /
+  pool build, so `--port 5420` and `--lanes 4` are visible everywhere.
+- `probe` subcommand must keep working; bare first arg `probe` stays the
+  trigger (or accept flags before it — decide once, test both orders).
+- no flags = byte-identical behavior to today.
+- test: `--port` listens on the override, `--lanes` caps lanes,
+  `--debug` flips log verbosity, defaults unchanged without flags.
+
+## 12. perf monitoring: stage timings + resource sampling [large]
+
+optional monitor writing jsonl to its own file, mirroring the
+`logUsage` pattern (usage.go:56): gated on `monitor.enabled` (default
+false), zero cost when off, one line per record.
+
+per-request rows (wall clock, ms):
+- `total`: request accepted -> response fully written to the client.
+- `proxy_in`: accept -> upstream request dispatched (pii, guardrails,
+  conversion, lane pick — everything the proxy does before the wire).
+- `upstream_ttfb`: dispatch -> first upstream byte.
+- `ttft` (streaming only): dispatch -> first content delta written to
+  the client.
+- `model_tps`: completion_tokens / (last delta - first delta).
+- `upstream_total`: dispatch -> upstream body finished.
+- `drain`: upstream finished -> client write finished (sse rewrite +
+  flush time).
+- `proxy_overhead`: total - upstream_total (the "how much does the
+  proxy cost" number).
+
+operation rows (once per call):
+- startup phases: config load, model_info load, pool build + proxy
+  sort/verify, shared-lane pre-open, listen.
+- pool refresh, proxy verification, lane create/evict/rotate, model
+  fetch (`fetchZenModelIDs`).
+
+resource rows: rss, cpu %, goroutine count (threads), process net bytes
+in/out. sampled on a timer — default `interval_ms: 1000`, document
+500-2000 as the sane range; 1s catches refresh storms without drowning
+the file, 0.5s if a burst needs resolving. rss/cpu via runtime +
+getrusage, no new deps. also attach an rss snapshot to each request
+row so a slow request can be correlated with memory pressure.
+
+- config: `monitor.enabled` (false), `monitor.path`
+  (`nim-perf.jsonl`), `monitor.interval_ms` (1000). document in
+  `config.yml.example` + defaults in `defaultConfig()`; default-false
+  bool, so no raw-doc presence check needed. `--monitor` flag from
+  item 11 as the quick toggle.
+- verify: unit test that disabled monitor writes nothing and that
+  `proxy_overhead = total - upstream_total` on a fake timeline; live
+  check a streaming request row carries `ttft`, `model_tps`, and rss.
+- no `/status` section unless someone asks for one (that would need a
+  `status.show_*` flag + `StatusFor` redaction per AGENTS.md).
+
+## 13. zen: stop handing the client retryable failures while exits remain [medium]
+
+symptoms (2026-10-07 log): opencode shows "failed to process request"
+while the log shows rotation working. every failure 429-rotates, but
+after 5 attempts (`max_retries: 4`) the loop falls through and writes
+the last upstream status to the client: req-256 got `<- 429` with
+0 bytes after 1m5s, req-305 the same after 17s. two compounding bugs:
+
+- the 429 path (main.go:3388) closes the body then `continue`s, so the
+  post-loop code re-reads a closed body and forwards an empty 429. the
+  client sees a bodyless 429 and gives up.
+- `hedgedDo` (zenlanes.go:330) lets a fast 429 win: the primary 429s in
+  200ms, the hedge is cancelled, a success 1s behind it is thrown away.
+
+one open question: several `dial tcp 47.90.229.219:443: refused` lines
+name a dial target that is not the logged proxy, so a primary-side vs
+hedge-side mixup can't be ruled out yet.
+
+- track the last failure kind across the loop (`handleOpenCode`,
+  `handleOpenCodeAnthropic`, `zenPost`): retryable (429/529, net error)
+  vs terminal (anything else). a retryable tail enters a bounded drain
+  after the loop: fresh exits via `pickLaneProxyFor` skipping
+  already-tried ones, fresh session per try, bound by client ctx plus a
+  new `zen.retry_drain_secs` (default 0 = off, current behavior).
+  terminal errors keep today's path.
+- hedge: a retryable-status winner waits for the other side (same
+  budget) instead of cancelling it. first success wins; both-retryable
+  falls into the drain.
+- log hedge-side errors with their own proxy label, so the dial-target
+  mismatch is answerable next time.
+- never forward an empty upstream error: synthesize JSON with 502/503
+  + `Retry-After` on the retryable-exhausted path instead of the stale
+  429. check what opencode retries on and match it.
+- the refresh-storm half of this log (2-3 refreshes per burst) is
+  already item 10's; this item is only the client-facing tail.
+- test: fake upstream 4x429 then 200 -> client 200; all-429 -> JSON
+  502/503 with a non-empty body, never a bare 429; fast-429 vs
+  slow-200 hedge -> 200 wins.
+
+## left open
+
+- [ ] live restart of the primary (:5419). deliberately left to the user.
+
+## done — lanes, ttft, proxy rotation (was IMPROV_TODO.md)
+
+one line per item, checkbox marks state.
+
+### done
+
+- [x] measure zen ttft for space-bunny and muse-spark through the proxy (6s
+      sbunny, 403 in 12s on muse) — root cause was not ttft alone, see below
+- [x] `lane_hdr` / `lane_convo` / `lane_shared` / `lane_cache_key`
+      independent booleans in config.yml zen section (`config.go` *bool so
+      absent = default)
+- [x] convo off by default with a config disclaimer saying why (hash drifts
+      as history grows, one-shots pin lanes)
+- [x] shared pool pre-opens `lanes`-count lanes at startup AND on first
+      request (`ensureSharedLanes`, `ensureSharedLanesLocked`). verified:
+      a cold test instance showed 25 shared lanes immediately, not one lane
+      built on demand
+- [x] shared lanes actually spread. `lastUsed` is stamped on hand-out, not
+      only on success, so concurrent requests no longer all draw the same
+      coldest lane. 24 concurrent headerless requests now hit 8 distinct
+      lanes (was 1)
+- [x] hdr/convo/prompt_cache_key arriving at a full table converts the idlest
+      shared lane instead of piling onto one fallback (`convertSharedLocked`)
+- [x] no cooldowns at all: 429/geo/block rotate exit+session instantly
+      (`laneRotate` mints a new `ses_*` + picks a fresh exit)
+- [x] `lane_cooldown_secs` / `lane_wait_max_secs` / `probe_timeout_ms` /
+      `race_timeout_ms` marked unused in the example so nobody tunes them
+- [x] rate-limited >15s with no global success -> pool refresh + session
+      rotation (`maybeRefreshStalePool(lane)`, `stale_pool_secs`)
+- [x] deadcode removed: `laneCool`, `laneCoolSoft`, `laneBlock`, `laneWait`,
+      `laneHealthy`, `firstByteDo`, `laneCooldownBase`, `probeTimeout`,
+      `raceTimeout`, `raceProbe`
+- [x] no hot-path exit probe or parallel race (was 1s probe + 3.5s race on
+      every pick) — pool verified on refresh, dead exits die on real sends
+- [x] faster exits weigh more: live first-byte rtt ewma (`noteExitRTT`) mixed
+      into `proxyWeight` with api-reported latency + reliability
+- [x] freepi = one lane per account already (`freepiAcct.inflight` gate, one
+      jwt = one live stream); nvidia = one key per request, direct, no proxy.
+      backends never share lane state — confirmed, no change needed
+- [x] cancel propagates upstream: `r.Context()` on every upstream request
+      (zen oai, zen anthropic, nudge, nvidia `callUpstream`, freepi
+      `freepiTry`/`freepiFetch`), `semAcquire(ctx)`, `laneGate(ctx)`,
+      `zenBackoffCtx`, hedge both sides ctx-derived, and the stream copy
+      loops abort on ctx — extracted as `copyZenChatStream` so the check
+      lives in one place instead of three inline copies
+- [x] true streaming for `/responses` (was fully buffered before first byte):
+      `streamResponsesLive` (oai) + `streamResponsesLiveAnthropic`
+- [x] `prompt_cache_key` pins a lane on the openai-compat endpoint (read
+      before `stripCacheFields` deletes it upstream). anthropic-side
+      `cache_control` idea was retracted, not implemented
+- [x] low-capacity dual-lane race, optional, configurable, documented as
+      costing two upstream inferences: `lane_race_enabled`,
+      `race_utilization_threshold` (30%), `race_use_window_minutes` (10),
+      `race_hedge_after_ms` (0). rides the existing hedge machinery via
+      `hedgeDelay()`, so a race is a hedge with a 0ms delay rather than a
+      second mechanism. off by default
+- [x] example config synced with live config, all lane toggles + race keys
+      documented with the usage disclaimer
+- [x] live config: `lane_hdr: true`, `lane_shared: true`,
+      `lane_convo: false`, `lane_cache_key: true`, `lanes: 18`,
+      `lane_race_enabled: false`
+- [x] AGENTS.md updated for the no-cooldown rotation model
+- [x] cost row in `nimstatus.py` present again after an accidental revert
+      during this work
+- [x] fixed early stream cutoff (hedge winner's context was canceled on
+      return, killing the body mid-stream): `zenSide` hands the cancel to
+      `bodyCancelCloser` so the winner streams on and frees ctx on close
+- [x] regression tests for the cutoff: whole-stream delivery, cancel stops
+      the copy, live streamers carry every delta including tool calls, and
+      byte-at-a-time reads reassemble (`stream_cancel_test.go`)
+
+### verified end to end (scratch config, port 5420, then torn down)
+
+- [x] anthropic `/v1/messages` streaming: 275 words, `end_turn`, `[DONE]`
+- [x] anthropic `/v1/messages` non-streaming: content present, one body
+- [x] oai `/v1/chat/completions` streaming: full body, finish `stop`
+- [x] tool call: `Bash` emitted as `tool_use`, client spelling restored,
+      args streamed, `tool_use` stop reason
+- [x] multi-turn: tool result fed back produces a text answer, `end_turn`
+- [x] 8 concurrent streams: 8/8 complete, all correct, spread across lanes
+- [x] 25 shared lanes present at startup, distinct exits per lane
+- [x] lane race: fires when idle ("busy share 4% < 30%"), responses still
+      complete; silent when disabled
+- [x] `/health`, `/v1/models`, `/v1/messages/count_tokens`, `claude-*`
+      mapping all 200
+- [x] all 13 non-deepseek models swept on `/v1/messages`. **1 of 13 passes:
+      space-bunny-free.** the other 12 fail, and the failure is upstream, not
+      the proxy — evidence:
+  - 56 distinct exits attempted across the sweep; every other model drew
+    403 `FreeTierError` or 429 on all of them
+  - space-bunny hit **zero** blocks on those same exits in the same run and
+    answered `end_turn` + `[DONE]` on request both before and after the sweep
+  - log tally: 32 free-tier-blocked, 46 rate-limited, 1 x 200
+  - the lane/rotation machinery is provably working (it rotates on every
+    one of those failures and lands on a distinct exit each time); it just
+    cannot outrun a per-exit-per-model gate
+  - only exception needing its own look: `jev-1.13-free` returns upstream
+    **500** `{"type":"error","message":"Internal server error"}` rather than
+    403, i.e. the provider 500s on it. not a proxy defect either, but worth
+    remembering if jev starts 500ing on a good exit
+  - so: only space-bunny-free is usable right now. the rest are listed in
+    `/v1/models` but are effectively dead upstream. not something rotation
+    can fix.
+
+### not done / done-later (from the original "not done" section)
+
+- [x] **tokens served per lane and per model, since process start.**
+      `zenLane.tokens` is a `map[string]laneTokens` (requests, prompt,
+      completion, total) held on the lane object, not keyed by lane key, so
+      totals survive `laneRotate` (new session, same lane) and
+      `convertSharedLocked` (key renamed, same lane). `laneTouch` counts
+      the request at 200-time; `laneTokensAdd` folds the token counts in
+      once the body is parsed, since upstream reports usage in the stream
+      tail. `/status` lanes gained `prompt_tokens` / `completion_tokens` /
+      `total_tokens` plus a `by_model` map. rides the existing `show_zen`
+      flag and `StatusFor` redaction, no new flag needed. in-memory, resets
+      on restart, as asked. `nimstatus.py` shows a tok column (top model
+      appended when a lane served more than one) and a `tok served` line.
+- [x] found and fixed why the counters read zero: `initUsageLog()` ran
+      before `applyConfig`, so `usage.path` / `usage.enabled` came from an
+      unloaded config and the jsonl opened at the wrong path (or not at
+      all). moved after `applyConfig` in `serverMain`, and after the config
+      load in `runProbe`.
+- [x] found and fixed why anthropic streams reported zero tokens:
+      `streamAnthropic` returns on `finish_reason`, but zen sends usage in
+      a chunk *after* it. the body is now scanned up front via the existing
+      `sseUsageTee`, so both the usage record and the per-lane totals carry
+      real counts. the non-stream fold was already correct. verified live:
+      two turns recorded 1040 and 1298 tokens, 2338 total on one lane with
+      the per-model breakdown.
+- [ ] live restart of the primary (:5419) — moved to "left open" above.
+
+### notes
+
+- the "model says part of a thing then stops and runs no tools" symptom was
+  reproduced once and turned out to be upstream `max_tokens` truncation on
+  reasoning-heavy prompts, not a streaming bug: space-bunny spends its
+  budget on `reasoning_content` and returns zero visible content at low
+  `max_tokens`. with headroom it answers fully. worth remembering before
+  chasing it again.
+- muse-spark and most other zen free models now 403 `FreeTierError` on
+  essentially every exit in the pool (see the model sweep above). known,
+  per-exit per-model: rotation cannot fix a model-level gate, and only
+  space-bunny-free is currently serving.
+- `hedgedDo` winner must keep streaming. any change there needs a test that
+  asserts the body still yields bytes after it returns — that is the bug
+  that broke real sessions.
+- per-lane token totals read 0 for turns that hit `max_tokens` before
+  upstream emitted a usage chunk. that is upstream behaviour, not a counter
+  bug: a prompt short enough to reason briefly reports nothing. check
+  `usage` totals alongside the lane numbers before chasing it. the real
+  zero-token bug (usage after finish_reason) is fixed and listed above —
+  distinguish the two before spending time on it.
+- `models.params` was refactored out of config.yml into `model_info.jsonc`
+  + `modelinfo.go` while this work was in flight, committed alongside mine.
+  checked: it is deliberate and documented (AGENTS.md line ~69 says
+  `injectParams` only folds camelCase and no sampling defaults are injected
+  any more). `nudge_no_tools`, `context_length` and the thinking→effort
+  mapping all read model_info now. no action needed. noting it only because
+  the change landed in the same commits as the lane work and is easy to miss
+  when reading the log.

@@ -571,3 +571,38 @@ func TestHedgedDoWinnerBodyReadable(t *testing.T) {
 		t.Fatal("loser was never cancelled")
 	}
 }
+
+// modelDefaultEffort picks high-or-closest from the catalog; the request's
+// own effort always wins (enforced by the convertToResponses gate).
+func TestModelDefaultEffort(t *testing.T) {
+	useConfig(t, testConfig())
+	for id, want := range map[string]string{
+		"opencode/muse-spark-1.3-contributor-free": "high",
+		"opencode/space-bunny-free":                "high",
+		"opencode/deepseek-v4-flash-free":          "high",
+		"opencode/ling-3.1-flash-free":             "medium",
+		"freeepi/glm-5.3-flash":                    "high",
+		"opencode/no-such-model":                   "",
+	} {
+		if got := modelDefaultEffort(id); got != want {
+			t.Errorf("modelDefaultEffort(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+// a request-named effort survives convertToResponses untouched.
+func TestConvertKeepsRequestEffort(t *testing.T) {
+	useConfig(t, testConfig())
+	m := map[string]any{
+		"model":    "opencode/muse-spark-1.3-contributor-free",
+		"messages": []any{},
+		"reasoning": map[string]any{
+			"effort": "low",
+		},
+	}
+	convertToResponses(m)
+	r, _ := m["reasoning"].(map[string]any)
+	if r["effort"] != "low" {
+		t.Fatalf("request effort overwritten: %v", m["reasoning"])
+	}
+}

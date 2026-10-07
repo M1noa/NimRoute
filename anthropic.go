@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -229,17 +230,20 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 				continue // zen rejects empty tool names
 			}
 			tnames = append(tnames, name)
-			// zen 400s when parameters is null/missing/non-object.
+			// zen 400s when parameters is null/missing/non-object, and 400s
+			// the whole request with "Recursive JSON schemas are not currently
+			// supported" when a client tool ships $defs/$ref cycles. sanitize
+			// here so both the chat and responses paths inherit it.
 			var obj map[string]any
 			if err := json.Unmarshal(params, &obj); err != nil || obj == nil {
-				params = json.RawMessage(`{"type":"object"}`)
+				obj = map[string]any{"type": "object"}
 			}
 			tools = append(tools, map[string]any{
 				"type": "function",
 				"function": map[string]any{
 					"name":        name,
 					"description": desc,
-					"parameters":  params,
+					"parameters":  sanitizeZenSchema(obj),
 				},
 			})
 		}
@@ -585,7 +589,10 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Content          *string `json:"content"`
+				Content   *string `json:"content"`
+				Reasoning *string `json:"reasoning"`
+				// ReasoningContent is the reasoning_content spelling; upstreams
+				// send one or the other.
 				ReasoningContent *string `json:"reasoning_content"`
 				ToolCalls        []struct {
 					ID       string `json:"id"`
@@ -621,11 +628,21 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 {
 		msg := oaiResp.Choices[0].Message
 
+		// thinking block first, then the answer. reasoning and
+		// reasoning_content are the two spellings for the same trace.
+		thinking := ""
+		if msg.Reasoning != nil && *msg.Reasoning != "" {
+			thinking = *msg.Reasoning
+		} else if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+			thinking = *msg.ReasoningContent
+		}
+		if thinking = stripWaitSentinel(thinking); thinking != "" {
+			content = append(content, map[string]any{"type": "thinking", "thinking": thinking})
+		}
+
 		text := ""
 		if msg.Content != nil && *msg.Content != "" {
 			text = *msg.Content
-		} else if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
-			text = *msg.ReasoningContent
 		}
 		text = stripWaitSentinel(text)
 		if text != "" {
@@ -704,25 +721,46 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 
 	// proxy-internal marker must never reach the client.
 	body = stripSentinelSSE(body)
+	// some backends answer a streamed request with one plain json object
+	// (the freepi path asks upstream for stream=false and converts here).
+	// with no data: lines the loop below would parse as an empty stream.
+	body = sseNormalize(body)
 
 	msgID := "msg_" + randHex(24)
 	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
 	written += writeSSE(w, "message_start", preamble)
-	written += writeSSE(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 	written += writeSSE(w, "ping", `{"type":"ping"}`)
 	if fl != nil {
 		fl.Flush()
 	}
 
+	// the text block opens lazily: a reasoning turn claims index 0 for the
+	// thinking block and the answer follows at index 1.
+	thinkIdx := -1
+	textIdx := 0
+	textOpen := false
 	textClosed := false
+	thinkClosed := false
+	closeThinking := func() {
+		if thinkIdx >= 0 && !thinkClosed {
+			written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+			thinkClosed = true
+		}
+	}
+	closeText := func() {
+		if textOpen && !textClosed {
+			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, textIdx))
+			textClosed = true
+		}
+	}
 	hasToolCalls := false
-	toolIndex := -1
+	toolIdxMap := map[int]int{}
 	lastToolIdx := 0
 	hasSentStopReason := false
 	var strip sentinelStripper
 	flushStrip := func() {
 		if tail := strip.flush(); tail != "" && !hasToolCalls && !textClosed {
-			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(tail)))
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(tail)))
 		}
 	}
 
@@ -739,8 +777,17 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 
 		var chunk struct {
 			Choices []struct {
-				Delta struct {
+				// non-stream bodies carry the answer in message, not delta.
+				Message *struct {
 					Content          string `json:"content"`
+					Reasoning        string `json:"reasoning"`
+					ReasoningContent string `json:"reasoning_content"`
+				} `json:"message"`
+				Delta struct {
+					Content string `json:"content"`
+					// Reasoning is the reasoning spelling, ReasoningContent the
+					// reasoning_content one; both carry the same trace.
+					Reasoning        string `json:"reasoning"`
 					ReasoningContent string `json:"reasoning_content"`
 					ToolCalls        []struct {
 						Index    int    `json:"index"`
@@ -764,6 +811,18 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 			continue
 		}
 
+		// a buffered body reports the whole turn in message; fold it into the
+		// delta shape so one code path emits it.
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Message != nil {
+			m := chunk.Choices[0].Message
+			chunk.Choices[0].Delta.Content += m.Content
+			chunk.Choices[0].Delta.Reasoning += m.Reasoning
+			chunk.Choices[0].Delta.ReasoningContent += m.ReasoningContent
+			if chunk.Choices[0].FinishReason == nil {
+				chunk.Choices[0].FinishReason = strPtr("stop")
+			}
+		}
+
 		if chunk.Usage != nil {
 			if chunk.Usage.PromptTokens > 0 {
 				promptT = chunk.Usage.PromptTokens
@@ -779,9 +838,29 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		choice := chunk.Choices[0]
 
 		// text delta
+		// thinking delta, ahead of the text block
+		think := choice.Delta.Reasoning
+		if think == "" {
+			think = choice.Delta.ReasoningContent
+		}
+		if think != "" {
+			if thinkIdx < 0 {
+				closeText()
+				thinkIdx = 0
+				textIdx = 1
+				written += writeSSE(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
+			}
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%s}}`, jsonStr(think)))
+		}
+
+		// text delta
 		if choice.Delta.Content != "" && !hasToolCalls && !textClosed {
+			if !textOpen {
+				written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
+				textOpen = true
+			}
 			if clean := strip.push(choice.Delta.Content); clean != "" {
-				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%s}}`, jsonStr(clean)))
+				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(clean)))
 			}
 		}
 
@@ -789,24 +868,28 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		if len(choice.Delta.ToolCalls) > 0 {
 			if !hasToolCalls {
 				hasToolCalls = true
-				if !textClosed {
-					written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
-					textClosed = true
-				}
+				closeThinking()
+				closeText()
 			}
 
+			// tools follow whatever blocks already opened (thinking, text).
+			// each upstream tool index gets its own block index: deltas for a
+			// second call in the same chunk must not reuse the first's index.
+			base := boolInt(thinkIdx >= 0) + boolInt(textOpen)
 			for _, tc := range choice.Delta.ToolCalls {
-				if toolIndex < 0 || tc.Index != toolIndex {
-					toolIndex = tc.Index
+				idx, open := toolIdxMap[tc.Index]
+				if !open {
+					idx = base + lastToolIdx
 					lastToolIdx++
+					toolIdxMap[tc.Index] = idx
 					toolID := tc.ID
 					if toolID == "" {
 						toolID = "toolu_" + randHex(24)
 					}
-					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, lastToolIdx, jsonStr(toolID), jsonStr(tnames.resolve(tc.Function.Name))))
+					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, idx, jsonStr(toolID), jsonStr(tnames.resolve(tc.Function.Name))))
 				}
 				if tc.Function.Arguments != "" {
-					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, lastToolIdx, jsonStr(tc.Function.Arguments)))
+					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, idx, jsonStr(tc.Function.Arguments)))
 				}
 			}
 		}
@@ -815,14 +898,13 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		if choice.FinishReason != nil && !hasSentStopReason {
 			hasSentStopReason = true
 			flushStrip()
+			closeText()
 
-			for i := 1; i <= lastToolIdx; i++ {
-				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
-			}
+			closeThinking()
 
-			if !textClosed {
-				written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
-				textClosed = true
+			toolBase := boolInt(thinkIdx >= 0) + boolInt(textOpen)
+			for i := 0; i < lastToolIdx; i++ {
+				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 			}
 
 			stopReason := "end_turn"
@@ -847,12 +929,15 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 	// stream ended without finish_reason
 	if !hasSentStopReason {
 		flushStrip()
-		for i := 1; i <= lastToolIdx; i++ {
-			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, i))
+		closeText()
+
+		closeThinking()
+
+		toolBase := boolInt(thinkIdx >= 0) + boolInt(textOpen)
+		for i := 0; i < lastToolIdx; i++ {
+			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 		}
-		if !textClosed {
-			written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
-		}
+
 		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":%d}}`, compT))
 		written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
 		n, _ := w.Write([]byte("data: [DONE]\n\n"))
@@ -1360,13 +1445,53 @@ func responseItemText(item map[string]any) string {
 	return sb.String()
 }
 
+// nudgeState tracks consecutive tool-less turns per session, so the
+// no-tools reprompt stops after nudgeMaxStreak rounds instead of firing on
+// every tool-less turn forever. a tool-calling turn resets the streak.
+type nudgeState struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+const nudgeMaxStreak = 2
+
+func (s *nudgeState) allowed(session string) bool {
+	if session == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n[session] < nudgeMaxStreak
+}
+
+func (s *nudgeState) note(session string, calledTools bool) {
+	if session == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.n == nil {
+		s.n = map[string]int{}
+	}
+	if calledTools {
+		delete(s.n, session)
+		return
+	}
+	if len(s.n) > 8192 {
+		s.n = map[string]int{}
+	}
+	s.n[session]++
+}
+
+var nudgeStreaks = &nudgeState{}
+
 // tryNudgeResponses runs the no-tools continue: gates on the master switch,
 // the per-model flag, offered tools, and response text, then posts the
 // continuation via post. returns the retry body, or nil when the nudge
 // doesn't fire (or the retry is wait-only) so callers keep the original.
 // callers merge: stream sites append the retry as a second body,
 // buffered sites fold mergeResponsesSSE([rb, retry]) before converting.
-func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byte) []byte) []byte {
+func tryNudgeResponses(session, clientModel string, posted, rb []byte, post func(nb []byte) []byte) []byte {
 	if !nudgeEnabled(clientModel) {
 		dbglog.Printf("  nudge skip model=%s reason=disabled", clientModel)
 		return nil
@@ -1377,6 +1502,11 @@ func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byt
 	}
 	text, hasCalls := scanResponsesSSE(rb)
 	if hasCalls {
+		nudgeStreaks.note(session, true)
+		return nil
+	}
+	if !nudgeStreaks.allowed(session) {
+		dbglog.Printf("  nudge skip model=%s reason=streak-cap", clientModel)
 		return nil
 	}
 	if strings.Contains(text, waitSentinel) {
@@ -1400,6 +1530,7 @@ func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byt
 	}
 	text2, nHasCalls := scanResponsesSSE(nb2)
 	if !nHasCalls {
+		nudgeStreaks.note(session, false)
 		// retry called nothing: swallowing keeps the turn to one
 		// assistant message so the agent acts instead of narrating
 		// twice. covers wait-only plus any tool-less text (which may
@@ -1411,6 +1542,7 @@ func tryNudgeResponses(clientModel string, posted, rb []byte, post func(nb []byt
 		}
 		return nil
 	}
+	nudgeStreaks.note(session, true)
 	acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d", clientModel, nHasCalls, len(nb2))
 	return nb2
 }
@@ -1455,8 +1587,21 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	// bound the body read: a client that stalls mid-upload otherwise pins
+	// this goroutine before the "-> POST" log, which reads as a hang with
+	// no trace past "--> POST". closing the body unblocks the stalled read.
+	readCtx, readCancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer readCancel()
+	go func() {
+		<-readCtx.Done()
+		r.Body.Close()
+	}()
 	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
 	if err != nil {
+		if readCtx.Err() != nil {
+			writeAnthropicError(w, http.StatusRequestTimeout, "invalid_request_error", "request body read timed out")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -1525,6 +1670,18 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		}
 		acclog.Printf("%s routed to freepi model=%s", reqID, upstreamModel)
 		p.handleFreepiAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
+		return
+	}
+
+	// Route antseed/* models to the p2p backend
+	if strings.HasPrefix(upstreamModel, "antseed/") {
+		if !antseedEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (antseed disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "antseed is disabled; set antseed.enabled: true in config.yml")
+			return
+		}
+		acclog.Printf("%s routed to antseed model=%s", reqID, upstreamModel)
+		p.handleAntseedAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
 		return
 	}
 
@@ -1690,6 +1847,27 @@ func jsonStr(s string) string {
 	return string(b)
 }
 
+// boolInt turns a flag into a 0/1 block-index offset.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// strPtr boxes a string for the finish_reason field.
+func strPtr(s string) *string { return &s }
+
+// sseNormalize wraps a bare json body as a single sse chunk so the streaming
+// converters can parse it. sse input passes through untouched.
+func sseNormalize(body []byte) []byte {
+	t := bytes.TrimSpace(body)
+	if len(t) == 0 || t[0] != '{' && t[0] != '[' {
+		return body
+	}
+	return []byte("data: " + string(t) + "\n\ndata: [DONE]\n\n")
+}
+
 func writeAnthropicError(w http.ResponseWriter, status int, errType, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1793,22 +1971,67 @@ func zenMsgID() string {
 }
 
 // setZenHeaders applies the exact header set the real opencode client sends to
-// zen so anonymous free-tier requests pass the "used from within OpenCode" check.
-// real client (session/llm/request.ts): bare `opencode/${InstallationVersion}`
-// with no ai-sdk/bun suffix, x-opencode-request = user message id.
+// zen. source of truth is packages/opencode/src/session/llm/request.ts in the
+// upstream clone: for a provider whose id starts with "opencode" it sends
+// x-opencode-session-id (on every request, not just opencode providers),
+// x-opencode-project, x-opencode-session, x-opencode-request and
+// x-opencode-client, plus a bare `opencode/${InstallationVersion}` User-Agent
+// with no ai-sdk/bun suffix.
 func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("x-opencode-session-id", sessionID)
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-opencode-request", zenMsgID())
 	req.Header.Set("x-opencode-project", "global")
-	req.Header.Set("User-Agent", "opencode/"+zenVersionStr())
+	req.Header.Set("User-Agent", zenUserAgent())
 	req.Header.Set("Accept", "*/*")
-	// opencode's @ai-sdk/anthropic client sends this on every zen request.
-	// the anonymous free tier fingerprints it, so omitting it can surface as
-	// FreeTierError ("can only be used from within OpenCode").
-	req.Header.Set("anthropic-version", "2023-06-01")
+}
+
+// --- debug capture / passthrough (all no-ops unless env is set) ---
+
+// zenDebugDir returns the ZEN_CAPTURE dir when debug capture is on.
+func zenDebugDir() string { return os.Getenv("ZEN_CAPTURE") }
+
+var zenDebugSeq atomic.Int64
+
+// zenDebugCapture writes one metadata json file into the capture dir.
+func zenDebugCapture(tag string, v any) {
+	dir := zenDebugDir()
+	if dir == "" {
+		return
+	}
+	os.MkdirAll(dir, 0o755)
+	n := zenDebugSeq.Add(1)
+	if b, err := json.Marshal(v); err == nil {
+		os.WriteFile(fmt.Sprintf("%s/%s-%05d.json", dir, tag, n), b, 0o644)
+	}
+}
+
+// zenApplyHeaders sets the upstream headers for a zen request: the mimicked
+// client set normally, or — debug only (ZEN_PASSTHROUGH=1 and the inbound
+// request carries real opencode headers) — the client's own headers verbatim
+// so upstream sees the real client fingerprint. hop-by-hop headers are
+// dropped; accept-encoding must stay off so the response body stays plain.
+func zenApplyHeaders(req *http.Request, sessionID string, client http.Header, reqID string, attempt any, target, proxy, model string) {
+	passthrough := os.Getenv("ZEN_PASSTHROUGH") != "" && len(client["X-Opencode-Session"]) > 0
+	if passthrough {
+		h := client.Clone()
+		for _, k := range []string{"Connection", "Accept-Encoding", "Content-Length", "Transfer-Encoding", "Te"} {
+			h.Del(k)
+		}
+		req.Header = h
+	} else {
+		setZenHeaders(req, sessionID)
+	}
+	if zenDebugDir() != "" {
+		zenDebugCapture("out", map[string]any{
+			"req_id": reqID, "attempt": attempt, "url": target, "headers": req.Header,
+			"proxy": redactProxyUserinfo(proxy), "session": sessionID, "model": model,
+			"passthrough": passthrough,
+		})
+	}
 }
 
 func estimateTokens(body []byte) int {
@@ -1841,6 +2064,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	endpoint := endpointForModel(zenModel)
 	isResponses := endpoint == "/responses"
 	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, zenModel, endpoint)
+	if zenDebugDir() != "" {
+		zenDebugCapture("in", map[string]any{"side": "anthropic", "req_id": reqID, "url": r.URL.String(), "headers": r.Header, "model": clientModel, "stream": isStream})
+	}
 
 	var m map[string]any
 	if json.Unmarshal(oaiBody, &m) == nil {
@@ -1928,7 +2154,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if err != nil {
 				return nil
 			}
-			setZenHeaders(req, sessionID)
+			zenApplyHeaders(req, sessionID, r.Header, reqID, zenRetries, target, proxy, zenModel)
 			if zenRetries > 0 {
 				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
 			}
@@ -1953,7 +2179,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					if herr != nil {
 						return nil, herr
 					}
-					setZenHeaders(hreq, laneSession(hl))
+					zenApplyHeaders(hreq, laneSession(hl), r.Header, reqID, "hedge", target, hp, zenModel)
 					hup, huerr := hcl.Do(hreq)
 					if huerr == nil {
 						noteExitOK(hp)
@@ -1966,6 +2192,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if fb > 6*time.Second {
 					noteExitSlow(proxy)
 				}
+			}
+			if up != nil {
+				zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": up.StatusCode, "headers": up.Header, "attempt": zenRetries, "model": zenModel})
 			}
 			if err != nil {
 				dropProxy(proxy)
@@ -2134,7 +2363,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
 					return nb2
 				}
-				if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
+				if retry := tryNudgeResponses(sessionID, upstreamModel, oaiBody, rb, post); retry != nil {
 					bodies = append(bodies, retry)
 				}
 				written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
@@ -2181,7 +2410,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
 				return nb2
 			}
-			if retry := tryNudgeResponses(upstreamModel, oaiBody, rb, post); retry != nil {
+			if retry := tryNudgeResponses(sessionID, upstreamModel, oaiBody, rb, post); retry != nil {
 				rb = mergeResponsesSSE([][]byte{rb, retry})
 			}
 			rb = responsesToChat(responsesSSEToJSON(rb))

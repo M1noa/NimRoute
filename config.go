@@ -228,6 +228,28 @@ type freepiConfig struct {
 	// QueueWaitSecs is how long a request waits for a busy account to free
 	// up (one live stream per jwt). 0 = 60.
 	QueueWaitSecs int `yaml:"queue_wait_secs"`
+	// ReasoningEffort is the default reasoning effort injected into freepi
+	// requests when the client sent none. "" = off.
+	ReasoningEffort string `yaml:"reasoning_effort"`
+}
+
+// antseedConfig gates the antseed p2p backend. keyless by design:
+// identity is minted fresh in memory per process run and never saved.
+type antseedConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// StatsURL is the peer snapshot polled for discovery (dht skipped).
+	// "" = network.antseed.com/stats.
+	StatsURL string `yaml:"stats_url"`
+	// RefreshSecs is the snapshot poll interval. 0 = 300.
+	RefreshSecs int `yaml:"refresh_secs"`
+	// TrustMin mirrors minTrustScore: offers below it are ineligible.
+	// 0 disables the gate.
+	TrustMin float64 `yaml:"trust_min"`
+	// PreferFree adds the +25 score bonus for zero-price offers. default true.
+	PreferFree *bool `yaml:"prefer_free"`
+	// Proxies forces all peer tcp through these (http connect or socks5),
+	// rotated per dial. "" = direct.
+	Proxies []string `yaml:"proxies"`
 }
 
 type statusConfig struct {
@@ -237,6 +259,7 @@ type statusConfig struct {
 	ShowLocks          bool `yaml:"show_locks"`
 	ShowUsage          bool `yaml:"show_usage"`
 	ShowPool           bool `yaml:"show_pool"`
+	ShowAntseed        bool `yaml:"show_antseed"`
 }
 
 // usageConfig gates the per-request tracker. off = no file, no counters.
@@ -273,6 +296,7 @@ type appConfig struct {
 	Translate  translateConfig   `yaml:"translate"`
 	Zen        zenConfig         `yaml:"zen"`
 	Freepi     freepiConfig      `yaml:"freepi"`
+	Antseed    antseedConfig     `yaml:"antseed"`
 	Status     statusConfig      `yaml:"status"`
 	Usage      usageConfig       `yaml:"usage"`
 	Models     modelsConfig      `yaml:"models"`
@@ -330,6 +354,9 @@ func defaultConfig() appConfig {
 		Freepi: freepiConfig{
 			ClientVersion: "0.2.19",
 			AdInlineEvery: 5,
+		},
+		Antseed: antseedConfig{
+			RefreshSecs: 300,
 		},
 		Zen: zenConfig{
 			Enabled:                  true,
@@ -873,11 +900,15 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowPool {
 		sr.Pool = nil
 	}
+	if !c.Status.ShowAntseed {
+		sr.Antseed = nil
+	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
 		sr.ZenLanes = nil
 		sr.Freepi = nil
+		sr.Antseed = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Pool = nil
