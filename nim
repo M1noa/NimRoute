@@ -57,9 +57,10 @@ svc_stop() {
   case "$SVC_CMD" in
     launchd)
       # bootout both labels: pre-rename instances still run as
-      # com.user.nvidia-nimroute, current as com.user.nimroute.
+      # com.user.nvidia-nim-proxy, current as com.user.nimroute.
       launchctl bootout "gui/$(id -u)/$SVC" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
-      launchctl bootout "gui/$(id -u)/com.user.nvidia-nimroute" 2>/dev/null
+      launchctl bootout "gui/$(id -u)/com.user.nvidia-nim-proxy" 2>/dev/null
+      pkill -f "nim-proxy$" 2>/dev/null
       pkill -f "nimroute$" 2>/dev/null
       ;;
     systemd) systemctl --user disable --now nimroute 2>/dev/null ;;

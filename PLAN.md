@@ -6,7 +6,7 @@ restarts), then lanes/pool, status UI, freepi last (biggest).
 ## 0. service restart/stop broken [bug, first]
 
 symptom: `./nim restart|stop` leaves the proxy running.
-cause: launchd still runs old label `com.user.nvidia-nimroute`
+cause: launchd still runs old label `com.user.nvidia-nim-proxy`
 (`launchctl list` shows it); `nim` bootouts `com.user.nimroute`
 after the rename, which matches nothing.
 fix: `svc_stop` bootouts BOTH labels (old + new). one-line change

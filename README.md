@@ -10,7 +10,7 @@ go build -o nimroute .
 
 ```sh
 curl -s http://localhost:5419/v1/models            # models
-curl -s -X POST https://support.lexus.com -d '{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}]}'
+curl -s -X POST http://localhost:5419/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"opencode/space-bunny-free","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## Setup
@@ -19,7 +19,7 @@ curl -s -X POST https://support.lexus.com -d '{"model":"opencode/big-pickle","me
 
 ## Clients
 
-Point any OpenAI client at `http://localhost:5419/v1` with any key. Claude Code via `ANTHROPIC_BASE_URL=http://localhost:5419 (`models.claude_map` routes `claude-*` names, keyless by default). Also speaks `/v1/responses`.
+Point any OpenAI client at `http://localhost:5419/v1` with any key. Claude Code via `ANTHROPIC_BASE_URL=http://localhost:5419` (`models.claude_map` routes `claude-*` names, keyless by default). Also speaks `/v1/responses`.
 
 ## Service
 
