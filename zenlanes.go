@@ -46,11 +46,13 @@ type zenLane struct {
 }
 
 // laneTokens is one model's contribution to a lane's lifetime totals.
+// DurMs sums finished-request durations for the avg_ms in /status.
 type laneTokens struct {
-	Requests   int `json:"requests"`
-	Prompt     int `json:"prompt_tokens"`
-	Completion int `json:"completion_tokens"`
-	Total      int `json:"total_tokens"`
+	Requests   int   `json:"requests"`
+	Prompt     int   `json:"prompt_tokens"`
+	Completion int   `json:"completion_tokens"`
+	Total      int   `json:"total_tokens"`
+	DurMs      int64 `json:"duration_ms"`
 }
 
 type laneStatus struct {
@@ -64,6 +66,8 @@ type laneStatus struct {
 	Prompt     int `json:"prompt_tokens"`
 	Completion int `json:"completion_tokens"`
 	Tokens     int `json:"total_tokens"`
+	// AvgMs is mean finished-request duration across all models.
+	AvgMs int `json:"avg_ms"`
 	// ByModel breaks the totals down per model served on this lane.
 	ByModel map[string]laneTokens `json:"by_model,omitempty"`
 }
@@ -146,7 +150,10 @@ func exitHealthFor(proxy string) *exitHealth {
 }
 
 // noteExit429 records a 429 on an exit. twice in a row with 20s+ since the
-// last success means long-term saturation: 12h ban for every model.
+// last success means long-term saturation: 12h ban for every model. a new
+// exit (never succeeded) gets no ban: two fast 429s on first touch are the
+// exit being busy, not proof it is dead, and banning fresh exits one by one
+// empties the usable pool until only a restart clears the bans.
 func noteExit429(proxy string) bool {
 	if proxy == "" {
 		return false
@@ -156,6 +163,9 @@ func noteExit429(proxy string) bool {
 	h.streak++
 	streak, lastOK := h.streak, h.lastOK
 	exitTrackMu.Unlock()
+	if lastOK.IsZero() {
+		return false
+	}
 	if streak >= 2 && time.Since(lastOK) > 20*time.Second {
 		longBurnMu.Lock()
 		longBurned[proxy] = time.Now().Add(12 * time.Hour)
@@ -220,7 +230,6 @@ func noteExitSlow(proxy string) {
 	if n >= 2 {
 		acclog.Printf("  zen exit %s dropped: 2 slow strikes in 1h", redactProxyUserinfo(proxy))
 		dropProxy(proxy)
-		laneDropProxy(proxy)
 	}
 }
 
@@ -789,13 +798,13 @@ func laneRotate(l *zenLane, model string) string {
 	return laneSession(l)
 }
 
-// noteRateLimit counts lanes rate-limited since the last pool refresh and
-// fires one once the threshold is crossed: when several distinct exits are
-// limited at once, the whole pool is stale, not one proxy.
-func noteRateLimit() {
+// noteRateLimit counts lanes rate-limited since the last pool refresh.
+// true when a refresh fired: the counter resets on every trip either way,
+// and a trip inside the cooldown window skips the refresh (debug-logged).
+func noteRateLimit() bool {
 	n := cfg().Zen.PoolRefresh429s
 	if n <= 0 {
-		return
+		return false
 	}
 	poolRefresh429Mu.Lock()
 	poolRefresh429s++
@@ -804,10 +813,34 @@ func noteRateLimit() {
 		poolRefresh429s = 0
 	}
 	poolRefresh429Mu.Unlock()
-	if hit {
-		acclog.Printf("  zen: %d rate-limited lanes, refreshing proxy pool", n)
-		refreshZenProxiesAsync()
+	if !hit {
+		return false
 	}
+	if cd := poolRefreshCooldown(); cd > 0 {
+		zenProxiesMu.RLock()
+		ago := time.Since(zenPoolRefreshed)
+		zenProxiesMu.RUnlock()
+		if ago < cd {
+			dbglog.Printf("  zen: %d rate-limited lanes, refresh skipped (last %v ago, cooldown %v)", n, ago.Round(time.Second), cd)
+			return false
+		}
+	}
+	acclog.Printf("  zen: %d rate-limited lanes, refreshing proxy pool", n)
+	refreshZenProxiesAsync()
+	return true
+}
+
+// poolRefreshCooldown is the minimum gap between 429-triggered refreshes.
+// 0 = 120s default, negative disables (every trip refreshes).
+func poolRefreshCooldown() time.Duration {
+	s := cfg().Zen.PoolRefreshCooldownSecs
+	if s < 0 {
+		return 0
+	}
+	if s == 0 {
+		return 120 * time.Second
+	}
+	return time.Duration(s) * time.Second
 }
 
 func resetPoolRefresh429s() {
@@ -848,8 +881,9 @@ func laneTouch(l *zenLane, proxy, model string) {
 
 // laneTokensAdd folds one turn's upstream token counts into the lane's
 // lifetime per-model totals. tok.Total falls back to prompt+completion
-// when upstream omits it.
-func laneTokensAdd(l *zenLane, model string, prompt, completion, total int) {
+// when upstream omits it. durMs folds in for avg_ms; 0 skips (callers
+// without a measured duration pass 0).
+func laneTokensAdd(l *zenLane, model string, prompt, completion, total int, durMs int64) {
 	if l == nil || model == "" {
 		return
 	}
@@ -868,6 +902,7 @@ func laneTokensAdd(l *zenLane, model string, prompt, completion, total int) {
 	m.Prompt += prompt
 	m.Completion += completion
 	m.Total += total
+	m.DurMs += durMs
 	l.tokens[model] = m
 }
 
@@ -929,29 +964,19 @@ func pickLaneProxyFor(model string) string {
 
 // laneReproxy swaps a dead exit for a fresh verified one that no other lane
 // holds and that is not burned for model, keeping the lane session pinned
-// (affinity survives proxy churn).
+// (affinity survives proxy churn). no spare exit keeps the old pin: a lane
+// with "" never sends, so the dead-but-working exit stays until a real
+// replacement exists.
 func laneReproxy(l *zenLane, model string) string {
 	p := pickLaneProxyFor(model)
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
+	if p == "" {
+		return l.proxy
+	}
 	l.proxy = p
 	l.country = proxyCountry(p)
 	return p
-}
-
-// laneDropProxy tells lanes holding a burned proxy to forget it; they pick
-// a fresh exit on next use instead of reusing a dead one.
-func laneDropProxy(proxyURL string) {
-	if proxyURL == "" {
-		return
-	}
-	lanesMu.Lock()
-	defer lanesMu.Unlock()
-	for _, l := range lanes {
-		if l.proxy == proxyURL {
-			l.proxy = ""
-		}
-	}
 }
 
 // laneEscalate pins a fresh proxy to a lane that just got rate-limited or
@@ -1122,14 +1147,15 @@ func maybeRefreshStalePool(l *zenLane) bool {
 	return true
 }
 
-// resetStaleLanes mints fresh sessions and drops pinned exits after a stale
-// refresh, so retry loops re-enter on new sessions instead of dead ones.
+// resetStaleLanes mints fresh sessions after a stale refresh, so retry
+// loops re-enter on new sessions instead of dead ones. pins stay: an old
+// exit keeps serving until a real send proves it dead, never cleared in
+// bulk across every lane at once.
 func resetStaleLanes() {
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	for _, l := range lanes {
 		l.limitedSince = time.Time{}
-		l.proxy = ""
 		l.session = zenSession()
 	}
 	zenSuccessMu.Lock()
@@ -1188,31 +1214,6 @@ func sweepLanes() {
 	}
 }
 
-// lanesRevalidate clears lane exits that are no longer in the freshly
-// verified pool, so a refresh actually re-points the lanes instead of
-// leaving them pinned to proxies that just died.
-func lanesRevalidate(verified []string) {
-	if len(verified) == 0 {
-		return
-	}
-	inPool := make(map[string]bool, len(verified))
-	for _, v := range verified {
-		inPool[v] = true
-	}
-	lanesMu.Lock()
-	stale := 0
-	for _, l := range lanes {
-		if l.proxy != "" && !inPool[l.proxy] {
-			l.proxy = ""
-			stale++
-		}
-	}
-	lanesMu.Unlock()
-	if stale > 0 {
-		acclog.Printf("  zen lanes: %d stale exit(s) cleared by pool refresh", stale)
-	}
-}
-
 // redactProxyUserinfo strips user:pass from a proxy url so a credentialed
 // proxy never reaches /status, which is open even when auth.tokens is set.
 // built by hand: url.String() would percent-escape the mask.
@@ -1246,10 +1247,15 @@ func laneSnapshot() []laneStatus {
 			LastUsed: now.Sub(l.lastUsed).Round(time.Second).String(),
 			Requests: l.requests, RateLimit: l.rateLimit,
 		}
+		var dur int64
 		for _, m := range l.tokens {
 			st.Prompt += m.Prompt
 			st.Completion += m.Completion
 			st.Tokens += m.Total
+			dur += m.DurMs
+		}
+		if st.Requests > 0 {
+			st.AvgMs = int(dur / int64(st.Requests))
 		}
 		if len(l.tokens) > 0 {
 			st.ByModel = make(map[string]laneTokens, len(l.tokens))
@@ -1304,6 +1310,9 @@ func laneFailover(l *zenLane) *zenLane {
 // dead exits die on real sends, and a probe here costs a full round trip
 // on every request. "" means direct, correct on a cold lane when
 // always_proxy is off; once escalated the pinned exit wins regardless.
+// a burned pin rotates this lane only: the pool exit stays (other models
+// and lanes still use it) and the pin is never cleared before its
+// replacement exists (laneReproxy keeps it when dry).
 func laneProxyFor(l *zenLane, model string) string {
 	lanesMu.Lock()
 	p := l.proxy
@@ -1311,17 +1320,6 @@ func laneProxyFor(l *zenLane, model string) string {
 	lanesMu.Unlock()
 	if p != "" && !exitBurned(p, model) && !exitLongBurned(p) {
 		return p
-	}
-	if p != "" {
-		lanesMu.Lock()
-		if l.proxy == p {
-			l.proxy = ""
-		}
-		lanesMu.Unlock()
-		if !exitBurned(p, model) && !exitLongBurned(p) {
-			dropProxy(p)
-			laneDropProxy(p)
-		}
 	}
 	if !cfg().Zen.AlwaysProxy && !escalated {
 		return ""

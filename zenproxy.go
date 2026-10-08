@@ -211,10 +211,6 @@ func refreshZenProxies() {
 		lats[u] = e.ResponseTimeMs
 		relis[u] = e.Reliability
 	}
-	setProxyCountries(countries)
-	setProxyLatency(lats)
-	setProxyReliability(relis)
-
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	verified := make([]string, 0, len(cands))
@@ -238,14 +234,30 @@ func refreshZenProxies() {
 	}
 	wg.Wait()
 
+	// metadata commits only with a real pool: a failed sweep must not
+	// clobber the live country/latency/reliability maps for the old exits.
+	if len(verified) > 0 {
+		kc, kl, kr := map[string]string{}, map[string]int{}, map[string]float64{}
+		for _, v := range verified {
+			if c, ok := countries[v]; ok {
+				kc[v] = c
+			}
+			if l, ok := lats[v]; ok {
+				kl[v] = l
+			}
+			if r, ok := relis[v]; ok {
+				kr[v] = r
+			}
+		}
+		setProxyCountries(kc)
+		setProxyLatency(kl)
+		setProxyReliability(kr)
+	}
+	applyVerifiedPool(verified)
 	zenProxiesMu.Lock()
-	zenProxies = verified
 	zenPoolRefreshed = time.Now()
 	zenPoolCands = len(cands)
 	zenProxiesMu.Unlock()
-	// a fresh pool means every lane's pinned exit is suspect: revalidate
-	// against the new verified set so lanes stop burning stale exits.
-	lanesRevalidate(verified)
 	// pre-open the shared lanes now that exits exist: cold starts spread
 	// from the first request instead of serializing on lane creation.
 	// also pre-build transports so the first send skips tls/dial setup.
@@ -473,7 +485,27 @@ func sampleProxies(n int) []string {
 	return out
 }
 
+// applyVerifiedPool swaps in a fresh verified set. empty verifies keep
+// the old pool: a failed sweep must never wipe working exits. lanes keep
+// their pins on refresh: an old exit keeps serving until a real send
+// proves it dead, so refresh can never clear all lanes at once.
+func applyVerifiedPool(verified []string) {
+	if len(verified) == 0 {
+		log.Printf("  zen proxies: verify found 0, keeping old pool")
+		return
+	}
+	zenProxiesMu.Lock()
+	zenProxies = verified
+	left := len(verified)
+	zenProxiesMu.Unlock()
+	log.Printf("  zen proxies: %d verified", left)
+}
+
 // dropProxy removes a dead proxy from the pool so it is not picked again.
+// the last exit is never dropped and lanes keep the pin until they rotate:
+// removing a working exit before its replacement exists empties the pool
+// and leaves every lane with no proxy. a dead last exit at least attempts
+// until the next refresh refills the pool.
 func dropProxy(proxyURL string) {
 	if proxyURL == "" {
 		return
@@ -482,6 +514,11 @@ func dropProxy(proxyURL string) {
 	found := false
 	for i, p := range zenProxies {
 		if p == proxyURL {
+			if len(zenProxies) <= 1 {
+				zenProxiesMu.Unlock()
+				log.Printf("  zen proxies: keeping last exit %s (pool would drain)", proxyURL)
+				return
+			}
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			found = true
 			zenPoolDropped++
@@ -491,7 +528,6 @@ func dropProxy(proxyURL string) {
 	}
 	zenProxiesMu.Unlock()
 	if found {
-		laneDropProxy(proxyURL)
 		closeZenTransport(proxyURL)
 	}
 }
@@ -691,11 +727,14 @@ func noteZenCountryBlock(country string) int {
 	return zenCountryBlocks[country]
 }
 
-// poolExit is one verified exit for /status.
+// poolExit is one verified exit for /status. AvgMs is the live
+// first-byte ewma (0 = no real sends yet); LatencyMs stays the
+// api-reported verification figure for the pool picker.
 type poolExit struct {
 	Proxy   string `json:"proxy"`
 	Country string `json:"country"`
 	Latency int    `json:"latency_ms"`
+	AvgMs   int    `json:"avg_ms,omitempty"`
 	Pinned  bool   `json:"pinned"`
 }
 
@@ -733,10 +772,21 @@ func poolSnapshot() poolSummary {
 	for _, p := range pool {
 		out.Exits = append(out.Exits, poolExit{
 			Proxy: redactProxyUserinfo(p), Country: proxyCountry(p),
-			Latency: proxyLatency(p), Pinned: pinned[p],
+			Latency: proxyLatency(p), AvgMs: proxyLiveMs(p), Pinned: pinned[p],
 		})
 	}
 	return out
+}
+
+// proxyLiveMs returns the live first-byte ewma for an exit, 0 when no
+// real send has sampled it yet.
+func proxyLiveMs(proxyURL string) int {
+	zenLiveMu.RLock()
+	defer zenLiveMu.RUnlock()
+	if ms := zenLive[proxyURL]; ms > 0 {
+		return int(ms)
+	}
+	return 0
 }
 
 // logZenNetErr logs a transport-level zen failure with model and country.
