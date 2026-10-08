@@ -350,6 +350,21 @@ func TestLookupModelInfoStrips1M(t *testing.T) {
 	}
 }
 
+// anthropic [1m] alias: the suffixed id must resolve to the base model
+// with no catalog entry at all (the strip never gates on the catalog).
+func TestAnthropicRequestStrips1M(t *testing.T) {
+	setModelInfo(map[string]modelInfoEntry{})
+	t.Cleanup(func() { setModelInfo(loadModelInfo(modelInfoPath())) })
+	body := []byte(`{"model":"antseed/gpt-6-luna[1m]","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	_, _, upstream, _, _, err := anthropicRequestToOpenAI(body)
+	if err != nil {
+		t.Fatalf("anthropicRequestToOpenAI: %v", err)
+	}
+	if upstream != "antseed/gpt-6-luna" {
+		t.Fatalf("upstream = %q, want antseed/gpt-6-luna", upstream)
+	}
+}
+
 func TestUnlistedFreeModelsExcludedFromListing(t *testing.T) {
 	// zen still serves these; the proxy keeps them out of /v1/models.
 	live := []string{
@@ -2594,6 +2609,14 @@ func TestLaneEscalateFromDirect(t *testing.T) {
 func TestLaneRotateRefreshesSessionKeepsLatch(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
 	l := &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.9:9", escalated: true}
 	lanesMu.Lock()
 	lanes["x"] = l
@@ -2688,21 +2711,142 @@ func TestSweepReleasesIdleProxy(t *testing.T) {
 	}
 }
 
-func TestLanesRevalidate(t *testing.T) {
+// an empty verify must keep the old pool and all lane pins: a failed
+// refresh wiping the pool is the outage that forces a restart.
+func TestApplyVerifiedPoolKeepsOldOnEmpty(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
 	lanesMu.Lock()
 	lanes["a"] = &zenLane{id: "a", session: zenSession(), proxy: "http://10.0.0.1:1"}
-	lanes["b"] = &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.9:9"}
 	lanesMu.Unlock()
-	lanesRevalidate([]string{"http://10.0.0.1:1", "http://10.0.0.2:2"})
+	applyVerifiedPool(nil)
+	zenProxiesMu.RLock()
+	n := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if n != 2 {
+		t.Fatalf("empty verify must keep the old pool, left %d", n)
+	}
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	if lanes["a"].proxy == "" {
-		t.Error("verified exit must survive a refresh")
+		t.Error("empty verify must not clear lane pins")
 	}
-	if lanes["b"].proxy != "" {
-		t.Error("unverified exit must be cleared on refresh")
+}
+
+// a successful refresh replaces the pool but never clears working pins:
+// old exits keep serving until a real send proves them dead.
+func TestApplyVerifiedPoolKeepsLanePins(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	lanesMu.Lock()
+	lanes["a"] = &zenLane{id: "a", session: zenSession(), proxy: "http://10.0.0.1:1"}
+	lanesMu.Unlock()
+	applyVerifiedPool([]string{"http://10.0.0.2:2", "http://10.0.0.3:3"})
+	zenProxiesMu.RLock()
+	n := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if n != 2 {
+		t.Fatalf("pool = %d exits, want 2", n)
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if lanes["a"].proxy != "http://10.0.0.1:1" {
+		t.Errorf("refresh must not clear working pins, got %q", lanes["a"].proxy)
+	}
+}
+
+// reproxy with no spare exit keeps the working pin: rotating onto ""
+// leaves the lane with no proxy and the request can never send.
+func TestLaneReproxyKeepsPinWhenDry(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = nil
+	zenProxiesMu.Unlock()
+	l := &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.9:9"}
+	if got := laneReproxy(l, ""); got != "http://10.0.0.9:9" {
+		t.Fatalf("laneReproxy with dry pool = %q, want the old pin kept", got)
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if l.proxy == "" {
+		t.Error("dry pool must not empty the lane pin")
+	}
+}
+
+// the last pool exit is never dropped: a pool of zero serves nothing,
+// a dead last exit at least attempts until the refresh refills the pool.
+func TestDropProxyKeepsLastExit(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	dropProxy("http://10.0.0.1:1")
+	zenProxiesMu.RLock()
+	n := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if n != 1 {
+		t.Fatalf("pool = %d exits after one drop, want 1", n)
+	}
+	dropProxy("http://10.0.0.2:2")
+	zenProxiesMu.RLock()
+	n = len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if n != 1 {
+		t.Fatalf("last exit must survive dropProxy, pool = %d", n)
+	}
+}
+
+// stale recovery rotates sessions, not exits: clearing every pin at once
+// is the mass wipe that leaves all lanes with no proxy.
+func TestResetStaleLanesKeepsProxies(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	lanesMu.Lock()
+	lanes["a"] = &zenLane{id: "a", session: zenSession(), proxy: "http://10.0.0.1:1", limitedSince: time.Now()}
+	lanes["b"] = &zenLane{id: "b", session: zenSession(), proxy: "http://10.0.0.2:2", limitedSince: time.Now()}
+	lanesMu.Unlock()
+	before := map[string]string{}
+	lanesMu.Lock()
+	for k, l := range lanes {
+		before[k] = l.session
+	}
+	lanesMu.Unlock()
+	resetStaleLanes()
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for k, l := range lanes {
+		if l.proxy == "" {
+			t.Errorf("lane %s lost its pin on stale reset", k)
+		}
+		if l.session == before[k] {
+			t.Errorf("lane %s kept a stale session", k)
+		}
+		if !l.limitedSince.IsZero() {
+			t.Errorf("lane %s kept its limit run", k)
+		}
 	}
 }
 
@@ -3514,6 +3658,26 @@ func TestStreamAnthropicBufferedJSONBody(t *testing.T) {
 	}
 	if strings.Contains(out, "[DONE]") == false {
 		t.Errorf("stream never terminated:\n%s", out)
+	}
+}
+
+// buffered upstream body with tool_calls (freepi asks for stream=false
+// and converts here) must emit a tool_use block, not stop_reason tool_use
+// with zero tool blocks (claude code: "tool call could not be parsed").
+func TestStreamAnthropicBufferedToolCalls(t *testing.T) {
+	body := []byte(`{"choices":[{"message":{"content":"","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\": \"echo 4\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}`)
+
+	rec := httptest.NewRecorder()
+	streamAnthropic(rec, body, "m", toolNames{"Bash"})
+	out := rec.Body.String()
+	if !strings.Contains(out, `"content_block":{"type":"tool_use"`) {
+		t.Errorf("buffered tool_calls never emitted a tool_use block:\n%s", out)
+	}
+	if !strings.Contains(out, `"partial_json":"{\"command\": \"echo 4\"}"`) {
+		t.Errorf("tool arguments never emitted:\n%s", out)
+	}
+	if !strings.Contains(out, `"stop_reason":"tool_use"`) {
+		t.Errorf("stop_reason must be tool_use:\n%s", out)
 	}
 }
 

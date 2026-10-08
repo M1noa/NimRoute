@@ -453,6 +453,120 @@ func TestFreepiSnapshotServesCache(t *testing.T) {
 	}
 }
 
+// a stale catalog refreshes: ids fetched before the ttl serve once, then
+// the next warm() pulls the new list instead of pinning the boot-time one.
+func TestFreepiCatalogExpires(t *testing.T) {
+	ids := atomic.Int32{}
+	fakeFreepi(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/client-version":
+			n := ids.Add(1)
+			w.Write([]byte(`{"models":[{"id":"m` + string(rune('0'+n)) + `","name":"M"}]}`))
+		case "/me/stats":
+			w.Write([]byte(`{"tier":"free"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	c := testConfig()
+	c.Freepi.Enabled = true
+	c.Freepi.Accounts = []freepiAccount{{Name: "exp", JWT: "j"}}
+	useConfig(t, c)
+	freepiSnapshot()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sum := freepiSnapshot(); len(sum.Accounts) > 0 && len(sum.Accounts[0].Models) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := freepiModels(freepiAccounts()[0]); len(got) != 1 || got[0] != "m1" {
+		t.Fatalf("first catalog = %v, want [m1]", got)
+	}
+	fa := freepiAccounts()[0]
+	fa.mu.Lock()
+	fa.catalogAt = time.Now().Add(-freepiCatalogTTL - time.Second)
+	fa.statsAt = time.Now()
+	fa.mu.Unlock()
+	if got := freepiCatalog(fa); len(got) != 1 || got[0].ID != "m2" {
+		t.Fatalf("expired catalog = %v, want [m2]", got)
+	}
+}
+
+// model health: any success wins; 3 same-code failures across 2+ sellers
+// reads broken with the code; anything less stays unknown (single-seller
+// streaks are proxy trouble, not a dead model).
+func TestModelHealth(t *testing.T) {
+	totalsMu.Lock()
+	old := outcomesByModel
+	outcomesByModel = map[string][]modelOutcome{}
+	totalsMu.Unlock()
+	t.Cleanup(func() {
+		totalsMu.Lock()
+		outcomesByModel = old
+		totalsMu.Unlock()
+	})
+	if got := modelHealthFor("m"); got.State != "unknown" {
+		t.Fatalf("no outcomes = %v, want unknown", got)
+	}
+	noteModelOutcome("m", false, 502, "s1")
+	noteModelOutcome("m", false, 502, "s1")
+	noteModelOutcome("m", false, 502, "s2")
+	if got := modelHealthFor("m"); got.State != "broken" || got.Code != 502 {
+		t.Fatalf("3x502 across 2 sellers = %v, want broken/502", got)
+	}
+	// reset: single-seller streak never counts, however long.
+	totalsMu.Lock()
+	outcomesByModel["m1"] = nil
+	totalsMu.Unlock()
+	noteModelOutcome("m1", false, 429, "s1")
+	noteModelOutcome("m1", false, 429, "s1")
+	noteModelOutcome("m1", false, 429, "s1")
+	if got := modelHealthFor("m1"); got.State != "unknown" {
+		t.Fatalf("single-seller streak = %v, want unknown", got)
+	}
+	// reset: mixed codes never count.
+	totalsMu.Lock()
+	outcomesByModel["m2"] = nil
+	totalsMu.Unlock()
+	noteModelOutcome("m2", false, 429, "s1")
+	noteModelOutcome("m2", false, 502, "s2")
+	noteModelOutcome("m2", false, 429, "s3")
+	if got := modelHealthFor("m2"); got.State != "unknown" {
+		t.Fatalf("mixed codes = %v, want unknown", got)
+	}
+	// reset: the real broken shape.
+	totalsMu.Lock()
+	outcomesByModel["m3"] = nil
+	totalsMu.Unlock()
+	noteModelOutcome("m3", false, 503, "s1")
+	noteModelOutcome("m3", false, 503, "s2")
+	noteModelOutcome("m3", false, 503, "s1")
+	if got := modelHealthFor("m3"); got.State != "broken" || got.Code != 503 {
+		t.Fatalf("3x503 across 2 sellers = %v, want broken/503", got)
+	}
+	// one success clears everything.
+	noteModelOutcome("m3", true, 0, "s9")
+	if got := modelHealthFor("m3"); got.State != "working" {
+		t.Fatalf("after success = %v, want working", got)
+	}
+}
+
+// lane avg_ms folds finished-request durations across models.
+func TestLaneAvgMs(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	l := laneFor("avg-1", []byte(`{"messages":[{"role":"user","content":"x"}]}`))
+	laneTouch(l, "", "m")
+	laneTokensAdd(l, "m", 5, 5, 10, 1000)
+	laneTouch(l, "", "m")
+	laneTokensAdd(l, "m", 5, 5, 10, 3000)
+	snap := laneSnapshot()
+	if len(snap) != 1 || snap[0].AvgMs != 2000 {
+		t.Fatalf("avg = %+v, want avg_ms 2000", snap)
+	}
+}
+
 // freepi disabled without accounts; jwt never in status.
 func TestFreepiSnapshotNoLeak(t *testing.T) {
 	fakeFreepi(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
@@ -514,21 +628,39 @@ func TestLongBurn(t *testing.T) {
 	}
 }
 
+// a fresh exit (never succeeded) survives repeat 429s: two fast limits on
+// first touch are congestion, not saturation. banning new exits one by one
+// empties the usable pool until only a restart clears the 12h bans.
+func TestLongBurnSkipsFreshExits(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	longBurnMu.Lock()
+	longBurned = map[string]time.Time{}
+	longBurnMu.Unlock()
+	exitTrackMu.Lock()
+	delete(exitTrack, "http://9.9.9.10:1")
+	exitTrackMu.Unlock()
+	for i := 0; i < 5; i++ {
+		noteExit429("http://9.9.9.10:1")
+	}
+	if exitLongBurned("http://9.9.9.10:1") {
+		t.Fatal("fresh exit with no success must never long-burn")
+	}
+	exitTrackMu.Lock()
+	delete(exitTrack, "http://9.9.9.10:1")
+	exitTrackMu.Unlock()
+}
+
 // slow strikes: 2 in an hour drops the exit.
 func TestSlowStrikes(t *testing.T) {
 	exitTrackMu.Lock()
 	delete(exitTrack, "http://8.8.8.8:1")
 	exitTrackMu.Unlock()
 	zenProxiesMu.Lock()
-	zenProxies = append(zenProxies, "http://8.8.8.8:1")
+	zenProxies = append(zenProxies, "http://8.8.8.8:1", "http://8.8.8.9:9")
 	defer func() {
 		zenProxiesMu.Lock()
-		for i, p := range zenProxies {
-			if p == "http://8.8.8.8:1" {
-				zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
-				break
-			}
-		}
+		zenProxies = nil
 		zenProxiesMu.Unlock()
 	}()
 	zenProxiesMu.Unlock()
