@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,6 +22,11 @@ var freePiBase = "https://api.freepi.ai"
 // leaseGrace is how long a locally-claimed lease is treated as live before
 // a 409 is attributed to a crashed run instead of an in-flight request.
 const leaseGrace = 3 * time.Second
+
+// freepiCatalogTTL is how long /client-version ids are trusted. the picker
+// catalog churns, so a boot-time list goes stale: /v1/models would advertise
+// dead ids and miss new ones.
+const freepiCatalogTTL = 5 * time.Minute
 
 func freepiEnabled() bool {
 	c := cfg().Freepi
@@ -62,6 +67,7 @@ type freepiAcct struct {
 	lastAd    time.Time
 	claimedAt time.Time // when inflight went 0->1
 	catalog   []freepiCatalogEntry
+	catalogAt time.Time
 	stats     freepiStats
 	statsAt   time.Time
 	warming   bool
@@ -72,7 +78,8 @@ type freepiAcct struct {
 // waits on api.freepi.ai. one flight per account, retried at most every 15s.
 func (fa *freepiAcct) warm() {
 	fa.mu.Lock()
-	stale := len(fa.catalog) == 0 || time.Since(fa.statsAt) >= time.Minute
+	stale := len(fa.catalog) == 0 || time.Since(fa.statsAt) >= time.Minute ||
+		time.Since(fa.catalogAt) >= freepiCatalogTTL
 	if !stale || fa.warming || time.Since(fa.warmAt) < 15*time.Second {
 		fa.mu.Unlock()
 		return
@@ -157,6 +164,12 @@ func freepiAccounts() []*freepiAcct {
 		if a.Name == "" || a.JWT == "" {
 			continue
 		}
+		// duplicate names collapse (second jwt overwrites the first and
+		// one lane appears twice): keep the first, warn on the rest.
+		if seen[a.Name] {
+			log.Printf("WARN: duplicate freepi account name %q, ignoring later entry", a.Name)
+			continue
+		}
 		seen[a.Name] = true
 		fa, ok := freepiAccts[a.Name]
 		if !ok {
@@ -211,15 +224,23 @@ func freepiGet(fa *freepiAcct, path string, timeout time.Duration) (int, []byte)
 // inline every Nth turn, impression once per fresh click_token, meter per
 // turn. failures swallowed. nothing is displayed anywhere.
 func freepiAdCycle(fa *freepiAcct, forceBanner bool) {
+	// turns/lastAd are touched from a spawned goroutine per request: hold
+	// the account lock for the state, not the network calls.
+	fa.mu.Lock()
 	now := time.Now()
-	if forceBanner || now.Sub(fa.lastAd) > 10*time.Minute {
-		if code, body := freepiGet(fa, "/ads/next?slot=banner", 3*time.Second); code == 200 {
-			freepiImpress(fa, body)
-		}
+	doBanner := forceBanner || now.Sub(fa.lastAd) > 10*time.Minute
+	if doBanner {
 		fa.lastAd = now
 	}
 	fa.turns++
-	if fa.turns%freepiInlineEvery() == 0 {
+	doInline := fa.turns%freepiInlineEvery() == 0
+	fa.mu.Unlock()
+	if doBanner {
+		if code, body := freepiGet(fa, "/ads/next?slot=banner", 3*time.Second); code == 200 {
+			freepiImpress(fa, body)
+		}
+	}
+	if doInline {
 		if code, body := freepiGet(fa, "/ads/next?slot=inline", 3*time.Second); code == 200 {
 			freepiImpress(fa, body)
 		}
@@ -296,12 +317,13 @@ func freepiModels(fa *freepiAcct) []string {
 }
 
 // freepiCatalog returns the full catalog rows, caching ids + mults on the
-// account. names (and their multipliers) refresh with the stats tick.
+// account for freepiCatalogTTL. the comment above warm() explains why the
+// list must expire: the picker catalog churns.
 func freepiCatalog(fa *freepiAcct) []freepiCatalogEntry {
 	fa.mu.Lock()
-	cached := fa.catalog
+	cached, at := fa.catalog, fa.catalogAt
 	fa.mu.Unlock()
-	if len(cached) > 0 {
+	if len(cached) > 0 && time.Since(at) < freepiCatalogTTL {
 		return cached
 	}
 	_, body := freepiGet(fa, "/client-version", 5*time.Second)
@@ -313,6 +335,7 @@ func freepiCatalog(fa *freepiAcct) []freepiCatalogEntry {
 		Model string `json:"model"`
 	}
 	var out []freepiCatalogEntry
+	ok := false
 	if json.Unmarshal(body, &cv) == nil {
 		for _, m := range cv.Models {
 			if m.ID == "" {
@@ -323,10 +346,15 @@ func freepiCatalog(fa *freepiAcct) []freepiCatalogEntry {
 		if len(out) == 0 && cv.Model != "" {
 			out = []freepiCatalogEntry{{ID: cv.Model, Name: cv.Model}}
 		}
+		ok = len(out) > 0
 	}
-	fa.mu.Lock()
-	fa.catalog = out
-	fa.mu.Unlock()
+	// stamp the cache only on a successful parse: a transient error must
+	// not hide every model for the full TTL.
+	if ok {
+		fa.mu.Lock()
+		fa.catalog, fa.catalogAt = out, time.Now()
+		fa.mu.Unlock()
+	}
 	return out
 }
 
@@ -378,9 +406,10 @@ func freepiSnapshot() *freepiSummary {
 }
 
 // applyFreepiReasoning injects the configured default reasoning effort
-// when the client sent none. only models with an explicit level list in
-// model_info.jsonc are touched; a value the model doesn't list clamps to
-// its highest level.
+// when the client sent none. only models the free-pi gateway declares
+// reasoning-capable (freepi_declared_reasoning, not the underlying
+// model's flag) with an explicit level list are touched; a value the
+// model doesn't list clamps to its highest level.
 func applyFreepiReasoning(m map[string]any, realModel string) {
 	want := cfg().Freepi.ReasoningEffort
 	if want == "" {
@@ -390,6 +419,9 @@ func applyFreepiReasoning(m map[string]any, realModel string) {
 		return
 	}
 	if _, ok := m["reasoning"]; ok {
+		return
+	}
+	if !modelFreepiReasoning("freeepi/" + realModel) {
 		return
 	}
 	levels := modelEffortLevels("freeepi/" + realModel)
@@ -427,6 +459,35 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "freepi: "+acct)
 		return
+	}
+	// fetch is always buffered (stream=false upstream), so both client
+	// branches nudge the same folded JSON.
+	fold := func(b []byte) []byte {
+		if strings.Contains(string(b), "data: ") {
+			return sseToNonStream(b, realModel, tnames)
+		}
+		return b
+	}
+	rb = fold(rb)
+	post := func(nb []byte) []byte {
+		var m map[string]any
+		if json.Unmarshal(nb, &m) == nil {
+			m["model"] = realModel
+			stripCacheFields(m)
+			applyFreepiReasoning(m, realModel)
+			m["stream"] = false
+			if b, err := json.Marshal(m); err == nil {
+				nb = b
+			}
+		}
+		_, rb2, _, ok := freepiFetch(r.Context(), r.Method, nb, realModel)
+		if !ok {
+			return nil
+		}
+		return fold(rb2)
+	}
+	if retry := tryNudgeJSON(r.Header.Get("x-session-id"), clientModel, "freepi", oaiBody, rb, post); retry != nil {
+		rb = mergeChatJSON(rb, retry)
 	}
 	u := respUsage(rb)
 	prompT, compT, totalT := u.prompt, u.completion, u.total
@@ -502,7 +563,7 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 			}
 			if fa == nil {
 				fa = c
-				break
+				continue
 			}
 			if faLast, fd := tried[fa.name]; fd && last.Before(faLast) {
 				fa = c
@@ -539,11 +600,18 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 		}
 		lastErr = errMsg
 		tried[fa.name] = time.Now()
-		if !retry && time.Now().After(deadline) {
+		// deadline binds every path: a persistent 401/429 must answer
+		// the client, not spin. backoff keeps us from hammering one
+		// account at round-trip speed.
+		if time.Now().After(deadline) {
 			break
 		}
-		if !retry && len(tried) >= len(accts) && time.Now().After(deadline) {
-			break
+		if retry {
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, nil, "client disconnected", false
+			}
 		}
 	}
 	if lastErr == "" {
@@ -557,7 +625,10 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 // ctx cancels the upstream send: one live stream per jwt, so a disconnect
 // must free the account immediately.
 func freepiTry(ctx context.Context, method, target string, body []byte, fa *freepiAcct, model string) (*http.Response, []byte, string, string, bool) {
-	go freepiAdCycle(fa, fa.turns == 0)
+	fa.mu.Lock()
+	firstTurn := fa.turns == 0
+	fa.mu.Unlock()
+	go freepiAdCycle(fa, firstTurn)
 	var lastErr string
 	for attempt := 0; attempt < 2; attempt++ {
 		if ctx.Err() != nil {
@@ -573,8 +644,13 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 			acclog.Printf("!! freepi net error acct=%s model=%s: %v", fa.name, model, err)
 			return nil, nil, "", err.Error(), false
 		}
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
+		// a mid-body reset is a retryable failure, not a 200: the
+		// client would see a stream that stops and pay twice on retry.
+		rb, rerr := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
+		if rerr != nil {
+			return nil, nil, "", rerr.Error(), true
+		}
 		if resp.StatusCode == http.StatusOK {
 			return resp, rb, fa.name, "", false
 		}
@@ -620,14 +696,19 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 
 	resp, rb, acct, ok := freepiFetch(r.Context(), r.Method, body, realModel)
 	if !ok {
+		// fixed envelope: upstream detail may quote-break Sprintf json.
+		// detail stays server-side in the acclog line above.
 		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
-		http.Error(w, fmt.Sprintf(`{"error":"freepi: %s"}`, acct), http.StatusBadGateway)
+		writeJSONError(w, http.StatusBadGateway, "freepi: upstream failed")
 		return
 	}
 	u := respUsage(rb)
 	prompT, compT, totalT := u.prompt, u.completion, u.total
 	for k, v := range resp.Header {
-		w.Header()[k] = v
+		lk := strings.ToLower(k)
+		if lk == "content-type" || strings.HasPrefix(lk, "x-ratelimit") || lk == "retry-after" {
+			w.Header()[k] = v
+		}
 	}
 	if !isStream {
 		w.Header().Set("Content-Type", "application/json")

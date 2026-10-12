@@ -16,8 +16,7 @@ touches: `nim`.
 
 ## 1. lanes + pool perf [go]
 
-1.1 `max_response_ms` 400→250: `config.go` default, live
-`config.yml`, example. pool latencies run 5–240ms so this trims
+1.1 `max_response_ms` 400→250: `config.go` default + example (shipped values: default 250, live config 350 — see config.yml). pool latencies run 5–240ms so this trims
 the tail only.
 1.2 convo-lane 1m idle expiry: new `zen.convo_idle_minutes`
 (default 1). `sweepLanes` drops `convo:*` lanes idle past it.
@@ -53,11 +52,9 @@ conversation), `shared` (overflow pool), `hdr` (explicit pin).
 `usage` verbatim. document in AGENTS.md so nobody "fixes" it.
 verify: `./nim status`, tail-status, stdlib fallback.
 
-## 3. freepi backend [go, big]
+## 3. freepi backend [go, big] DONE/SHIPPED
 
-docs: FREEPI-DOCS.md (complete: auth, endpoints, ads, models,
-errors, fingerprint). no /tmp clone present; docs suffice, clone
-only if a behavior is ambiguous.
+one-stream-per-account rotation + silent ads + catalog (see `freepi.go`, `TODO.md` item on freepi). docs: FREEPI-DOCS.md (auth, endpoints, ads, models, errors, fingerprint).
 
 3.1 config: `freepi:` section — `enabled`, `accounts[]`
 (`name`, `jwt`), `client_version` (default 0.2.19),

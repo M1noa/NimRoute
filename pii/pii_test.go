@@ -238,3 +238,46 @@ func TestRestoreKeepsValidJSON(t *testing.T) {
 }
 
 func jsonValid(s string) bool { return json.Valid([]byte(s)) }
+
+// missing weights must degrade to nil, never crash or retry per request:
+// the singleton records the error under the same key.
+func TestNerMissingWeightsDegrades(t *testing.T) {
+	if d := NerDetector("/no/such/model_q4.onnx", "", 500, 0.4); d != nil {
+		t.Fatal("bogus model path must yield nil detector (heuristics take over)")
+	}
+	if d := NerDetector("/no/such/model_q4.onnx", "", 500, 0.4); d != nil {
+		t.Fatal("second call with same key must stay nil, not reload")
+	}
+}
+
+// cache keys on paragraph hash + config version: same paragraph skips
+// rescan, a version bump rescans.
+func TestScanCacheKeysOnVersion(t *testing.T) {
+	calls := 0
+	d := func(text string) []Span {
+		calls++
+		return nil
+	}
+	s := &Scanner{Detectors: []Detector{d}, Cache: NewScanCache(8), Ver: "v1"}
+	s.detect("hello world")
+	s.detect("hello world")
+	if calls != 1 {
+		t.Fatalf("same paragraph + ver must scan once, scanned %d", calls)
+	}
+	s.Ver = "v2"
+	s.detect("hello world")
+	if calls != 2 {
+		t.Fatalf("ver bump must rescan, scanned %d", calls)
+	}
+}
+
+// startup benchmark must return a sane positive rate, stable run to run.
+func TestRegexUSPerKB(t *testing.T) {
+	a, b := RegexUSPerKB(), RegexUSPerKB()
+	if a <= 0 || b <= 0 {
+		t.Fatalf("us/KB must be positive, got %v %v", a, b)
+	}
+	if a > 100000 || b > 100000 {
+		t.Fatalf("us/KB absurdly high: %v %v", a, b)
+	}
+}

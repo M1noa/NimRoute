@@ -1,7 +1,7 @@
 NOTICE
 
 This project bundles or downloads the Rampart PII-detection model
-(nationaldesignstudio/rampart, https://huggingface.co/nationaldesignstudio/rampart),
+(nationaldesignstudio/rampart rev b1993e4e68b082835b80ffc65acc03325ea2e501, https://huggingface.co/nationaldesignstudio/rampart),
 Copyright National Design Studio, licensed under Creative Commons
 Attribution 4.0 International (CC BY 4.0).
 

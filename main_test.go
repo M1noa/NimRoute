@@ -50,6 +50,14 @@ func useConfig(t *testing.T, c *appConfig) {
 	t.Cleanup(func() { applyConfig(prev) })
 }
 
+// useConfigForFuzz is useConfig for *testing.F: same swap + restore.
+func useConfigForFuzz(f *testing.F, c *appConfig) {
+	f.Helper()
+	prev := cfg()
+	applyConfig(c)
+	f.Cleanup(func() { applyConfig(prev) })
+}
+
 func approx(a, b float64) bool {
 	return math.Abs(a-b) < 0.01
 }
@@ -298,21 +306,17 @@ func TestFetchZenModelIDs(t *testing.T) {
 }
 
 func TestExtraFreeModelsGatedOnLiveAPI(t *testing.T) {
-	// extras only list when the live api still serves them.
-	live := map[string]bool{"big-pickle": true}
-	listed := []string{}
+	// extras only list when the live api still serves them: calls the
+	// production filter with fixture data (the old version re-implemented
+	// the logic inline and passed regardless of regressions).
 	seen := map[string]bool{"opencode/muse-spark-1.3-contributor-free": true}
-	for _, id := range []string{"big-pickle", "retired-model"} {
-		if seen["opencode/"+id] {
-			continue
-		}
-		if len(live) > 0 && !live[id] {
-			continue
-		}
-		listed = append(listed, id)
+	live := []string{"big-pickle"}
+	got := filterExtraFreeModels([]string{"big-pickle", "retired-model"}, seen, live, true)
+	if len(got) != 1 || got[0] != "big-pickle" {
+		t.Fatalf("gated extras = %v, want [big-pickle]", got)
 	}
-	if len(listed) != 1 || listed[0] != "big-pickle" {
-		t.Fatalf("gated extras = %v, want [big-pickle]", listed)
+	if got := filterExtraFreeModels([]string{"big-pickle"}, map[string]bool{}, nil, false); len(got) != 0 {
+		t.Fatalf("zen off must list nothing, got %v", got)
 	}
 }
 
@@ -1938,11 +1942,12 @@ func TestAnonEntityVariations(t *testing.T) {
 }
 
 func TestAnonFuzzyThreshold(t *testing.T) {
-	// below-threshold text untouched: minoa vs Minoa is 0.8 case-sensitive.
+	// exact matching is case-insensitive: lowercase minoa matches the
+	// Minoa entity (a case shift must not bypass masking).
 	g := pii.ForRequest(piiCfg(testPIIConfig()), "t-fuzzy")
 	up := string(g.MaskBody([]byte(`{"content":"hello minoa"}`)))
-	if !strings.Contains(up, "minoa") {
-		t.Fatalf("below-threshold text must not match: %s", up)
+	if strings.Contains(up, "minoa") {
+		t.Fatalf("case variant must match: %s", up)
 	}
 	if s := pii.Similarity("minoa", "Minoa"); s >= 0.95 {
 		t.Fatalf("similarity(minoa,Minoa) = %v, want < 0.95", s)
@@ -2399,6 +2404,8 @@ func TestRedactProxyUserinfo(t *testing.T) {
 		"http://user@host:8080":      "http://***@host:8080", // no password, still creds
 		"http://host:8080":           "http://host:8080",
 		"socks5://u:p@1.2.3.4:1080":  "socks5://***@1.2.3.4:1080",
+		// password containing @: first-@ split leaks the tail.
+		"http://user:p@ss@host:8080": "http://***@host:8080",
 		"":                           "",
 	}
 	for in, want := range cases {
@@ -3367,9 +3374,10 @@ func TestApplyFreepiReasoning(t *testing.T) {
 	// setCatalog after useConfig: applyConfig reloads the real catalog.
 	setCatalog := func() {
 		setModelInfo(map[string]modelInfoEntry{
-			"freeepi/with-max":  {Reasoning: &yes, EffortLevels: []string{"low", "high", "max"}},
-			"freeepi/no-max":    {Reasoning: &yes, EffortLevels: []string{"minimal", "low", "medium", "high", "xhigh"}},
-			"freeepi/no-levels": {Reasoning: &yes},
+			"freeepi/with-max":  {Reasoning: &yes, FreepiReasoning: true, EffortLevels: []string{"low", "high", "max"}},
+			"freeepi/no-max":    {Reasoning: &yes, FreepiReasoning: true, EffortLevels: []string{"minimal", "low", "medium", "high", "xhigh"}},
+			"freeepi/no-levels": {Reasoning: &yes, FreepiReasoning: true},
+			"freeepi/unserved":  {Reasoning: &yes, EffortLevels: []string{"low", "high"}},
 		})
 	}
 	t.Cleanup(func() { setModelInfo(loadModelInfo(modelInfoPath())) })
@@ -3385,6 +3393,7 @@ func TestApplyFreepiReasoning(t *testing.T) {
 		{"injects max when listed", "max", "with-max", nil, "max"},
 		{"clamps to highest listed", "max", "no-max", nil, "xhigh"},
 		{"no level list = untouched", "max", "no-levels", nil, nil},
+		{"gateway says no reasoning = untouched", "max", "unserved", nil, nil},
 		{"client effort wins", "max", "with-max", map[string]any{"reasoning_effort": "low"}, "low"},
 		{"reasoning object wins", "max", "with-max", map[string]any{"reasoning": map[string]any{"effort": "low"}}, nil},
 	}

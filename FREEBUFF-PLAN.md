@@ -31,7 +31,7 @@ freebuff:
 1. strip `freebuff/` prefix → wire id (e.g. `freebuff/deepseek-v4-flash` → `deepseek/deepseek-v4-flash`). reject unknown ids with 400 + valid list.
 2. pick account (sticky per api-key caller like `PickSticky`, skip 429/backoff).
 3. ensure session: `GET /api/v1/freebuff/session` (heartbeat headers if instance held) → if `none/ended/gone` → `POST /api/v1/freebuff/session/admission` with `x-freebuff-model`, `x-freebuff-wallet-spend-limit: 0`. handle `model_locked` (DELETE other-model instance? no — keep per-model instance map, one slot per model per account), `rate_limited/spend_limited/ip_capped/country_blocked/banned` → surface as 429/403 with upstream message, mark account cooldown.
-4. forward chat: normalize inbound (anthropic messages OR openai messages) → openai `POST https://codebuff.com/api/v1/chat/completions` with `model=<wire-id>`, `codebuff_metadata={freebuff_instance_id, surface:'cli'}`, headers `Authorization: Bearer <token>`, `user-agent: Freebuff-CLI/<ver>`. stream SSE bytes through untouched (same pattern as `callUpstream`).
+4. forward chat (FULL turn lifecycle per §9c: START → server runId + server-UUID instanceId + Buffy opening + `cost_mode:'free'`, else 403): normalize inbound (anthropic messages OR openai messages) → openai `POST https://codebuff.com/api/v1/chat/completions` with `model=<wire-id>`, `codebuff_metadata={freebuff_instance_id, surface:'cli'}`, headers `Authorization: Bearer <token>`, `user-agent: Freebuff-CLI/<ver>`. stream SSE bytes through untouched (same pattern as `callUpstream`).
 5. gate-code check on error body: match `error`+`status` per `FREEBUFF_GATE_CODES`; `endsTheSession` → drop instance, re-admit once, retry once; `keep` → return typed 429/428 to client so claude code retries.
 6. after first response bytes flow → fire ad impression for the currently held ad (ties billable event to real usage), update freebucks snapshot from next session GET.
 
@@ -55,18 +55,19 @@ freebuff:
 - heartbeat GET keeps slot; DELETE on clean shutdown (test binary only).
 - concurrent callers share one session per model (mutex), no admission stampede.
 
-## 7. test protocol (separate port, main untouched)
+## 9. test protocol (separate port, main untouched)
+(note: needs `status.show_freebuff` flag per AGENTS.md §4 — add with the /status block.)
 1. build `nimroute-test` from clean tree + new file, run with `config-test.yml` (port 5420, `enabled:true`, 1 token).
 2. `GET /status` → freebuff block present, no ads text leak when `show_ads:false`.
 3. `GET /v1/models` → `freebuff/*` listed.
 4. openai: `POST :5420/v1/chat/completions {model: freebuff/z-ai/glm-5.3-flash, stream:true}` → 200 SSE, text flows.
-5. anthropic: `POST :5420/v1/messages {model: freebuff/deepseek/deepseek-v4-flash}` via scripts/cctest.py pattern → valid `message` SSE.
+5. anthropic: `POST :5420/v1/messages {model: freebuff/deepseek/deepseek-v4-flash}` via a committed harness (scripts/cctest.py is gitignored; track it or point at the committed equivalent) → valid `message` SSE.
 6. all-models sweep: loop catalog (script), record per-model ok/rate_limited/gated.
 7. idle check: no ad auction for 5 idle min (log grep); usage check: 3 turns → ≥1 impression logged.
 8. audit: `go vet`, race run, diff review (new file + config + status struct only).
 9. only then: copy to main config with `enabled:true`, restart main 5419, re-run steps 3-5 against 5419.
 
-## 8b. auto behaviors (new asks)
+## 8. auto behaviors (new asks)
 - model refresh: background goroutine per `model_refresh_sec` (300s): session GET per account → union(`rateLimitsByModel`, `limitedModelOffers`, `freebucks.prices`) → rebuild `freebuff/*` list + per-model premium/limited flags → atomic swap into `handleModels` + claude_map fallback targets. stale flag if refresh fails.
 - live usage in /status: per account `{daily remaining/limit + resetIn, wallet balance, monthly $ left}` from latest freebucks block; per model `used/limit` from `rateLimitsByModel`; per active turn `{model, account, sessionExpiresIn, egress}`. poll `session_poll_sec` (30s) + refresh after every served turn (piggyback, no extra timer).
 - realistic ads: auction only on (admission | rotation expiry + served-since | freebucks<20% | rate_limited seen). body uses last ≤6 REAL proxy turns. impression only after streamed turn, once per fill. counters + last ad timestamps always live.

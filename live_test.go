@@ -15,7 +15,9 @@ import (
 // handleAnthropic end to end minus the network hop, which is the only part
 // not ours. covers routing, RTK, PII ordering and the tool-name restore in
 // one pass. asserts on the body handed to the response translator.
-func TestLiveAnthropicChain(t *testing.T) {
+// local chains over httptest servers (never live upstreams despite the
+// old TestLive* names).
+func TestLocalAnthropicChain(t *testing.T) {
 	c := defaultConfig()
 	c.Rtk.Enabled = true
 	c.Nvidia.Enabled = true
@@ -75,7 +77,7 @@ func TestLiveAnthropicChain(t *testing.T) {
 }
 
 // the full streaming chain, same coverage through the SSE writer.
-func TestLiveStreamChain(t *testing.T) {
+func TestLocalStreamChain(t *testing.T) {
 	c := defaultConfig()
 	c.Rtk.Enabled = true
 	useConfig(t, &c)
@@ -170,7 +172,7 @@ func TestZenProxyE2EStreams(t *testing.T) {
 			t.Fatalf("%s: %v", path, err)
 		}
 		defer res.Body.Close()
-		out, _ := io.ReadAll(res.Body)
+		out, _ := io.ReadAll(io.LimitReader(res.Body, 32<<20))
 		if res.StatusCode != http.StatusOK {
 			t.Fatalf("%s status %d: %s", path, res.StatusCode, out)
 		}
@@ -200,10 +202,10 @@ func TestZenProxyE2EStreams(t *testing.T) {
 // handleAnthropic, against a local upstream. this is the path a /v1/messages
 // request takes when the model is not opencode/*: request translation, real
 // upstream exchange, response translation, tool-name restore.
-func TestLiveToolCallRoundTrip(t *testing.T) {
+func TestLocalToolCallRoundTrip(t *testing.T) {
 	var gotBody []byte
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody, _ = io.ReadAll(io.LimitReader(r.Body, 32<<20))
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"choices":[{"message":{"content":"let me check","tool_calls":[
 			{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}},

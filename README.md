@@ -1,7 +1,7 @@
 # NimRoute
 > THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
 
-OpenAI-compatible proxy with two backends: **NVIDIA NIM** (key pool, needs keys) and **opencode zen free models** (`opencode/<model>`, works keyless).
+OpenAI/Anthropic-compatible proxy with four backends: **opencode zen free models** (`opencode/<model>`, keyless), **freepi ad-supported models** (`freeepi/<model>`, needs `./nim freepi auth`), **antseed p2p models** (`antseed/<model>`, keyless), and **NVIDIA NIM** (`nvidia/<model>` key pool, needs keys). `route/<model>` fans out across backends.
 
 ```sh
 go build -o nimroute .
@@ -23,9 +23,9 @@ Point any OpenAI client at `http://localhost:5419/v1` with any key. Claude Code 
 
 ## Service
 
-`./nim run|start|stop|restart|status|logs|tail|install|uninstall` (launchd/systemd/nohup; system-wide templates in `deploy/`).
+`./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth` (launchd/systemd/nohup; system-wide templates in `deploy/`).
 
-`/status` shows pool health (keys/lanes hidden without a token when auth is on). Requests logged to `nim-usage.jsonl`. Env: `PORT`, `CONFIG_FILE`, `NIM_AUTH`, `DEBUG=1`.
+`/status` shows pool health (keys/lanes hidden without a token when auth is on). Requests logged to `nim-usage.jsonl`. Env: `PORT` (overrides `server.port`), `CONFIG_FILE`, `NIM_AUTH` (authenticates `nimstatus.py` against `/status` only; server auth is `auth.tokens`), `DEBUG=1`, `CORS_ORIGINS`, `ZEN_CAPTURE=1` (debug traffic capture, owner-only files).
 
 ```sh
 go test ./...

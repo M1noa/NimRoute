@@ -17,6 +17,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -118,8 +119,11 @@ def main():
     if not ok_tokens:
         fails.append("count_tokens")
 
+    if not text:
+        print("FAIL catalog has no text entries")
+        return 1
     one = free[0]["id"] if free else text[0]["id"]
-    status, res, _ = req(f"/v1/models/{one}")
+    status, res, _ = req(f"/v1/models/{urllib.parse.quote(one, safe='')}")
     ok_single = status == 200 and res.get("id")
     print(f"models/{one}: {'ok' if ok_single else f'FAIL {status}'}")
     if not ok_single:

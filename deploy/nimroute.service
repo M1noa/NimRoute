@@ -7,9 +7,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=REPLACE_WITH_PATH
 ExecStart=REPLACE_WITH_PATH/nimroute
-Restart=always
+# port comes from server.port in config.yml (default 5419): no PORT env
+# here, it would silently override the config.
+Restart=on-failure
 RestartSec=3
-Environment=PORT=5419
 # optional: Environment=CONFIG_FILE=/path/to/config.yml
 
 [Install]

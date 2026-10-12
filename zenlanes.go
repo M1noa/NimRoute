@@ -658,9 +658,11 @@ func laneModes() (hdr, convo, shared bool) {
 	return hdr, convo, shared
 }
 
-// convertSharedLocked renames the idlest shared lane to key, minting a fresh
-// session for the new identity. caller holds lanesMu. nil when no shared
-// lane exists to convert.
+// convertSharedLocked allocates a fresh lane for key and drops the idlest
+// shared lane to hold the cap. the victim is never mutated in place: an
+// in-flight request may hold its pointer, and renaming it mid-request
+// breaks session continuity for both conversations. caller holds lanesMu.
+// nil when no shared lane exists to convert.
 func convertSharedLocked(key string) *zenLane {
 	var victimKey string
 	var victim *zenLane
@@ -676,13 +678,13 @@ func convertSharedLocked(key string) *zenLane {
 		return nil
 	}
 	delete(lanes, victimKey)
-	victim.session = zenSession()
-	victim.proxy = ""
-	victim.limitedSince = time.Time{}
-	victim.lastUsed = time.Now()
-	victim.id = shortLaneID(key)
-	lanes[key] = victim
-	return victim
+	l := &zenLane{
+		session:  zenSession(),
+		lastUsed: time.Now(),
+		id:       shortLaneID(key),
+	}
+	lanes[key] = l
+	return l
 }
 
 // ensureSharedLanes pre-opens shared lanes up to the cap so a cold start
@@ -713,7 +715,9 @@ func ensureSharedLanesLocked() {
 // cacheKeyOf reads the openai-compat prompt_cache_key (or camel
 // promptCacheKey) off a body. clients set it per conversation, so it works
 // as a lane identity where no x-session-id header exists. read before
-// stripCacheFields, which deletes the field for upstream.
+// stripCacheFields, which deletes the field for upstream. note the
+// exception to verbatim lane identity: pck values are whitespace-trimmed
+// (json string padding is not identity).
 func cacheKeyOf(body []byte) string {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
@@ -816,17 +820,36 @@ func noteRateLimit() bool {
 	if !hit {
 		return false
 	}
+	if !poolRefreshDue() {
+		zenProxiesMu.RLock()
+		ago := time.Since(zenPoolRefreshed)
+		zenProxiesMu.RUnlock()
+		dbglog.Printf("  zen: %d rate-limited lanes, refresh skipped (last %v ago, cooldown %v)", n, ago.Round(time.Second), poolRefreshCooldown())
+		return false
+	}
+	acclog.Printf("  zen: %d rate-limited lanes, refreshing proxy pool", n)
+	// stamp at fire time: the completion stamp lands ~30s+ later after
+	// verify, so a second trip during an in-flight refresh would see a
+	// stale timestamp and log a duplicate fire (harmless via TryLock,
+	// but noisy). completion re-stamps with the true finish time.
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	refreshZenProxiesAsync()
+	return true
+}
+
+// poolRefreshDue reports whether a tripped 429 counter may fire: true when
+// the last refresh finished outside the cooldown window.
+func poolRefreshDue() bool {
 	if cd := poolRefreshCooldown(); cd > 0 {
 		zenProxiesMu.RLock()
 		ago := time.Since(zenPoolRefreshed)
 		zenProxiesMu.RUnlock()
 		if ago < cd {
-			dbglog.Printf("  zen: %d rate-limited lanes, refresh skipped (last %v ago, cooldown %v)", n, ago.Round(time.Second), cd)
 			return false
 		}
 	}
-	acclog.Printf("  zen: %d rate-limited lanes, refreshing proxy pool", n)
-	refreshZenProxiesAsync()
 	return true
 }
 
@@ -956,10 +979,58 @@ func pickLaneProxyFor(model string) string {
 		cands = append(cands, p)
 	}
 	if len(cands) == 0 {
+		// dry pool: every exit is pinned or burned. on public proxies the
+		// 429s that arm long-burns come from every other user of the exit,
+		// so a full ban means the pool is starved, not saturated. give up
+		// the freshest long-burns (one per call) rather than leaving the
+		// caller with "": the alternative is guaranteed 502s until a restart.
+		if unbanned := unbanOldestLongBurn(model); unbanned != "" {
+			return unbanned
+		}
 		return ""
 	}
 	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
 	return sampleWeighted(cands, 1)[0]
+}
+
+// unbanOldestLongBurn lifts the soonest-lapsing 12h saturation ban that
+// fits the model filter and returns that exit ("" when the ban map is
+// empty). called only when every pool exit is pinned or burned, so it
+// cannot race-select a healthy spare: anything here beats "".
+func unbanOldestLongBurn(model string) string {
+	longBurnMu.Lock()
+	var bestP string
+	var bestTime time.Time
+	found := false
+	pool := make([]string, 0, len(longBurned))
+	zenProxiesMu.RLock()
+	for _, p := range zenProxies {
+		pool = append(pool, p)
+	}
+	zenProxiesMu.RUnlock()
+	// prefer current-pool exits, freshest-lapsing ban wins. order outside
+	// the pool does not matter: picking an exit no longer in the pool
+	// gives nothing (it never gets probed again).
+	for _, p := range pool {
+		until, ok := longBurned[p]
+		if ok && (!found || until.Before(bestTime)) {
+			bestP, bestTime, found = p, until, true
+		}
+	}
+	if !found {
+		longBurnMu.Unlock()
+		return ""
+	}
+	delete(longBurned, bestP)
+	longBurnMu.Unlock()
+	acclog.Printf("  zen long-burn lifted early (dry pool): %s", redactProxyUserinfo(bestP))
+	// per-model burn still binds: if the exit is burned for this model,
+	// lifting the long-burn gains nothing; report dry and let the caller
+	// use the old pin (or fail over) as before.
+	if exitBurned(bestP, model) {
+		return ""
+	}
+	return bestP
 }
 
 // laneReproxy swaps a dead exit for a fresh verified one that no other lane
@@ -973,6 +1044,13 @@ func laneReproxy(l *zenLane, model string) string {
 	defer lanesMu.Unlock()
 	if p == "" {
 		return l.proxy
+	}
+	// re-validate under the write lock: two concurrent rotations can
+	// otherwise pin the same exit picked from a stale snapshot.
+	for _, o := range lanes {
+		if o != l && o.proxy == p {
+			return l.proxy
+		}
 	}
 	l.proxy = p
 	l.country = proxyCountry(p)
@@ -993,7 +1071,7 @@ func laneEscalate(l *zenLane, model string) string {
 	l.country = proxyCountry(p)
 	l.escalated = true
 	lanesMu.Unlock()
-	acclog.Printf("  opencode lane %s escalating direct -> %s (%s)", l.id, p, proxyCountry(p))
+	acclog.Printf("  opencode lane %s escalating direct -> %s (%s)", l.id, redactProxyUserinfo(p), proxyCountry(p))
 	return p
 }
 
@@ -1158,9 +1236,8 @@ func resetStaleLanes() {
 		l.limitedSince = time.Time{}
 		l.session = zenSession()
 	}
-	zenSuccessMu.Lock()
-	zenSuccessAt = time.Now()
-	zenSuccessMu.Unlock()
+	// zenSuccessAt intentionally untouched: no success happened, and
+	// stamping it delays the next stale-pool trip during ongoing failure.
 }
 
 // sweepLanes runs on the pool refresh tick: drops lanes idle past ttl and
@@ -1227,7 +1304,9 @@ func redactProxyUserinfo(p string) string {
 	}
 	rest := p[i+3:]
 	slash := strings.Index(rest, "/")
-	at := strings.Index(rest, "@")
+	// split userinfo at the LAST @ before the first slash: passwords may
+	// contain @ (first-@ split leaks the tail, net/url splits last).
+	at := strings.LastIndex(rest, "@")
 	// an @ before the first slash means the authority carries credentials
 	// (user or user:pass) — redact the whole userinfo segment.
 	if at < 0 || (slash >= 0 && slash < at) {
@@ -1242,8 +1321,15 @@ func laneSnapshot() []laneStatus {
 	now := time.Now()
 	out := make([]laneStatus, 0, len(lanes))
 	for _, l := range lanes {
+		// lane ids derive from the verbatim client x-session-id: hash
+		// them on /status instead of echoing client identity back.
+		id := l.id
+		if strings.HasPrefix(id, "hdr:") {
+			sum := sha256.Sum256([]byte(id))
+			id = "hdr:" + hex.EncodeToString(sum[:])[:12]
+		}
 		st := laneStatus{
-			ID: l.id, Proxy: redactProxyUserinfo(l.proxy), Country: l.country,
+			ID: id, Proxy: redactProxyUserinfo(l.proxy), Country: l.country,
 			LastUsed: now.Sub(l.lastUsed).Round(time.Second).String(),
 			Requests: l.requests, RateLimit: l.rateLimit,
 		}
@@ -1293,6 +1379,9 @@ func laneFailover(l *zenLane) *zenLane {
 		}
 	}
 	if best != nil {
+		// stamp the hand-out: without it concurrent retries converge on
+		// the same stalest lane.
+		best.lastUsed = now
 		return best
 	}
 	if len(lanes) < laneCap() {

@@ -2,6 +2,10 @@
 keys.json
 keys.jsonc
 config.yml
+config.*.yml
+!config.yml.example
+freepi_jwt.txt
+*.jwt
 proxies.txt
 .env
 
@@ -40,8 +44,11 @@ nim-usage.jsonl
 system-prompts/
 cctest.py
 opencode_prompt.py
-zen_probe_spark.tsv
-zen_probe_countries.tsv
+zen_probe*.tsv
+nim-perf.jsonl
+
+# local-only p2p / scratch state (per-clone, was .git/info/exclude)
+.freebuff/
 
 # pii model artifacts (fetched by pii/fetch_model.sh, never committed)
 pii/testdata/*.onnx

@@ -4,10 +4,20 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// maskFallbacks counts MaskBody fail-open fallbacks (valid json in,
+// broken json out, original shipped unmasked). exposed for /status.
+var maskFallbacks atomic.Int64
+
+// MaskFallbacks returns the process-lifetime fail-open count.
+func MaskFallbacks() int64 { return maskFallbacks.Load() }
 
 // session wiring: per-request guard built from config + incoming headers.
 // replaces anon.go's anonMap end to end.
@@ -24,10 +34,13 @@ type Config struct {
 	// new knobs
 	DetectSecrets bool
 	DetectPII     bool // deterministic structured classes
+	// OnTimeout is the ner timeout policy (skip | heuristics): heuristics
+	// detectors always run, so a timed-out ner contributes nothing either
+	// way. both values mean heuristics-only on ner timeout today.
 	Ner           NerConfig
 	KeepLabels    []string
 	IncludeSystem bool
-	OnTimeout     string // skip | heuristics (ner timeout policy)
+	OnTimeout     string
 	VaultTTLHours int
 	VaultMaxSize  int
 }
@@ -61,12 +74,13 @@ type guardEntry struct {
 	elem  *list.Element
 }
 
-// SessionKey derives a stable vault id from an api key.
+// SessionKey derives a stable vault id from an api key. full 256-bit
+// digest: truncation to 64 bits invites collisions on an identity key.
 func SessionKey(apiKey string) string {
 	sum := sha256.Sum256([]byte(apiKey))
 	const hexd = "0123456789abcdef"
 	var b strings.Builder
-	for _, v := range sum[:8] {
+	for _, v := range sum[:] {
 		b.WriteByte(hexd[v>>4])
 		b.WriteByte(hexd[v&15])
 	}
@@ -82,13 +96,27 @@ func vaultKey() []byte {
 
 // ForRequest returns the session guard, or nil when disabled (zero
 // overhead: callers check nil and pass bodies through untouched).
+// cfgVersion fingerprints the detector config: a config change must not
+// keep serving stale guards (new entities/detectors would never apply).
+func cfgVersion(cfg Config) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%+v|%+v|%+v|%+v|%+v|%+v|%+v|%+v|%+v|%+v|%+v|%+v",
+		cfg.Mode, cfg.DetectSecrets, cfg.DetectPII, cfg.IncludeSystem,
+		cfg.FuzzyThreshold, cfg.KeepLabels, cfg.Terms, cfg.Entities,
+		cfg.Ner, cfg.VaultTTLHours, cfg.VaultMaxSize, cfg.OnTimeout)
+	sum := sha256.Sum256([]byte(b.String()))
+	return fmt.Sprintf("%x", sum)
+}
+
 func ForRequest(cfg Config, sessionID string) *Guard {
 	if !cfg.Enabled {
 		return nil
 	}
-	if len(sessionID) > 128 {
-		sessionID = sessionID[:128]
-	}
+	// hash the full id into the map key: two long ids with a common
+	// 128-char prefix must not share one guard and vault. the detector
+	// config version rides along so a config change rebuilds live guards.
+	sum := sha256.Sum256([]byte(sessionID))
+	sessionID = fmt.Sprintf("sid:%x@%s", sum, cfgVersion(cfg))
 	guardMu.Lock()
 	defer guardMu.Unlock()
 	if e, ok := guards[sessionID]; ok {
@@ -125,11 +153,13 @@ func build(cfg Config, sessionID string) *Guard {
 			dets = append(dets, d)
 		}
 	}
+	// nil (absent) keeps the city/state/zip default; explicitly empty
+	// (keep_labels: []) masks everything: no silent keep list.
 	keep := map[Label]bool{}
 	for _, k := range cfg.KeepLabels {
 		keep[Label(strings.ToUpper(k))] = true
 	}
-	if len(keep) == 0 {
+	if cfg.KeepLabels == nil {
 		keep = nil // scanner falls back to city/state/zip default
 	}
 	ttl := time.Duration(cfg.VaultTTLHours) * time.Hour
@@ -150,7 +180,9 @@ func build(cfg Config, sessionID string) *Guard {
 				continue
 			}
 			repl[strings.ToLower(strings.TrimSpace(s))] = e.Replacement
-			v.SeedFixed(e.Replacement, s, customLabel(e))
+			if !v.SeedFixed(e.Replacement, s, customLabel(e)) {
+				log.Printf("WARN: anonymize entity %q reuses replacement %q: refusing (first owner wins)", e.Name, e.Replacement)
+			}
 		}
 	}
 	return &Guard{
@@ -168,8 +200,10 @@ func (g *Guard) MaskBody(body []byte) []byte {
 	// safety net: masking works on raw bytes, so a detector span that
 	// crosses a json structural character can silently corrupt the body
 	// and the request would die as invalid json upstream. if masking
-	// broke a body that was valid json, ship the original instead.
+	// broke a body that was valid json, ship the original instead — but
+	// say so: silent fail-open is a standing PII leak.
 	if json.Valid(body) && !json.Valid(masked) {
+		maskFallbacks.Add(1)
 		return body
 	}
 	return masked

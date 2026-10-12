@@ -60,12 +60,9 @@ offer failover only (no lanes — 28/28 no-429 experiment killed that).
 
 ## notes
 
-- pre-existing uncommitted changes (anthropic.go, config.go, freepi.go,
-  main.go, modelinfo.go, zenproxy.go, *_test.go, TODO.md) are NOT from
-  this work — do not revert.
+- work from a clean tree (`git status`): uncommitted changes from other work are NOT from this work — do not revert.
 - sellers advertise ids like `z-ai/glm-5.3-flash`; display id strips
   vendor path, canon matches either form.
 - minimax-m3 + gpt-6-luna entries are lineage estimates (no openrouter
   record); fix ctx/maxout when live catalog confirms.
-- wire clone at /var/folders/nk/qtcnhdz964sg80k2fnz8nnnh0000gp/T/opencode/antseed
-  (reference only, not part of repo).
+- wire clone: re-clone upstream `Antseed/antseed` to a scratch dir for reference (never commit absolute /tmp or /var paths).

@@ -32,7 +32,6 @@ type Vault struct {
 	byOrig  map[string]*vaultEntry
 	bySurr  map[string]*vaultEntry
 	lru     *list.List
-	counts  map[string]int
 }
 
 func NewVault(key []byte, ttl time.Duration, maxSize int) *Vault {
@@ -55,10 +54,13 @@ func NewVaultMode(key []byte, ttl time.Duration, maxSize int, mode string) *Vaul
 		byOrig: map[string]*vaultEntry{},
 		bySurr: map[string]*vaultEntry{},
 		lru:    list.New(),
-		counts: map[string]int{},
 	}
 }
 
+// normOrig canonicalizes the lookup key (case + whitespace folded), so
+// restore returns the first-seen surface form for later case variants.
+// documented, not fixed: per-request forms would break cross-request
+// surrogate stability, which is the vault's whole point.
 func normOrig(label Label, s string) string {
 	return string(label) + "|" + strings.ToLower(strings.Join(strings.Fields(s), " "))
 }
@@ -109,7 +111,16 @@ func (v *Vault) For(label Label, original string) string {
 	e.elem = v.lru.PushFront(k)
 	v.byOrig[k] = e
 	v.bySurr[surr] = e
-	v.counts[string(label)]++
+	// expired entries linger until their original is re-added: sweep them
+	// once the map is half full so dead weight can't pin live entries out.
+	if len(v.byOrig) >= v.maxSize/2 {
+		now := time.Now()
+		for _, oe := range v.byOrig {
+			if now.After(oe.expires) {
+				v.remove(oe)
+			}
+		}
+	}
 	for v.lru.Len() > v.maxSize {
 		back := v.lru.Back()
 		if back == nil {
@@ -125,20 +136,36 @@ func (v *Vault) For(label Label, original string) string {
 }
 
 // SeedFixed registers a fixed surrogate -> original pair (entity
-// `replacement:` values). fixed pairs never expire with the vault ttl
-// and are returned by Lookup/Surrogates like derived ones.
-func (v *Vault) SeedFixed(surrogate, original string, label Label) {
+// `replacement:` values). seeded entries share the vault ttl and lru
+// membership like derived ones: immortal entries never expire and never
+// count to maxSize. a duplicate Replacement for a different original is
+// refused (reported): silently aliasing it masks to a derived surrogate
+// yet restores to the first entity's original.
+func (v *Vault) SeedFixed(surrogate, original string, label Label) bool {
 	if surrogate == "" || original == "" {
-		return
+		return false
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if _, taken := v.bySurr[surrogate]; taken {
-		return
+	if e, taken := v.bySurr[surrogate]; taken {
+		return normOrig(e.label, e.original) == normOrig(label, original)
 	}
-	e := &vaultEntry{original: original, surrogate: surrogate, label: label, expires: time.Now().Add(100 * 365 * 24 * time.Hour)}
+	e := &vaultEntry{original: original, surrogate: surrogate, label: label, expires: time.Now().Add(v.ttl)}
+	e.elem = v.lru.PushFront(normOrig(label, original))
 	v.byOrig[normOrig(label, original)] = e
 	v.bySurr[surrogate] = e
+	for v.lru.Len() > v.maxSize {
+		back := v.lru.Back()
+		if back == nil {
+			break
+		}
+		if e2, ok := v.byOrig[back.Value.(string)]; ok {
+			v.remove(e2)
+		} else {
+			v.lru.Remove(back)
+		}
+	}
+	return true
 }
 
 // maxSurrogateSalts caps the hmac salt-retry loop in Vault.For.
@@ -179,8 +206,14 @@ func (v *Vault) Lookup(surrogate string) (string, bool) {
 func (v *Vault) Surrogates() []string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	now := time.Now()
 	out := make([]string, 0, len(v.bySurr))
-	for s := range v.bySurr {
+	for s, e := range v.bySurr {
+		// expired entries are dead placeholders: including them makes
+		// the streaming holdback over-hold and restore scan garbage.
+		if now.After(e.expires) {
+			continue
+		}
 		out = append(out, s)
 	}
 	return out

@@ -1,91 +1,90 @@
 # audit 2026-10-07 — NimRoute
 
-> read-only. no source files modified. subagents stalled partway, so code sections were audited by direct inspection (grep + targeted reads) instead. docs section by subagent with cross-checks into config.go, config.yml.example, model_info.jsonc, main.go:1-150.
+> read-only. no source files modified. subagents stalled on upstream 502s, so code sections were audited by direct inspection (grep + targeted reads). security-audit skill unavailable, manual pass done instead. `go vet ./...` clean, `gofmt -l .` clean, no TODO/FIXME/XXX in non-test code.
 
 ## critical
 
-- `antseedp2p.go:769` — `mustHex(ack.Pub)` panics on malformed hex, and `ack` arrives from the network peer. a malicious seller sends a validly-signed ack with non-hex `pub` and crashes the whole proxy. fix: replace `mustHex` with an error-returning decode at this call site.
-- `antseedp2p.go:111,662` — `panic(err)` on `crypto/rand` failure and in `mustHex`. any panic takes down the single proxy process serving :5419. fix: return errors instead of panicking.
-- `FREEBUFF-DOCS.md:113` vs `FREEBUFF-PLAN.md:30`, `FREEBUFF-TODO.md:21` — acc2 suspended for third-party proxy use, doc bans live tests until client-legitimacy solved, but plan/todo still schedule sweeps and streaming turns with no legitimacy design. fix: halt phases B-D until a legitimacy approach is documented.
-- `FREEBUFF-PLAN.md:30` vs `FREEBUFF-DOCS.md:103` — per-turn lifecycle forwards only `model` + metadata, but turns require agent-run `runId`, server-UUID instance, Buffy system opening, `cost_mode:'free'` or they 403. fix: add the full gate recipe to the plan lifecycle.
+- `antseedp2p.go:769` — `mustHex(ack.Pub)` panics on malformed hex after sig check. `ack` is peer-controlled; dialed seller signs non-hex `pub` and crashes the whole proxy. fix: error-returning decode here, delete `mustHex`.
+- `antseedp2p.go:111,662` — `panic(err)` on `crypto/rand` failure and in `mustHex`. any panic takes down :5419. fix: return errors.
+- `anthropic.go:2044-2051` — `ZEN_PASSTHROUGH=1` copies client `X-Opencode-*` headers verbatim upstream, bypassing the `zenHeaderForwarded` blocklist (`main.go:3663`). client spoofs session/project identity to zen. fix: delete passthrough or drop `x-opencode-*` even in passthrough mode.
 
 ## high
 
-- `main.go:4106-4129` — `captureRequest` (gated on `ZEN_CAPTURE`) writes full request headers including `Authorization`/`x-api-key` plus bodies to `/tmp/oc-capture` with mode 0644. any local user reads proxy credentials. fix: skip auth headers in the dump and write 0600.
-- `anthropic.go:2021-2124,2339-2438` — `ZEN_DUMP` writes upstream request/response bodies to disk 0644, same credential-exposure shape on a debug path. fix: 0600 and document that the flag persists sensitive traffic.
-- `main.go:4107` — `captureRequest` uses uncapped `io.ReadAll(r.Body)` before the 10MB `bodyLimit` read at `:2838`, so a client bypasses the body cap by setting `ZEN_CAPTURE`. fix: wrap in `io.LimitReader` with `bodyLimit`.
-- `scripts/freepi_login.py:67` — JWT saved with bare `open(out, "w")`, honoring umask instead of 0600 like `config.go:512` does for seeds. fix: `os.chmod(out, 0o600)` after write.
-- `README.md:4` — lists only NIM + opencode zen, but `config.go:222,238` + `model_info.jsonc:110` ship freepi and antseed. fix: rewrite backend paragraph, link per-backend docs.
-- `AGENTS.md:23` — routing says `opencode/` → zen, else NIM, but example defines `freepi/`, `antseed/` prefixes. fix: document all four prefixes + handlers.
-- `TODO.md:186,207` — two sections numbered `## 11`, breaks the stable-numbering invariant at `TODO.md:4`. fix: renumber 11-13, fix xrefs.
-- `config.go:452` — presence checks restore only `show_usage`/`show_pool`; `ShowKeys`, `ShowOpencodeModels`, `ShowZen`, `ShowLocks`, `guardrails.enabled`, `inject.params`, `nudge.enabled` also default true unchecked, so explicit `false` is silently dropped on reload. fix: extend raw-doc checks or convert to `*bool`.
-- `config.go:878-911` — `StatusFor` hides `Freepi` on unauthenticated calls but no `status.show_freepi` flag exists, violating `AGENTS.md:82` (every new section needs a flag). fix: add `show_freepi` + redaction + docs.
-- `AGENTS.md:85` — redaction list omits freepi, antseed, `LaneCap`, `ZenLanes` though `config.go:906` hides them. fix: update list to match code.
-- `config.yml.example:362` — `claude_map` defaults to muse-spark-1.3 / bare `moonshotai/kimi-k3`, but only space-bunny serves (`TODO.md:396`) and kimi-k3 503s keyless. fix: repoint keyless defaults at a serving model.
-- `ANTSEED-PLAN.md:3` — header says nothing implemented, but `ANTSEED-TODO.md:7` records full impl + e2e + primary restart. fix: flip status, point to files.
-- `CHANGED-SINCE-682b2eb.md:1` — scratch pins HEAD `b4fa0b3` (2026-10-05), project renamed twice since, file says delete itself at line 123. fix: delete the file.
-- `PLAN.md:56` — freepi as future work with cooldown/burn lane mechanics, but implemented as one-stream-per-account with no shared lanes (`TODO.md:347`). fix: mark done or archive.
+- `main.go:4107-4130` — `captureRequest` (`ZEN_CAPTURE`) uncapped `io.ReadAll(r.Body)` bypasses the 10MB `bodyLimit` (`:2838`), dumps full `r.Header` (auth) + body to `/tmp/oc-capture` at 0644. fix: `LimitReader` + skip auth headers + 0600.
+- `anthropic.go:2027-2036,2094-2095` — `zenDebugCapture` writes inbound `r.Header` to capture dir at 0644. same cred-exposure shape. fix: redact auth/cookie/session before marshal, 0600.
+- `anthropic.go:2120-2127,2348-2351,2420-2423` — `ZEN_DUMP` writes upstream req/resp bodies at 0644. fix: 0600 + doc note that flag persists traffic.
+- `main.go:2767-2769` — `Access-Control-Allow-Origin: *` + `Allow-Headers: *` on all routes incl authenticated `/v1/*`. any site with a leaked token spends quota. fix: restrict origin or config-gate.
+- `main.go:2962-2963` — `dbglog` prints full `r.Header` + body when `debugMode`. auth material in debug log. fix: redact authorization/x-api-key/cookie/session.
+- `main.go:3020-3022` — NIM path forwards client `X-Forwarded-Host` upstream; zen list drops it (`:3667`) as client-claimed. fix: drop it in NIM too, stop setting `X-Forwarded-For` from `RemoteAddr` without opt-in.
+- `scripts/freepi_login.py:67` — JWT saved via bare `open(out,"w")`, umask-dependent; `config.go:512` uses 0600 for seeds. fix: `os.chmod(out, 0o600)`.
+- `config.go:878-917` — `StatusFor` has `ShowAntseed` but no `show_freepi` flag; `sr.Freepi` gated only on unauth (`:910`), violates AGENTS §4 every-section-needs-flag. fix: add `show_freepi` + redaction + docs.
+- `README.md:4` — lists NIM + zen only; `config.go:222,238` + routing (`main.go:2906-2939`) ship freepi + antseed. fix: rewrite backend paragraph.
+- `AGENTS.md:23` — routing says `opencode/` → zen else NIM; code routes `freeepi/`, `antseed/` too. fix: document all four.
+- `TODO.md:186,206` — two `## 11` sections, breaks stable-numbering invariant (`:4`). fix: renumber 11-13 + xrefs.
+- `AGENTS.md:85` — redaction list omits freepi/antseed/`LaneCap`/`ZenLanes` though `config.go:906-914` hides them. fix: sync list.
 
 ## medium
 
-- `main.go:2767-2769` — `Access-Control-Allow-Origin: *` with `Allow-Headers: *` on all routes including authenticated `/v1/*`. any website can spend the operator's backend quota if it learns a token. fix: restrict origin or gate CORS behind a config flag.
-- `main.go:2962` — `dbglog` prints full `r.Header` (auth material) whenever `DEBUG_FILE` is set. fix: redact authorization/x-api-key/cookie in the debug dump.
-- `main.go:2980-2982` — NIM deny-list drops `authorization`, `host`, `origin`, `cookie`, `x-api-key`, `x-session-id` but not `x-forwarded-host`, which the zen list (`:3664`) drops as client-claimed. fix: add it for parity.
-- `pii/pii.go:65-73` — `SessionKey` truncates sha256(apiKey) to 64 bits for the vault id; `vaultKey` is a hardcoded constant (`"nimroute-pii-v1"`), so surrogate derivation is identical across restarts and installs. fix: generate the hmac key with `crypto/rand` at startup.
-- `piiwiring.go:39-53` — `piiSessionID` hashes the full `Authorization` header value (scheme + token) rather than the token, so `Bearer X` and `X` split one client into two vaults. fix: strip the scheme before hashing.
-- `config.yml.example:149` — zen section omits `ConvoIdleMinutes` (`config.go:159`, promised `PLAN.md:22`). fix: add example block.
-- `config.yml.example:299` — freepi omits `queue_wait_secs` (`config.go:230`). fix: document or remove field.
-- `TODO.md:203` — cooldown-skip bullet under item 11 (fetch-tool 502) belongs to item 10 pool tuning. fix: move it.
-- `ANTSEED-PLAN.md:76` — mandates static table with `supersedes:`, but `model_info.jsonc:117` is flat and todo sorts by live count. fix: pick one ordering.
-- `TODO.md:154` — item 9 labeled done, subtasks (startup warn, per-id test) read open. fix: check off with evidence or reopen.
-- `TODO.md:156` — claims 102 entries (81 nim + 14 zen + 7 freepi); jsonc now has 15 zen + 5 antseed. fix: refresh count + date.
-- `TODO.md:149` — item 8 discusses lane cap 5→6; `config.go:366` defaults 25. fix: update or close.
-- `ANTSEED-PLAN.md:33` — nested `discovery:` + timeouts, but `config.go:238` flattened/dropped keys. fix: reconcile plan/code/example.
-- `ANTSEED-PLAN.md:20` — plans `antseedcat.go`; catalog implemented in `antseed.go` unexplained. fix: record where canonical-key/ranking lives.
-- `ANTSEED-TODO.md:63,70` — stale uncommitted-changes warning plus `/var/folders/...` absolute path. fix: delete note, use reproducible clone cmd.
-- `ANTSEED-TODO.md:49` — e2e claims `gpt-oss-120b`, no antseed entry in jsonc. fix: add entry or correct note.
-- `FREEBUFF-PLAN.md:15`, `FREEBUFF-TODO.md` — `test_port: 5420`, no `model_refresh_sec`; example adds it. fix: unify key list in one place.
-- `FREEBUFF-PLAN.md:69` — order 7, 8b, 8; no `show_freebuff` flag though required. fix: renumber, name flag + redaction.
-- `FREEBUFF-PLAN.md:96` — chat POST `https://codebuff.com`; canonical is `https://www.codebuff.com`. fix: use www.
-- `FREEBUFF-TODO.md:10` — A6 proposes backoff for chat 503s; docs reclassify as pre-ban soft-refuse. fix: update to ban hypothesis, forbid sweeps.
+- `piiwiring.go:43-52` — `piiSessionID` hashes full `Authorization` value incl `Bearer ` scheme, so `Bearer X` vs `X` split one client into two vaults. fix: strip scheme before hashing.
+- `pii/pii.go:65-81` — `SessionKey` truncates sha256 to 64 bits; `vaultKey` hardcoded `"nimroute-pii-v1"`, identical surrogates across installs. fix: full hash + `crypto/rand` key at startup (persist only if cross-restart stability wanted).
+- `config.yml.example:299` — freepi section omits `queue_wait_secs` (`config.go:230`, `freepi.go:52`). fix: document or remove field.
+- `config.yml.example:149` — zen section omits `convo_idle_minutes` (`config.go:159`). fix: add block.
+- `config.yml.example:362-370` — `claude_map` defaults to muse-spark-1.3 / bare `moonshotai/kimi-k3`; sweep notes only space-bunny serves (`TODO.md:396`). fix: repoint keyless defaults.
+- `ANTSEED-PLAN.md:3` — header says nothing implemented; `ANTSEED-TODO.md:7` + `antseed.go`/`antseedp2p.go` show full impl. fix: flip status, point to files.
+- `ANTSEED-PLAN.md:33` vs `config.go:238` — plan shows nested `discovery:` + timeouts, code flattened/dropped. fix: reconcile.
+- `ANTSEED-PLAN.md:20` — plans `antseedcat.go`; catalog lives in `antseed.go` unexplained. fix: record canonical location.
+- `ANTSEED-TODO.md:63,70` — stale uncommitted-changes warning + `/var/folders/...` absolute path. fix: delete, use reproducible clone cmd.
+- `CHANGED-SINCE-682b2eb.md:1` — pins HEAD `b4fa0b3` (2026-10-05), renames since, self-delete note at eof. fix: delete file.
+- `PLAN.md:56` — freepi as future work; implemented one-stream-per-account (`TODO.md:347`). fix: mark done or archive.
+- `TODO.md:154-156` — item 9 done but subtasks read open; claims 102 entries (81+14+7), jsonc now 108 (33 nvidia + 15 opencode + 7 freeepi + 5 antseed + rest). fix: refresh count + date or reopen.
+- `TODO.md:149` — lane cap 5→6; `config.go:366` + `zenlanes.go:389` default 25. fix: update or close.
+- `TODO.md:203` — cooldown-skip bullet under item 11 (fetch 502) belongs to item 10. fix: move.
+- `TODO.md:208,276` — hardcoded `main.go:4453`, `config.go:387`, `main.go:3388` with no rev, already drifted. fix: symbol names or drop numbers.
+- `FREEBUFF-PLAN.md:30` vs `FREEBUFF-DOCS.md:103` — turn lifecycle forwards model+metadata only, but turns need runId/server-UUID/Buffy opening/`cost_mode:free` or 403. fix: add gate recipe.
+- `FREEBUFF-DOCS.md:113` vs plan/todo — acc2 suspended, doc bans live tests, plan still schedules sweeps/streaming with no legitimacy design. fix: halt phases B-D until documented.
+- `FREEBUFF-PLAN.md:69` — order 7,8b,8; no `show_freebuff` flag though required. fix: renumber + flag.
 - `FREEBUFF-TODO.md:19` — B7 names `main_test.go`; repo uses per-area files. fix: name real target.
-- `FREEBUFF-MODEL-TABLE.md:1` — price `?`/`entitle`/`0`/`10/15pk`, no rev pin for 2026-09-28 source. fix: legend + revision.
-- `FREEPI-DOCS.md:5` — stray README disclosure quote in research note. fix: delete line.
-- `FREEPI-DOCS.md:90-107` — fingerprint/chat/ads/version guidance duplicated, ethics buried in second copy. fix: dedupe to one block.
-- `FREEPI-DOCS.md:1` — no privacy section, unlike FREEBUFF-DOCS. fix: document prompt/ads/meter exfil.
-- `FREEPI-DOCS.md:12,64` — says catalog not live-tested, then presents live 2026-10-03 bench. fix: clarify catalog vs probed.
-- `ANTSEED-DOCS.md:3` — file:line refs into unpinned clone. fix: pin SHA, move Go subset (:505) to top.
-- `FREEBUFF-PLAN.md:59`, `FREEBUFF-TODO.md:21` — reference `scripts/cctest.py`; `.gitignore:41` ignores it so fresh clones lack it. fix: track script or reference committed harness.
-- `TODO.md:208,276` — hardcoded `main.go:4453`, `config.go:387`, `main.go:3388` no revision, already drifted. fix: symbol names or drop numbers.
+- `FREEBUFF-PLAN.md:59` + `FREEBUFF-TODO.md:21` — ref `scripts/cctest.py`; `.gitignore:41` ignores it, fresh clones lack it. fix: track or ref committed harness.
+- `FREEPI-DOCS.md:90-107` — fingerprint/chat/ads/version guidance duplicated, ethics buried in second copy. fix: dedupe.
+- `FREEPI-DOCS.md:1` — no privacy section unlike FREEBUFF-DOCS. fix: document prompt/ads/meter exfil.
+- `FREEPI-DOCS.md:12,64` — catalog not live-tested vs live 2026-10-03 bench. fix: clarify catalog vs probed.
+- `ANTSEED-DOCS.md:3` — file:line refs into unpinned clone. fix: pin SHA.
 
 ## low
 
-- `main.go:4404` — key probe uses `rand.Intn` (`math/rand`) for key choice; sampling-only so acceptable, but unseeded-source confusion recurs (go ≥1.20 auto-seeds, `go.mod` says 1.26). fix: comment that math/rand is sampling-only here.
-- `usage.go:126`, `main.go:749,757` — usage/access logs open 0644; contain model + key *names* (not secrets), still world-readable. fix: 0640 or document.
-- `live_test.go:173`, `todo_small_test.go:617,637` — uncapped `io.ReadAll` on test response bodies. test-only, but a large upstream body OOMs the test run. fix: cap with `io.LimitReader`.
-- `zenlanes.go:583` + `main.go:3215` — lanes key on raw `x-session-id` verbatim including empty string, so all headerless clients share one lane. known per AGENTS §7, but empty-header collapse is undocumented. fix: note it next to `laneFor`.
-- `.gitignore:16` — ignores only `nim-usage.jsonl` + legacy names; scratch `config.*.yml` + `nim-perf.jsonl` untracked (`CHANGED-SINCE-682b2eb.md:121`, `TODO.md:257`). fix: add patterns.
-- `NOTICE:3` — credits Rampart without model/code version. fix: pin HF revision + commit.
-- `config.yml.example:260` — freebuff only backend with inline privacy notes. fix: matching pointers for all four or one docs section.
-- `AGENTS.md:115` — lane modes list hdr/convo/shared, omits `lane_cache_key` (`config.go:135`). fix: add fourth mode.
+- `usage.go:126`, `main.go:749,757` — usage/access logs 0644; model + key names, not secrets, still world-readable. fix: 0640 or document.
+- `live_test.go:173`, `todo_small_test.go:657,677` — uncapped `io.ReadAll` on test bodies; large upstream OOMs test run. fix: `LimitReader`.
+- `main.go:4405`, `zenproxy.go:464-466`, `main.go:325`, `zenproxy.go:365` — `math/rand` for key/proxy sampling only, acceptable; go 1.26 auto-seeds. fix: comment sampling-only.
+- `.gitignore:16` — ignores `nim-usage.jsonl` + legacy names only; scratch `config.*.yml` + `nim-perf.jsonl` untracked. fix: add patterns.
+- `NOTICE:3` — Rampart credit without model/code version. fix: pin HF rev + commit.
+- `config.yml.example:260` — freebuff-only inline privacy notes. fix: pointers for all four or one docs section.
+- `AGENTS.md:115` — lane modes hdr/convo/shared, omits `lane_cache_key` (`config.go:135`). fix: add fourth mode.
+- `FREEBUFF-MODEL-TABLE.md:1` — price `?`/`entitle`/`0`, no rev pin. fix: legend + revision.
+- `FREEPI-DOCS.md:5` — stray README disclosure quote. fix: delete line.
 
-## verified clean (checked, no finding)
+## corrections to prior audit (muse-oct-7, verified wrong)
 
-- all other upstream `io.ReadAll` sites capped via `io.LimitReader` (`upstreamBodyLimit` 128MB, `bodyLimit` 10MB); `antseed.go:379` 32MB, `freepi.go:206` 1MB.
-- `zenHeaderForwarded` (`main.go:3662`) and NIM deny-list (`main.go:2980`) both drop auth/session/cookie; no credential forwarding found.
-- `redactProxyUserinfo` (`zenlanes.go:1219`) applied at every log/status call site grepped.
-- auth comparison uses `subtle.ConstantTimeCompare` (`config.go:841`).
-- `gofmt -l .` clean, `go vet ./...` clean.
-- scan-cache sweep exists (`pii.go:208`, called `zenlanes.go:1185`) and scan/vault TTLs are separate per comments.
-- only two `panic` sites, both flagged above; no TODO/FIXME/XXX in non-test code.
+- presence-check gap (`config.go:452`): not a bug. `loadConfigFile` starts from `defaultConfig()` (all show_* true) and `yaml.Unmarshal` leaves absent keys alone, so explicit `false` survives. checks are redundant, not lossy.
+- empty-header lane collapse (`zenlanes.go:583`): not a bug. empty `headerSession` falls through to pck/convo/shared spread (`:584-632`), never a single collapsed lane.
+- `live_test.go` network use: by design (e2e minus network hop), sleeps are short/fixed-count, acceptable.
+
+## verified clean
+
+- all prod upstream `io.ReadAll` capped (`upstreamBodyLimit` 128MB, `bodyLimit` 10MB, `antseed.go:379` 32MB, `freepi.go:213` 1MB); only uncapped prod read is `captureRequest` (flagged).
+- `zenHeaderForwarded` (`main.go:3663`) + NIM deny-list (`:2981`) drop auth/session/cookie; no cred forwarding outside `ZEN_PASSTHROUGH` (flagged).
+- `redactProxyUserinfo` (`zenlanes.go:1219`) at every log/status site grepped.
+- auth compare `subtle.ConstantTimeCompare` (`config.go:841`); session-id ids (`zenID`/`randHex`/`randBase62`) use `crypto/rand`.
+- scan-cache sweep exists (`pii.go:208`, called `zenlanes.go:1185`), scan/vault TTLs separate.
+- only two prod `panic` sites, both flagged; `zen_schema_test.go:30` panic is test-only.
+- `pii` guard/vault registries bounded (`maxGuards`/`maxVaults` 512, LRU); scan cache bounded 2048 + idle sweep.
 
 ## files covered
 
-all root `*.go` (anthropic, antseed, antseedp2p, config, freepi, main, modelinfo, piiwiring, rtk, rtkcompress, rtkdetect, usage, zenlanes, zenproxy + all `*_test.go`), all `pii/*.go`, `scripts/*.py`, `nimstatus.py`, `nim`, `model_info.jsonc`, `guardrails.json`, `config.yml.example`, `go.mod/go.sum`, `deploy/*`, `.github/workflows/build.yml`, README.md, AGENTS.md, PLAN.md, TODO.md, ANTSEED-PLAN.md, ANTSEED-TODO.md, ANTSEED-DOCS.md, FREEBUFF-PLAN.md, FREEBUFF-TODO.md, FREEBUFF-DOCS.md, FREEBUFF-MODEL-TABLE.md, FREEPI-DOCS.md, CHANGED-SINCE-682b2eb.md, LICENSE, NOTICE, .gitignore.
+all root `*.go` (main, config, anthropic, zenproxy, zenlanes, freepi, antseed, antseedp2p, modelinfo, usage, piiwiring, rtk, rtkcompress, rtkdetect + all `*_test.go`: main, todo_small, audit_fixes, fidelity, fuzz, lane_tokens, live, regress_stream_nudge, stream_cancel, usage, zen_schema, antseed), all `pii/*.go` (pii, detect, vault, scan, span, custom, fake, wordpiece, ner_ort, ner_stub + tests + `fetch_model.sh`), `scripts/*.py` (antseed_test, cctest, freebuff_client, freebuff_login, freepi_login, freepi_probe, opencode_prompt, probe_zen_proxies), `nimstatus.py`, `nim`, `model_info.jsonc`, `guardrails.json`, `config.yml.example`, `go.mod/go.sum`, `deploy/*`, `.github/workflows/build.yml`, README.md, AGENTS.md, PLAN.md, TODO.md, ANTSEED-PLAN/TODO/DOCS, FREEBUFF-PLAN/TODO/DOCS/MODEL-TABLE, FREEPI-DOCS, CHANGED-SINCE-682b2eb.md, LICENSE, NOTICE, .gitignore.
 
 ## gaps (not reviewed)
 
-- `testdata/`, `pii/testdata/vocab.txt` contents (treated as fixtures).
-- `leaked-system-prompts/`, `system-prompts/`, `system_prompts_leaks/` corpora — data dirs, out of scope for a code audit.
-- behavior under `-tags ner` build (`go build -tags ner` not run; only default `go vet`).
-- live e2e against :5419 (primary instance untouched per AGENTS §2).
+- `testdata/`, `pii/testdata/vocab.txt` contents (fixtures).
+- `leaked-system-prompts/`, `system-prompts/`, `system_prompts_leaks/` corpora (data dirs).
+- `-tags ner` build (`go build -tags ner` not run).
+- live e2e against :5419 (primary untouched per AGENTS §2).

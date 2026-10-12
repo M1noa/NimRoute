@@ -1,7 +1,9 @@
 package main
 
 import (
+	"io"
 	"net/http"
+	"strings"
 
 	"nimroute/pii"
 )
@@ -42,9 +44,11 @@ func piiSessionID(r *http.Request) string {
 	}
 	var got string
 	if h := r.Header.Get("Authorization"); h != "" {
-		got = h
+		// strip the scheme: "Bearer X" and "X" are one client, one vault.
+		got = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(h), "Bearer "))
+		got = strings.TrimSpace(strings.TrimPrefix(got, "bearer "))
 	} else {
-		got = r.Header.Get("x-api-key")
+		got = strings.TrimSpace(r.Header.Get("x-api-key"))
 	}
 	if got == "" {
 		return "sess:default"
@@ -67,24 +71,30 @@ func piiConfigWithEnabled() pii.Config {
 type piiWriter struct {
 	w http.ResponseWriter
 	r *pii.Revealer
-	g *pii.Guard
 }
 
 func wrapPII(w http.ResponseWriter, g *pii.Guard) *piiWriter {
 	if g == nil {
 		return nil
 	}
-	return &piiWriter{w: w, r: g.NewRevealer(), g: g}
+	return &piiWriter{w: w, r: g.NewRevealer()}
 }
 
 func (d *piiWriter) Header() http.Header { return d.w.Header() }
 func (d *piiWriter) WriteHeader(s int)   { d.w.WriteHeader(s) }
 
 func (d *piiWriter) Write(b []byte) (int, error) {
+	// all of b is consumed (Push buffers the held-back suffix
+	// internally). a downstream short write without error is a broken
+	// writer: surface it as an error instead of lying about the count.
 	out := d.r.Push(b)
 	if len(out) > 0 {
-		if _, err := d.w.Write(out); err != nil {
+		wrote, err := d.w.Write(out)
+		if err != nil {
 			return 0, err
+		}
+		if wrote != len(out) {
+			return 0, io.ErrShortWrite
 		}
 	}
 	return len(b), nil

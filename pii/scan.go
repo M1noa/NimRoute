@@ -1,14 +1,15 @@
 package pii
 
 import (
-	"bytes"
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // scanner: paragraph-chunked detection with an lru span cache, scope-limited
@@ -45,6 +46,29 @@ func cacheKey(text, ver string) string {
 	h.Write([]byte{0})
 	h.Write([]byte(text))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// regexSample is the fixed synthetic text for the startup benchmark:
+// pii-dense prose repeated past 1KB so us/KB is stable across runs.
+var regexSample = strings.Repeat("contact alex rivera at alex@example.com ssn 472-81-0094 ip 10.0.0.1 card 4111 1111 1111 1111 url https://example.com/x. ", 16)
+
+// RegexUSPerKB runs the heuristic detectors over the sample 3 times and
+// returns microseconds per KB (median). call once at startup, never per
+// request: it costs ~milliseconds.
+func RegexUSPerKB() float64 {
+	const runs = 3
+	ds := make([]time.Duration, 0, runs)
+	for i := 0; i < runs; i++ {
+		start := time.Now()
+		detectHeuristics(regexSample)
+		ds = append(ds, time.Since(start))
+	}
+	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+	kb := float64(len(regexSample)) / 1024
+	if kb == 0 {
+		return 0
+	}
+	return float64(ds[len(ds)/2].Microseconds()) / kb
 }
 
 func (c *ScanCache) get(key string) ([]Span, bool) {
@@ -109,7 +133,6 @@ type Scanner struct {
 	Cache     *ScanCache
 	Keep      map[Label]bool
 	Ver       string
-	Timeout   int // reserved for ner timeout ms
 	// Replacements maps lowercased entity spellings to a fixed
 	// surrogate, bypassing the vault when set.
 	Replacements map[string]string
@@ -123,17 +146,39 @@ func (s *Scanner) surrogateFor(orig string) string {
 	return s.Replacements[strings.ToLower(strings.TrimSpace(orig))]
 }
 
-func splitParagraphs(s string) []string {
-	return strings.Split(s, "\n\n")
+// splitParagraphs splits on blank lines, recording each paragraph's raw
+// offset and its separator's real length (\r\n and 3+ newline runs broke
+// the old fixed +2 stride, misaligning every later span).
+func splitParagraphs(s string) (paras []string, bases []int) {
+	base := 0
+	for len(s) > 0 {
+		i := strings.Index(s, "\n\n")
+		if i < 0 {
+			paras = append(paras, s)
+			bases = append(bases, base)
+			break
+		}
+		// extend over \r and extra newlines: the separator is the full
+		// blank run starting at i.
+		j := i
+		for j < len(s) && (s[j] == '\n' || s[j] == '\r') {
+			j++
+		}
+		paras = append(paras, s[:i])
+		bases = append(bases, base)
+		base += j
+		s = s[j:]
+	}
+	return paras, bases
 }
 
 // detect runs detectors per paragraph with cache; offsets shifted back.
 func (s *Scanner) detect(text string) []Span {
 	var out []Span
-	base := 0
-	for _, para := range splitParagraphs(text) {
+	paras, bases := splitParagraphs(text)
+	for pi, para := range paras {
+		base := bases[pi]
 		if strings.TrimSpace(para) == "" {
-			base += len(para) + 2
 			continue
 		}
 		key := cacheKey(para, s.Ver)
@@ -150,7 +195,6 @@ func (s *Scanner) detect(text string) []Span {
 			sp.Text = text[sp.Start:sp.End]
 			out = append(out, sp)
 		}
-		base += len(para) + 2
 	}
 	return out
 }
@@ -168,30 +212,69 @@ func (s *Scanner) maskText(text string, v *Vault) string {
 	return text
 }
 
-// restoreText swaps surrogates back, longest first. esc form handles json.
+// restoreText swaps surrogates back, longest first. replacements happen
+// only on word boundaries: a model that independently writes "Marcus" in
+// an unrelated answer must not receive another user's original name.
+// esc form handles json string values.
 func restoreText(text string, v *Vault) string {
-	for _, surr := range longestFirst(v.Surrogates()) {
+	ss := v.Surrogates()
+	sort.Slice(ss, func(i, j int) bool { return len(ss[i]) > len(ss[j]) })
+	for _, surr := range ss {
 		orig, ok := v.Lookup(surr)
 		if !ok {
 			continue
 		}
 		if strings.Contains(text, surr) {
-			text = strings.ReplaceAll(text, surr, orig)
+			text = replaceBounded(text, surr, orig)
 		}
 		je, jo := jsonEscape(surr), jsonEscape(orig)
 		if je != surr && strings.Contains(text, je) {
-			text = strings.ReplaceAll(text, je, jo)
+			text = replaceBounded(text, je, jo)
 		}
 	}
 	return text
 }
 
-func longestFirst(ss []string) []string {
-	for i := 1; i < len(ss); i++ {
-		for j := i; j > 0 && len(ss[j]) > len(ss[j-1]); j-- {
-			ss[j], ss[j-1] = ss[j-1], ss[j]
-		}
+// replaceBounded replaces needle with repl only where both sides sit on a
+// non-word boundary (start/end of text or a non [A-Za-z0-9_] byte).
+// surrogate shapes with word chars inside still match whole.
+func replaceBounded(text, needle, repl string) string {
+	if needle == "" {
+		return text
 	}
+	var b strings.Builder
+	b.Grow(len(text))
+	i := 0
+	for {
+		j := strings.Index(text[i:], needle)
+		if j < 0 {
+			b.WriteString(text[i:])
+			break
+		}
+		j += i
+		if wordCharAt(text, j-1) || wordCharAt(text, j+len(needle)) {
+			b.WriteString(text[i : j+len(needle)])
+			i = j + len(needle)
+			continue
+		}
+		b.WriteString(text[i:j])
+		b.WriteString(repl)
+		i = j + len(needle)
+	}
+	return b.String()
+}
+
+func wordCharAt(s string, i int) bool {
+	if i < 0 || i >= len(s) {
+		return false
+	}
+	c := s[i]
+	return c == '_' || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
+}
+
+// longestFirst orders surrogates longest first (kept for tests callers).
+func longestFirst(ss []string) []string {
+	sort.Slice(ss, func(i, j int) bool { return len(ss[i]) > len(ss[j]) })
 	return ss
 }
 
@@ -212,7 +295,6 @@ func (s *Scanner) maskBody(body []byte, v *Vault, includeSystem bool) []byte {
 	zones := noScanZones(text, includeSystem)
 	spans := s.detectZoned(text, zones)
 	spans = applyPolicy(spans, s.Keep)
-	model, _ := topModel(text)
 	for _, sp := range spans {
 		orig := text[sp.Start:sp.End]
 		surr := s.surrogateFor(orig)
@@ -224,65 +306,41 @@ func (s *Scanner) maskBody(body []byte, v *Vault, includeSystem bool) []byte {
 		// spans are right-to-left so earlier offsets stay valid.
 		_ = zones
 	}
-	if model != "" && !strings.Contains(text, `"`+model+`"`) {
-		text = restoreTopModel(text, model)
-	}
 	return []byte(text)
 }
 
-// topModel reads the top-level model id for post-mask restore.
-func topModel(text string) (string, bool) {
-	var m map[string]any
-	if json.Unmarshal([]byte(text), &m) != nil {
-		return "", false
-	}
-	md, ok := m["model"].(string)
-	return md, ok
-}
-
-func restoreTopModel(text, model string) string {
-	var m map[string]any
-	if json.Unmarshal([]byte(text), &m) != nil {
-		return text
-	}
-	if _, ok := m["model"]; ok {
-		m["model"] = model
-		if b, err := json.Marshal(m); err == nil {
-			// key order may shift here, but only when a mask actually
-			// hit the model id; the common path returns bytes untouched.
-			return string(b)
-		}
-	}
-	return text
-}
-
 // noScanZones returns byte ranges to exclude: image/base64 blobs always,
-// system content unless includeSystem. implemented as offset ranges over
-// the raw text by locating string values under image keys and system roles.
+// system content unless includeSystem, plus the top-level model id (so a
+// detector hit there can't trigger a full-body remarshal). only the FIRST
+// occurrence of each skip string is zoned: it sits at its structural
+// position, while identical user text later in the body stays scannable.
+// residual: a user string placed before its system twin still zones wrong;
+// the common layout (system first) is correct.
 func noScanZones(text string, includeSystem bool) [][2]int {
 	var m map[string]any
 	if json.Unmarshal([]byte(text), &m) != nil {
 		return nil
 	}
 	var zones [][2]int
-	// find base64-ish long token values and system strings by re-scanning
-	// the raw text for their exact value occurrences.
+	zoneFirst := func(s string) {
+		if s == "" {
+			return
+		}
+		if i := strings.Index(text, s); i >= 0 {
+			zones = append(zones, [2]int{i, i + len(s)})
+		}
+	}
+	if md, ok := m["model"].(string); ok {
+		zoneFirst(`"model":"` + md + `"`)
+		zoneFirst(`"model": "` + md + `"`)
+	}
 	var strs []string
 	collectSkips(m, includeSystem, &strs)
 	for _, s := range strs {
 		if len(s) < 24 {
 			continue
 		}
-		start := 0
-		for {
-			i := strings.Index(text[start:], s)
-			if i < 0 {
-				break
-			}
-			st := start + i
-			zones = append(zones, [2]int{st, st + len(s)})
-			start = st + len(s)
-		}
+		zoneFirst(s)
 	}
 	return zones
 }
@@ -362,10 +420,10 @@ func (s *Scanner) detectZoned(text string, zones [][2]int) []Span {
 		return false
 	}
 	var out []Span
-	base := 0
-	for _, para := range splitParagraphs(text) {
+	paras, bases := splitParagraphs(text)
+	for pi, para := range paras {
+		base := bases[pi]
 		if strings.TrimSpace(para) == "" {
-			base += len(para) + 2
 			continue
 		}
 		// shift paragraph-local zone bounds
@@ -404,7 +462,6 @@ func (s *Scanner) detectZoned(text string, zones [][2]int) []Span {
 			sp.Text = text[sp.Start:sp.End]
 			out = append(out, sp)
 		}
-		base += len(para) + 2
 	}
 	return out
 }
@@ -446,6 +503,12 @@ func (r *Revealer) Push(chunk []byte) []byte {
 	if r.v == nil {
 		return chunk
 	}
+	// the vault grows mid-stream (uniquify "~n" lengthens surrogates): a
+	// snapshot max from NewRevealer would split later restores. refresh
+	// cheaply: MaxSurrogateLen skips expired entries already.
+	if m := r.v.MaxSurrogateLen() + 8; m > r.max {
+		r.max = m
+	}
 	data := append(append([]byte(nil), r.buf...), chunk...)
 	if len(data) <= r.max {
 		r.buf = data
@@ -453,6 +516,17 @@ func (r *Revealer) Push(chunk []byte) []byte {
 	}
 	cut := len(data) - r.max
 	cut = unsplit(data, cut, r.v)
+	// never cut mid-rune or mid-escape: chunk prefixes are arbitrary and
+	// the json guard in restoreBody only covers whole bodies.
+	for cut > 0 && cut < len(data) && !utf8.RuneStart(data[cut]) {
+		cut--
+	}
+	if cut > 0 && data[cut-1] == '\\' {
+		cut--
+		for cut > 0 && cut < len(data) && !utf8.RuneStart(data[cut]) {
+			cut--
+		}
+	}
 	out := restoreBody(data[:cut], r.v)
 	r.buf = append([]byte(nil), data[cut:]...)
 	return out
@@ -468,22 +542,29 @@ func (r *Revealer) Flush() []byte {
 }
 
 func unsplit(data []byte, cut int, v *Vault) int {
+	// prefix set of all surrogates: a split match ending at cut means
+	// data[cut-l:cut] is a proper prefix of some surrogate. set lookup
+	// per l replaces the old O(surrogates x cut) scan.
+	prefixes := map[string]bool{}
+	maxL := 0
+	for _, surr := range v.Surrogates() {
+		for l := 1; l < len(surr); l++ {
+			prefixes[surr[:l]] = true
+		}
+		if len(surr)-1 > maxL {
+			maxL = len(surr) - 1
+		}
+	}
 	for {
 		moved := false
-		for _, surr := range v.Surrogates() {
-			mb := []byte(surr)
-			maxL := len(mb) - 1
-			if maxL > cut {
-				maxL = cut
-			}
-			for l := maxL; l > 0; l-- {
-				if bytes.HasSuffix(data[:cut], mb[:l]) {
-					cut -= l
-					moved = true
-					break
-				}
-			}
-			if moved {
+		top := maxL
+		if top > cut {
+			top = cut
+		}
+		for l := top; l > 0; l-- {
+			if prefixes[string(data[cut-l:cut])] {
+				cut -= l
+				moved = true
 				break
 			}
 		}

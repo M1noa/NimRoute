@@ -16,12 +16,12 @@ func TestLaneTokensAccumulatePerModel(t *testing.T) {
 	l := laneFor("tok-1", body)
 
 	laneTouch(l, "http://10.0.0.1:1", "space-bunny-free")
-	laneTokensAdd(l, "space-bunny-free", 100, 50, 150)
+	laneTokensAdd(l, "space-bunny-free", 100, 50, 150, 0)
 	laneTouch(l, "http://10.0.0.1:1", "space-bunny-free")
-	laneTokensAdd(l, "space-bunny-free", 20, 10, 30)
+	laneTokensAdd(l, "space-bunny-free", 20, 10, 30, 0)
 	// a second model on the same lane must not merge into the first
 	laneTouch(l, "http://10.0.0.1:1", "big-pickle")
-	laneTokensAdd(l, "big-pickle", 7, 3, 10)
+	laneTokensAdd(l, "big-pickle", 7, 3, 10, 0)
 
 	// rotation: new session, same lane object, totals must persist
 	before := laneSession(l)
@@ -29,7 +29,7 @@ func TestLaneTokensAccumulatePerModel(t *testing.T) {
 	if laneSession(l) == before {
 		t.Fatal("rotate must mint a new session")
 	}
-	laneTokensAdd(l, "space-bunny-free", 1, 1, 2)
+	laneTokensAdd(l, "space-bunny-free", 1, 1, 2, 0)
 
 	snap := laneSnapshot()
 	if len(snap) != 1 {
@@ -59,7 +59,7 @@ func TestLaneTokensTotalFallsBack(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	l := laneFor("tok-2", []byte(`{"messages":[{"role":"user","content":"x"}]}`))
-	laneTokensAdd(l, "m", 30, 12, 0)
+	laneTokensAdd(l, "m", 30, 12, 0, 0)
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	if got := l.tokens["m"].Total; got != 42 {
@@ -73,9 +73,9 @@ func TestLaneTokensIgnoresEmptyTurn(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	l := laneFor("tok-3", []byte(`{"messages":[{"role":"user","content":"y"}]}`))
-	laneTokensAdd(l, "m", 0, 0, 0)
-	laneTokensAdd(nil, "m", 5, 5, 10) // nil lane must not panic
-	laneTokensAdd(l, "", 5, 5, 10)    // no model must not record
+	laneTokensAdd(l, "m", 0, 0, 0, 0)
+	laneTokensAdd(nil, "m", 5, 5, 10, 0) // nil lane must not panic
+	laneTokensAdd(l, "", 5, 5, 10, 0)    // no model must not record
 	lanesMu.Lock()
 	defer lanesMu.Unlock()
 	m := l.tokens["m"]

@@ -77,48 +77,122 @@ func NewCustomDetector(terms []string, entities []CustomTerm, threshold float64)
 	}
 }
 
+// fuzzyWorkBudget caps lines x spellings per detect call: the pass is
+// quadratic-ish per window and unbounded entities x multi-MB bodies burn
+// seconds of cpu on the request path. prefilter lines cheaply first.
+const fuzzyWorkBudget = 200000
+
 func (d *customDetector) detect(text string) []Span {
 	var out []Span
+	// exact pass, case-insensitive with case-preserving restore: "Minoa"
+	// must not bypass entity "minoa". offsets walk forward per spelling,
+	// so duplicate lines anchor to their own occurrence, not the first.
+	lower := strings.ToLower(text)
 	for _, sp := range d.spellings {
+		lsp := strings.ToLower(sp)
 		start := 0
 		for {
-			i := strings.Index(text[start:], sp)
+			i := strings.Index(lower[start:], lsp)
 			if i < 0 {
 				break
 			}
 			st := start + i
-			out = append(out, Span{st, st + len(sp), LCustom, 1, d.source, sp})
+			out = append(out, Span{st, st + len(sp), LCustom, 1, d.source, text[st : st+len(sp)]})
 			start = st + len(sp)
 		}
 	}
-	// fuzzy pass per line for near-miss spellings. lines past the cap
-	// skip it: fuzzFind is quadratic-ish per window and a 10MB single
-	// line would burn seconds of cpu per request.
-	for _, line := range strings.Split(text, "\n") {
-		if len(line) > 4096 {
+	// fuzzy pass per line for near-miss spellings. long lines run on
+	// chunked windows instead of skipping (a single-line 10MB json would
+	// otherwise bypass fuzzy entirely).
+	budget := fuzzyWorkBudget
+	base := 0
+	for _, line := range strings.SplitAfter(text, "\n") {
+		llen := len(line)
+		if strings.TrimSpace(line) == "" {
+			base += llen
 			continue
 		}
 		for _, sp := range d.spellings {
-			if !fuzzyEligible("", sp) {
+			if budget <= 0 {
+				break
+			}
+			budget -= llen
+			if !fuzzyEligible(d.entityType(sp), sp) {
 				continue
 			}
-			hit := fuzzFind(line, sp, d.threshold)
-			if hit == "" {
+			// cheap prefilter: skip lines sharing no trigram-ish signal.
+			if !linePrefilter(line, sp) {
 				continue
 			}
-			i := strings.Index(line, hit)
-			if i < 0 {
-				continue
+			for off := 0; off < llen; off += 4096 {
+				end := off + 4096
+				if end > llen {
+					end = llen
+				}
+				hit := fuzzFind(line[off:end], sp, d.threshold)
+				if hit == "" {
+					continue
+				}
+				i := strings.Index(line[off:end], hit)
+				if i < 0 {
+					continue
+				}
+				st := base + off + i
+				out = append(out, Span{st, st + len(hit), LCustom, 0.9, d.source, hit})
+				break
 			}
-			// anchor to full-text offset of this line occurrence.
-			base := strings.Index(text, line)
-			if base < 0 {
-				continue
-			}
-			out = append(out, Span{base + i, base + i + len(hit), LCustom, 0.9, d.source, hit})
 		}
+		if budget <= 0 {
+			break
+		}
+		base += llen
 	}
 	return out
+}
+
+// entityType recovers the spelling's entity type for fuzzy eligibility.
+// spellings are stored flat, so phone/email spellings get their stricter
+// bar via a digits/@ sniff instead of the name default.
+func (d *customDetector) entityType(sp string) string {
+	digits := 0
+	for i := 0; i < len(sp); i++ {
+		if sp[i] >= '0' && sp[i] <= '9' {
+			digits++
+		}
+	}
+	if strings.Contains(sp, "@") {
+		return "email"
+	}
+	if digits >= 6 {
+		return "phone"
+	}
+	return "name"
+}
+
+// linePrefilter is a cheap gate before the quadratic fuzzy pass: the line
+// must contain the spelling's first and last rune (case-insensitive), or
+// share at least half its distinct letters.
+func linePrefilter(line, sp string) bool {
+	ll := strings.ToLower(line)
+	ls := strings.ToLower(sp)
+	if len(ls) == 0 {
+		return false
+	}
+	rs := []rune(ls)
+	if !strings.ContainsRune(ll, rs[0]) || !strings.ContainsRune(ll, rs[len(rs)-1]) {
+		return false
+	}
+	seen := map[rune]bool{}
+	hit := 0
+	for _, r := range rs {
+		if !seen[r] {
+			seen[r] = true
+			if strings.ContainsRune(ll, r) {
+				hit++
+			}
+		}
+	}
+	return hit*2 >= len(seen)
 }
 
 func fuzzFind(s, variation string, threshold float64) string {

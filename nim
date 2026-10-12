@@ -5,6 +5,7 @@ PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$PROXY_DIR/nimroute.log"
 BINARY="$PROXY_DIR/nimroute"
 SVC="com.user.nimroute"
+PIDFILE="$PROXY_DIR/.nimroute.pid"
 PLIST="$HOME/Library/LaunchAgents/$SVC.plist"
 SYSTEMD="$HOME/.config/systemd/user/nimroute.service"
 OS="$(uname -s 2>/dev/null)"
@@ -26,7 +27,7 @@ svc_running() {
   case "$SVC_CMD" in
     launchd) launchctl list "$SVC" 2>/dev/null | grep '"PID"' | grep -qv '= 0' ;;
     systemd) systemctl --user is-active -q nimroute 2>/dev/null ;;
-    nohup)   [ -f /tmp/nimroute.pid ] && kill -0 "$(cat /tmp/nimroute.pid)" 2>/dev/null ;;
+    nohup)   [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null ;;
   esac
 }
 
@@ -49,7 +50,7 @@ svc_start() {
       systemctl --user daemon-reload && systemctl --user enable --now nimroute ;;
     nohup)
       cd "$PROXY_DIR" && nohup "$BINARY" >>"$LOGFILE" 2>&1 &
-      echo $! > /tmp/nimroute.pid ;;
+      (umask 077; echo $! > "$PIDFILE") ;;
   esac
 }
 
@@ -60,11 +61,16 @@ svc_stop() {
       # com.user.nvidia-nim-proxy, current as com.user.nimroute.
       launchctl bootout "gui/$(id -u)/$SVC" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
       launchctl bootout "gui/$(id -u)/com.user.nvidia-nim-proxy" 2>/dev/null
-      pkill -f "nim-proxy$" 2>/dev/null
-      pkill -f "nimroute$" 2>/dev/null
       ;;
     systemd) systemctl --user disable --now nimroute 2>/dev/null ;;
-    nohup)   [ -f /tmp/nimroute.pid ] && kill "$(cat /tmp/nimroute.pid)" 2>/dev/null; rm -f /tmp/nimroute.pid ;;
+    nohup)
+      if [ -f "$PIDFILE" ]; then
+        pid="$(cat "$PIDFILE")"
+        case "$pid" in ''|*[!0-9]*) ;;
+          *) kill "$pid" 2>/dev/null ;;
+        esac
+        rm -f "$PIDFILE"
+      fi ;;
   esac
 }
 
@@ -100,16 +106,16 @@ case "${1:-status}" in
     svc_start; sleep 2; pretty_status ;;
   stop)    svc_stop; echo "nimroute stopped" ;;
   restart) svc_stop; sleep 1; svc_start; sleep 2; pretty_status ;;
-  status)  pretty_status; [ "$2" = "tail" ] && status_tail ;;
+  status)  pretty_status; st=$?; if [ "${2:-}" = "tail" ]; then status_tail; else exit $st; fi ;;
   status-tail) status_tail ;;
   logs)    pretty_status; PY="$(find_py)" || PY=""; [ -n "$PY" ] && "$PY" "$PROXY_DIR/nimstatus.py" logs 10 || { [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last 10):"; tail -10 "$LOGFILE" | sed 's/^/    /'; }; } ;;
   log)
     case "$2" in
-      ""|tail|f) tail -f "$LOGFILE" ;;
-      [0-9]*) [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last $2):"; tail -n "$2" "$LOGFILE" | sed 's/^/    /'; } ;;
+      ""|tail|f) [ -f "$LOGFILE" ] && tail -f "$LOGFILE" || echo "no log yet ($LOGFILE)" ;;
+      [0-9]*) [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last $2):"; tail -n "$2" "$LOGFILE" | sed 's/^/    /'; } || echo "no log yet ($LOGFILE)" ;;
       *) echo "Usage: nim log [N|tail]"; exit 1 ;;
     esac ;;
-  tail)    tail -f "$LOGFILE" ;;
+  tail)    [ -f "$LOGFILE" ] && tail -f "$LOGFILE" || echo "no log yet ($LOGFILE)" ;;
   freepi)
     case "$2" in
       auth) PY="$(find_py)" || { echo "no python3"; exit 1; }; exec "$PY" "$PROXY_DIR/scripts/freepi_login.py" --into-config "$PROXY_DIR/config.yml" ;;

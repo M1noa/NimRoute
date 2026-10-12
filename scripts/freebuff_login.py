@@ -2,7 +2,7 @@
 # freebuff login helper. mints a login url, waits for the browser click,
 # verifies the token, writes it into config.yml (managed block at eof).
 # usage: python3 freebuff_login.py [--config config.yml] [--name acc1]
-import json, re, sys, time, uuid, urllib.request, urllib.parse
+import argparse, json, os, re, sys, tempfile, time, uuid, urllib.request, urllib.parse
 
 BASE = "https://freebuff.com"          # login host (real client uses this)
 API = "https://www.codebuff.com"       # session/chat/ads host
@@ -26,13 +26,11 @@ def api(method, url, body=None, token=None):
 
 
 def main():
-    cfg = "config.yml"
-    name = "acc1"
-    for i, a in enumerate(sys.argv[1:]):
-        if a == "--config":
-            cfg = sys.argv[i + 2]
-        elif a == "--name":
-            name = sys.argv[i + 2]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yml")
+    ap.add_argument("--name", default="acc1")
+    args = ap.parse_args()
+    cfg, name = args.config, args.name
 
     fp = uuid.uuid4().hex
     st, code = api("POST", BASE + "/api/auth/cli/code", {"fingerprintId": fp})
@@ -56,7 +54,11 @@ def main():
     assert st == 200 and "status" in sess, f"token verify failed: {st} {sess}"
     print(f"logged in as {user.get('email')} (session: {sess['status']})")
 
-    # merge into managed block in config.yml (stdlib only, no yaml dep)
+    # merge into managed block in config.yml (stdlib only, no yaml dep).
+    # single atomic write: the old append-then-rewrite duplicated the file
+    # every login. any pre-existing hand-written top-level freebuff: block
+    # is dropped first (a duplicate key breaks yaml uniqueKeys and used to
+    # trigger total config loss on restart).
     try:
         text = open(cfg).read()
     except FileNotFoundError:
@@ -67,14 +69,21 @@ def main():
         for nm, tk in re.findall(r'-\s*name:\s*"([^"]+)"\s*\n\s*token:\s*"([^"]+)"', m.group(1)):
             accts[nm] = tk
         text = text[:m.start()] + text[m.end():]
+    text = re.sub(r"(?m)^freebuff:\n(?:^[ \t]+.*\n?)+", "", text)
     accts[name] = tok
     lines = [BEGIN, "freebuff:", "  enabled: true", "  test_port: 5420",
              "  accounts:"] + \
         [f'    - name: "{n}"\n      token: "{t}"' for n, t in accts.items()] + \
         ["  show_ads: true", "  ad_rotation_sec: 60", "  session_poll_sec: 30",
          "  model_refresh_sec: 300", "  timeout_ms: 20000", END]
-    open(cfg, "a").write(text if text.endswith("\n") or not text else text + "\n")
-    open(cfg, "a").write("\n".join(lines) + "\n")
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n".join(lines) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(cfg)) or ".")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, cfg)
     print(f"saved account {name!r} to {cfg} (hot-reloaded, no restart)")
 
 

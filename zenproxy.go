@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -171,8 +172,10 @@ func refreshZenProxies() {
 		return
 	}
 	defer resp.Body.Close()
+	// cap the third-party body: a compromised list server must not feed
+	// unbounded allocation into the hourly refresh.
 	var list []proxyEntry
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&list); err != nil {
 		log.Printf("  zen proxies: decode failed: %v", err)
 		return
 	}
@@ -414,7 +417,7 @@ func probeProxyFull(proxyURL string, timeout time.Duration) bool {
 		c.Close()
 		return true
 	case "socks5":
-		c, err := socks5Dial(ctx, "tcp", "opencode.ai:443", pu.Host)
+		c, err := socks5Dial(ctx, "tcp", "opencode.ai:443", pu)
 		if err != nil {
 			return false
 		}
@@ -498,6 +501,13 @@ func applyVerifiedPool(verified []string) {
 	zenProxies = verified
 	left := len(verified)
 	zenProxiesMu.Unlock()
+	// transports, rtt and health for vanished exits die with the pool:
+	// all three only ever insert and would grow forever on hourly churn.
+	keep := map[string]bool{}
+	for _, v := range verified {
+		keep[v] = true
+	}
+	pruneDeadExits(keep)
 	log.Printf("  zen proxies: %d verified", left)
 }
 
@@ -516,13 +526,13 @@ func dropProxy(proxyURL string) {
 		if p == proxyURL {
 			if len(zenProxies) <= 1 {
 				zenProxiesMu.Unlock()
-				log.Printf("  zen proxies: keeping last exit %s (pool would drain)", proxyURL)
+				log.Printf("  zen proxies: keeping last exit %s (pool would drain)", redactProxyUserinfo(proxyURL))
 				return
 			}
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			found = true
 			zenPoolDropped++
-			log.Printf("  zen proxies: dropped %s (left %d)", proxyURL, len(zenProxies))
+			log.Printf("  zen proxies: dropped %s (left %d)", redactProxyUserinfo(proxyURL), len(zenProxies))
 			break
 		}
 	}
@@ -796,6 +806,20 @@ func logZenNetErr(retry int, model, proxy, tag string, err error) {
 		retry, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, err)
 }
 
+// exhausted429 synthesizes the retryable-exhausted response: JSON 503 +
+// Retry-After instead of the stale empty 429. the 429 branch closes the
+// upstream body before continuing, so without this the post-loop forward
+// re-reads a closed body and hands the client a bodyless 429 it gives up
+// on. 503 tells opencode to retry later.
+func exhausted429(model string, status int) *http.Response {
+	eb := []byte(`{"error":{"message":"opencode zen: all retries rate-limited (` + strconv.Itoa(status) + `), try again","type":"rate_limit_error"}}`)
+	h := make(http.Header)
+	h.Set("Content-Type", "application/json")
+	h.Set("Retry-After", "30")
+	acclog.Printf("!! opencode retryable-exhausted model=%s last=%d, synthesizing 503", model, status)
+	return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(eb)), Header: h}
+}
+
 // logZenBlocked logs a geo/user block with status, snippet, and the running
 // per-country block count. returns the count. proxy redacted like above.
 func logZenBlocked(kind string, retry, status int, model, proxy, tag string, body []byte) int {
@@ -866,7 +890,7 @@ func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, cancel := context.WithTimeout(ctx, 12*time.Second)
 			defer cancel()
-			return socks5Dial(c, network, addr, pu.Host)
+			return socks5Dial(c, network, addr, pu)
 		}
 	default:
 		tr.Proxy = http.ProxyURL(pu)
@@ -900,6 +924,34 @@ func closeZenTransport(proxyURL string) {
 		tr.CloseIdleConnections()
 	}
 	zenTransportMu.Unlock()
+}
+
+// pruneDeadExits drops transports, live-rtt samples and health entries for
+// exits no longer in the verified set. all three maps only insert;
+// without this the hourly refresh grows them forever.
+func pruneDeadExits(keep map[string]bool) {
+	zenTransportMu.Lock()
+	for u, tr := range zenTransports {
+		if !keep[u] {
+			delete(zenTransports, u)
+			tr.CloseIdleConnections()
+		}
+	}
+	zenTransportMu.Unlock()
+	zenLiveMu.Lock()
+	for u := range zenLive {
+		if !keep[u] {
+			delete(zenLive, u)
+		}
+	}
+	zenLiveMu.Unlock()
+	exitTrackMu.Lock()
+	for u := range exitTrack {
+		if !keep[u] {
+			delete(exitTrack, u)
+		}
+	}
+	exitTrackMu.Unlock()
 }
 
 // zenClient builds a client routing via proxyURL, or direct if ""/bad.
@@ -968,8 +1020,10 @@ func socks4Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 	return conn, nil
 }
 
-// socks5Dial connects to proxyAddr and requests a SOCKS5 (no-auth) CONNECT to addr.
-func socks5Dial(ctx context.Context, network, addr string, proxyAddr string) (net.Conn, error) {
+// socks5Dial connects via the proxy and requests a CONNECT to addr.
+// credentialed urls get RFC 1929 user/pass auth; bare urls stay no-auth.
+func socks5Dial(ctx context.Context, network, addr string, pu *url.URL) (net.Conn, error) {
+	proxyAddr := pu.Host
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -988,7 +1042,16 @@ func socks5Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 		defer conn.SetDeadline(time.Time{})
 	}
 
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+	var user, pass string
+	if pu.User != nil {
+		user = pu.User.Username()
+		pass, _ = pu.User.Password()
+	}
+	hello := []byte{0x05, 0x01, 0x00}
+	if user != "" {
+		hello = []byte{0x05, 0x02, 0x00, 0x02}
+	}
+	if _, err := conn.Write(hello); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -1000,6 +1063,35 @@ func socks5Dial(ctx context.Context, network, addr string, proxyAddr string) (ne
 	if resp[0] != 0x05 || resp[1] == 0xff {
 		conn.Close()
 		return nil, fmt.Errorf("socks5: no acceptable auth method")
+	}
+	// RFC 1929 username/password auth for credentialed proxy urls.
+	if resp[1] == 0x02 {
+		if user == "" {
+			conn.Close()
+			return nil, fmt.Errorf("socks5: proxy wants auth, url has no credentials")
+		}
+		var b bytes.Buffer
+		b.WriteByte(0x01)
+		b.WriteByte(byte(len(user)))
+		b.WriteString(user)
+		b.WriteByte(byte(len(pass)))
+		b.WriteString(pass)
+		if _, err := conn.Write(b.Bytes()); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		st := make([]byte, 2)
+		if _, err := io.ReadFull(conn, st); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if st[1] != 0x00 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5: auth failed")
+		}
+	} else if user != "" {
+		// credentials in url but proxy chose no-auth: proceed, the url
+		// may be shared across proxies with mixed auth.
 	}
 
 	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}

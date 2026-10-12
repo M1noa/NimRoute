@@ -1,4 +1,4 @@
-# freebuff model table (generated from repo source, 2026-09-28)
+# freebuff model table (generated from repo source, rev 2026-09-28; prices: `?` = unknown, `entitle` = entitlement-gated, `0` = free)
 wire id | display | premium | multimodal | base2 root | price/hr
 ---|---|---|---|---|---
 deepseek/deepseek-v4-pro | DeepSeek V4 Pro | true | false | base2-free-deepseek | ?

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -347,6 +349,15 @@ func TestConvoIdleExpiry(t *testing.T) {
 
 // lapsed burns are swept even when never re-read.
 func TestSweepBurns(t *testing.T) {
+	burnMu.Lock()
+	old := burned
+	burned = map[string]time.Time{}
+	burnMu.Unlock()
+	t.Cleanup(func() {
+		burnMu.Lock()
+		burned = old
+		burnMu.Unlock()
+	})
 	burnMu.Lock()
 	burned["x\x00m"] = time.Now().Add(-time.Minute)
 	burned["y\x00m"] = time.Now().Add(time.Hour)
@@ -746,7 +757,7 @@ func TestHedgedDoWinnerBodyReadable(t *testing.T) {
 	if err != nil || hedged {
 		t.Fatalf("primary send: %v hedged=%v", err, hedged)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	resp.Body.Close()
 	if err != nil {
 		t.Fatalf("winner body must stay readable after return: %v", err)
@@ -766,7 +777,7 @@ func TestHedgedDoWinnerBodyReadable(t *testing.T) {
 	if herr != nil || !hhedged {
 		t.Fatalf("hedge must win stalled primary: %v hedged=%v", herr, hhedged)
 	}
-	hbody, err := io.ReadAll(hresp.Body)
+	hbody, err := io.ReadAll(io.LimitReader(hresp.Body, 32<<20))
 	hresp.Body.Close()
 	if err != nil || !strings.Contains(string(hbody), "chunk-two") {
 		t.Fatalf("hedge winner body must stay readable: err=%v body=%q", err, string(hbody))
@@ -813,5 +824,393 @@ func TestConvertKeepsRequestEffort(t *testing.T) {
 	r, _ := m["reasoning"].(map[string]any)
 	if r["effort"] != "low" {
 		t.Fatalf("request effort overwritten: %v", m["reasoning"])
+	}
+}
+
+// every opencode/* id the live /models endpoint returns must have a
+// catalog entry; listed-but-unknown ids fall back to 131072 ctx.
+func TestZenModelIDsHaveModelInfo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"id":"big-pickle"},{"id":"muse-spark-1.3-contributor-free"},{"id":"no-such-model-free"}]}`)
+	}))
+	defer srv.Close()
+	// controlled catalog: known ids resolve, the fake one is reported.
+	setModelInfo(map[string]modelInfoEntry{
+		"opencode/big-pickle":                      {Ctx: 200000},
+		"opencode/muse-spark-1.3-contributor-free": {Ctx: 1048576},
+	})
+	t.Cleanup(func() { setModelInfo(loadModelInfo(modelInfoPath())) })
+	var listed []string
+	for _, m := range fetchZenModelIDsFrom(srv.URL) {
+		if !strings.HasSuffix(m, "-free") && m != "big-pickle" {
+			continue
+		}
+		listed = append(listed, "opencode/"+m)
+	}
+	miss := missingModelInfo(listed)
+	if len(miss) != 1 || miss[0] != "opencode/no-such-model-free" {
+		t.Fatalf("missing = %v, want [opencode/no-such-model-free]", miss)
+	}
+	if got := missingModelInfo(nil); len(got) != 0 {
+		t.Fatalf("empty in must give empty out, got %v", got)
+	}
+}
+
+// a 429 trip inside the cooldown window skips the refresh and resets the
+// counter; an old refresh fires. no network: poolRefreshDue is the
+// decision, noteRateLimit is only exercised for the counter.
+func TestPoolRefreshCooldown(t *testing.T) {
+	c := testConfig()
+	c.Zen.PoolRefresh429s = 4
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
+	if d := poolRefreshCooldown(); d != 120*time.Second {
+		t.Fatalf("cooldown = %v, want 120s", d)
+	}
+	c2 := testConfig()
+	c2.Zen.PoolRefreshCooldownSecs = -1
+	useConfig(t, c2)
+	if d := poolRefreshCooldown(); d != 0 {
+		t.Fatalf("negative must disable, got %v", d)
+	}
+
+	useConfig(t, c)
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	if poolRefreshDue() {
+		t.Fatal("fresh refresh must not be due inside the window")
+	}
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now().Add(-time.Hour)
+	zenProxiesMu.Unlock()
+	if !poolRefreshDue() {
+		t.Fatal("hour-old refresh must be due")
+	}
+
+	// counter resets on every trip: two trips of 4 with a fresh refresh
+	// in between must both skip, never accumulate into a fire.
+	resetPoolRefresh429s()
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	for i := 0; i < 4; i++ {
+		if noteRateLimit() {
+			t.Fatal("trip inside cooldown must skip, not fire")
+		}
+	}
+	poolRefresh429Mu.Lock()
+	left := poolRefresh429s
+	poolRefresh429Mu.Unlock()
+	if left != 0 {
+		t.Fatalf("counter = %d after trip, want reset to 0", left)
+	}
+}
+
+// flags parse in both orders around probe; unknown flags ignored.
+func TestParseFlags(t *testing.T) {
+	f, rest := parseFlags([]string{"--port", "5420", "probe", "--lanes=4"})
+	if f.port != 5420 || !f.set["port"] {
+		t.Fatalf("port not parsed: %+v", f)
+	}
+	if f.lanes != 4 || !f.set["lanes"] {
+		t.Fatalf("lanes not parsed: %+v", f)
+	}
+	if len(rest) != 1 || rest[0] != "probe" {
+		t.Fatalf("rest = %v, want [probe]", rest)
+	}
+	f2, rest2 := parseFlags([]string{"probe", "--config", "x.yml", "--debug"})
+	if f2.config != "x.yml" || !f2.set["config"] {
+		t.Fatalf("config not parsed: %+v", f2)
+	}
+	if !f2.debug || !f2.set["debug"] {
+		t.Fatalf("debug not parsed: %+v", f2)
+	}
+	if len(rest2) != 1 || rest2[0] != "probe" {
+		t.Fatalf("rest = %v, want [probe]", rest2)
+	}
+	// no flags: empty set, identical behavior.
+	f3, rest3 := parseFlags(nil)
+	if len(f3.set) != 0 || len(rest3) != 0 {
+		t.Fatalf("empty args must give empty flags/rest: %+v %v", f3, rest3)
+	}
+	f4, rest4 := parseFlags([]string{"--bogus", "probe"})
+	if len(f4.set) != 0 || len(rest4) != 1 {
+		t.Fatalf("unknown flags ignored: %+v %v", f4, rest4)
+	}
+}
+
+// --lanes caps the lane table, --debug flips verbosity.
+func TestFlagOverrides(t *testing.T) {
+	c := testConfig()
+	c.Zen.Lanes = 18
+	useConfig(t, c)
+	if laneCap() != 18 {
+		t.Fatalf("laneCap = %d, want 18", laneCap())
+	}
+	c2 := testConfig()
+	c2.Zen.Lanes = 4
+	useConfig(t, c2)
+	if laneCap() != 4 {
+		t.Fatalf("laneCap = %d, want 4 (--lanes override)", laneCap())
+	}
+	old := debugMode
+	debugMode = true
+	if !debugMode {
+		t.Fatal("debug must flip on")
+	}
+	debugMode = old
+}
+
+// transport error must move the lane off the dead exit: dropProxy +
+// laneReproxy (what both retry loops now do) leaves the pin on a live
+// exit instead of retrying the dead one 4 more times.
+func TestNetErrMovesLaneOffDeadExit(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	l := &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.1:1"}
+	lanesMu.Lock()
+	lanes["x"] = l
+	lanesMu.Unlock()
+	// the retry-loop net-error branch:
+	dropProxy("http://10.0.0.1:1")
+	laneReproxy(l, "")
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	if l.proxy == "http://10.0.0.1:1" {
+		t.Fatal("lane pin must leave the dropped exit, else all retries reuse it")
+	}
+	if l.proxy != "http://10.0.0.2:2" {
+		t.Fatalf("lane pin = %q, want the live spare", l.proxy)
+	}
+}
+
+// retryable-exhausted must never forward an empty body: synthesized JSON
+// 503 + Retry-After, never a bare 429.
+func TestExhausted429Synthesizes(t *testing.T) {
+	r := exhausted429("opencode/space-bunny-free", 429)
+	if r.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", r.StatusCode)
+	}
+	if r.Header.Get("Retry-After") == "" {
+		t.Fatal("Retry-After must be set")
+	}
+	rb, _ := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	r.Body.Close()
+	if len(bytes.TrimSpace(rb)) == 0 {
+		t.Fatal("body must be non-empty JSON")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rb, &m); err != nil {
+		t.Fatalf("body must be JSON: %v", err)
+	}
+}
+
+// 4x429 then 200 across attempts must reach the client as 200: rotation
+// keeps trying instead of handing back the first failure.
+func TestRetryLoopSurvives429s(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) <= 4 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"error":"rate limited"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	old := OpencodeBase
+	OpencodeBase = srv.URL
+	t.Cleanup(func() { OpencodeBase = old })
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.MaxRetries = 4
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+	p := newPool(nil)
+	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-13c")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200 after 4x429 then 200 (hits=%d): %s", rec.Code, hits.Load(), rec.Body.String())
+	}
+	if hits.Load() != 5 {
+		t.Fatalf("upstream hits = %d, want 5 (4x429 + 1x200)", hits.Load())
+	}
+}
+
+// overflow past cap under concurrency: 8 distinct hdr keys racing a full
+// table must spread (converting idle shared lanes), never pile onto one
+// fallback or exceed the cap.
+func TestOverflowSpreadsConcurrently(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 4
+	c.Zen.LaneHdr = boolPtr(true)
+	c.Zen.LaneShared = boolPtr(true)
+	useConfig(t, c)
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	ensureSharedLanes()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := map[*zenLane]bool{}
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			l := laneFor("overflow-"+string(rune('a'+i)), body)
+			mu.Lock()
+			seen[l] = true
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	lanesMu.Lock()
+	n := len(lanes)
+	lanesMu.Unlock()
+	if n > 4 {
+		t.Fatalf("table grew to %d lanes past cap 4", n)
+	}
+	if len(seen) < 2 {
+		t.Fatalf("8 distinct keys hit only %d lane(s), want spread", len(seen))
+	}
+}
+
+// --monitor flips the (row-less, item-12) monitor toggle on.
+func TestMonitorFlag(t *testing.T) {
+	f, _ := parseFlags([]string{"--monitor"})
+	if !f.monitor || !f.set["monitor"] {
+		t.Fatalf("--monitor not parsed: %+v", f)
+	}
+	c := testConfig()
+	if c.Monitor.Enabled {
+		t.Fatal("monitor must default off")
+	}
+	if c.Monitor.Path != "nim-perf.jsonl" || c.Monitor.IntervalMs != 1000 {
+		t.Fatalf("monitor defaults = %+v, want nim-perf.jsonl/1000", c.Monitor)
+	}
+}
+
+// --help parses without starting anything.
+func TestHelpFlag(t *testing.T) {
+	f, rest := parseFlags([]string{"--help"})
+	if !f.set["help"] {
+		t.Fatalf("--help not parsed: %+v", f)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("help must consume the flag: %v", rest)
+	}
+}
+
+// all-429 must reach the client as JSON 503 with a non-empty body and
+// Retry-After, never a bare 429.
+func TestRetryLoopAll429Synthesizes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer srv.Close()
+	old := OpencodeBase
+	OpencodeBase = srv.URL
+	t.Cleanup(func() { OpencodeBase = old })
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.MaxRetries = 2
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+	p := newPool(nil)
+	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-13all429")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(bytes.TrimSpace(rec.Body.Bytes())) == 0 {
+		t.Fatal("client body must be non-empty JSON")
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("Retry-After must pass through to the client")
+	}
+}
+
+// anthropic path, all-429: same synthesized 503 must reach the client.
+func TestAnthropicPathAll429Synthesizes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer srv.Close()
+	old := OpencodeBase
+	OpencodeBase = srv.URL
+	t.Cleanup(func() { OpencodeBase = old })
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.MaxRetries = 2
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+	p := newPool(nil)
+	orig := []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	oai := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCodeAnthropic(rec, r, orig, oai, "claude-haiku-4-5-20251001", "opencode/big-pickle", nil, false, time.Now(), "test-13aanth")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(bytes.TrimSpace(rec.Body.Bytes())) == 0 {
+		t.Fatal("client body must be non-empty JSON")
+	}
+}
+
+// fire stamps at trip time: a second trip during an in-flight refresh
+// must skip, not log a duplicate fire. zenRefreshMu held so the async
+// refresh collapses without network. retry the setup: a background
+// refresh completing between the stamp-set and the trip would (correctly)
+// make this trip skip.
+func TestRefreshFireStamps(t *testing.T) {
+	c := testConfig()
+	c.Zen.PoolRefresh429s = 1
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
+	resetPoolRefresh429s()
+	zenRefreshMu.Lock()
+	defer zenRefreshMu.Unlock()
+	fired := false
+	for i := 0; i < 3 && !fired; i++ {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = time.Now().Add(-time.Hour)
+		zenProxiesMu.Unlock()
+		fired = noteRateLimit()
+	}
+	if !fired {
+		t.Fatal("trip outside cooldown must fire")
+	}
+	zenProxiesMu.RLock()
+	ago := time.Since(zenPoolRefreshed)
+	zenProxiesMu.RUnlock()
+	if ago > time.Minute {
+		t.Fatalf("fire must stamp the refresh time, ago=%v", ago)
+	}
+	if noteRateLimit() {
+		t.Fatal("second trip during in-flight refresh must skip")
 	}
 }

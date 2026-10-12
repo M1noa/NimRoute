@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -57,13 +58,14 @@ var (
 	modelInfo   = map[string]modelInfoEntry{}
 )
 
-// stripJSONComments drops // line comments (values never contain them:
-// the file is machine-generated, one entry per line).
+// stripJSONComments drops full-line // comments. inline truncation is
+// wrong (values may contain //), so only lines whose first non-space
+// characters are // are dropped.
 func stripJSONComments(raw []byte) []byte {
 	var out []string
 	for _, l := range strings.Split(string(raw), "\n") {
-		if i := strings.Index(l, "//"); i >= 0 {
-			l = l[:i]
+		if strings.HasPrefix(strings.TrimSpace(l), "//") {
+			continue
 		}
 		if strings.TrimSpace(l) == "" {
 			continue
@@ -87,6 +89,22 @@ func loadModelInfo(path string) map[string]modelInfoEntry {
 	return m
 }
 
+// loadModelInfoKeep parses path, keeping the live catalog when the file is
+// present but broken: a truncated save must not wipe every model fact.
+// returns nil when there is nothing usable (caller keeps the old map).
+func loadModelInfoKeep(path string) map[string]modelInfoEntry {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]modelInfoEntry{}
+	}
+	var m map[string]modelInfoEntry
+	if err := json.Unmarshal(stripJSONComments(raw), &m); err != nil {
+		log.Printf("WARN: model catalog %s unparseable, keeping previous: %v", path, err)
+		return nil
+	}
+	return m
+}
+
 // modelInfoPath is the catalog file next to the working dir.
 func modelInfoPath() string {
 	if e := os.Getenv("MODEL_INFO_FILE"); e != "" {
@@ -95,13 +113,14 @@ func modelInfoPath() string {
 	return "model_info.jsonc"
 }
 
-// setModelInfo swaps the catalog (startup, reload, tests).
+// setModelInfo swaps the catalog (startup, reload, tests). nil keeps the
+// live map: loadModelInfoKeep returns nil on a broken file.
 func setModelInfo(m map[string]modelInfoEntry) {
+	if m == nil {
+		return
+	}
 	modelInfoMu.Lock()
 	defer modelInfoMu.Unlock()
-	if m == nil {
-		m = map[string]modelInfoEntry{}
-	}
 	modelInfo = m
 }
 
@@ -121,6 +140,22 @@ func lookupModelInfo(id string) *modelInfoEntry {
 		}
 	}
 	if s, ok := baseModelID(id); ok {
+		if e, ok := modelInfo[s]; ok {
+			return &e
+		}
+	}
+	return nil
+}
+
+// lookupModelInfoExact finds an entry without [1m] alias resolution:
+// exact, then with the nvidia/ prefix stripped.
+func lookupModelInfoExact(id string) *modelInfoEntry {
+	modelInfoMu.RLock()
+	defer modelInfoMu.RUnlock()
+	if e, ok := modelInfo[id]; ok {
+		return &e
+	}
+	if s := strings.TrimPrefix(id, "nvidia/"); s != id {
 		if e, ok := modelInfo[s]; ok {
 			return &e
 		}
@@ -184,7 +219,7 @@ func modelModality(id string) string {
 
 // modelSupportsParam reports whether the model accepts a request parameter
 // (openrouter list). false when no record exists, so callers must not treat
-// it as "rejected upstream".
+// it as "rejected upstream". covered by TestModelReasoningAndParams.
 func modelSupportsParam(id, param string) bool {
 	e := lookupModelInfo(id)
 	if e == nil || len(e.SupportedParams) == 0 {
@@ -196,6 +231,26 @@ func modelSupportsParam(id, param string) bool {
 		}
 	}
 	return false
+}
+
+// modelFreepiReasoning reports whether the free-pi gateway declares the
+// model reasoning-capable. the entry's top-level reasoning flag describes
+// the underlying model, not the served contract: freepi_declared_reasoning
+// wins for freeepi/ ids.
+func modelFreepiReasoning(id string) bool {
+	if e := lookupModelInfo(id); e != nil {
+		return e.FreepiReasoning
+	}
+	return false
+}
+
+// modelFreepiInputs are the inputs the free-pi gateway declares. same
+// served-contract rule as reasoning: declared wins for freeepi/ ids.
+func modelFreepiInputs(id string) []string {
+	if e := lookupModelInfo(id); e != nil && e.FreepiInputs != nil {
+		return e.FreepiInputs
+	}
+	return nil
 }
 
 // modelServedCtx is the window the proxy layer itself serves: freepi runs

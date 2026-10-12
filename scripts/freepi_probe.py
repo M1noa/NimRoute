@@ -3,7 +3,7 @@
 # fetches ads, then benchmarks every model for ttft + tps via streaming.
 # usage: python3 scripts/freepi_probe.py [--jwt freepi_jwt.txt] [--models id1,id2]
 #        python3 scripts/freepi_probe.py --list-only
-import json, sys, time, urllib.request, urllib.error, uuid
+import argparse, json, re, sys, time, urllib.request, urllib.error, uuid
 
 BASE = "https://api.freepi.ai"
 CLI_VERSION = "0.2.19"
@@ -41,8 +41,11 @@ def bench(model, token):
                    {"model": model, "messages": [{"role": "user", "content": PROMPT}],
                     "stream": True, "max_tokens": MAX_TOKENS}, token, stream=True)
     if st != 200:
-        resp.close() if hasattr(resp, "close") else None
-        return {"model": model, "error": f"HTTP {st}: {resp}"}
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return {"model": model, "error": f"HTTP {st}"}
     try:
         with resp as r:
             for line in r:
@@ -79,20 +82,35 @@ def bench(model, token):
 SESSION = uuid.uuid4().hex[:8]
 
 
-def main():
-    jwt_file, only, models = "freepi_jwt.txt", False, None
-    args = sys.argv[1:]
-    for i, a in enumerate(args):
-        if a == "--jwt":
-            jwt_file = args[i + 1]
-        elif a == "--list-only":
-            only = True
-        elif a == "--models":
-            models = args[i + 1].split(",")
+def read_jwt(jwt_file, config):
+    if jwt_file:
+        try:
+            return open(jwt_file).read().strip()
+        except FileNotFoundError:
+            sys.exit(f"no jwt file {jwt_file}; run freepi_login.py first.")
+    # --into-config flow writes into config.yml, not a jwt file: read the
+    # first account jwt from there.
     try:
-        token = open(jwt_file).read().strip()
+        text = open(config).read()
     except FileNotFoundError:
-        sys.exit(f"no jwt file {jwt_file}; run freepi_login.py first.")
+        sys.exit(f"no {config}; run freepi_login.py --into-config {config} first.")
+    m = re.search(r'jwt:\s*"([^"]+)"', text)
+    if not m:
+        sys.exit(f"no jwt in {config}; run freepi_login.py first.")
+    return m.group(1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jwt", default="",
+                    help="jwt file (default: first jwt in --config)")
+    ap.add_argument("--config", default="config.yml")
+    ap.add_argument("--list-only", action="store_true")
+    ap.add_argument("--models", default="")
+    args = ap.parse_args()
+    only = args.list_only
+    models = args.models.split(",") if args.models else None
+    token = read_jwt(args.jwt, args.config)
 
     st, cv = req("GET", "/client-version")
     print(f"client-version [{st}]: {json.dumps(cv)}")

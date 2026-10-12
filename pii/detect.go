@@ -45,7 +45,7 @@ type digitRule struct {
 }
 
 var digitRules = []digitRule{
-	{LCreditCard, []int{16, 15, 14}, luhnValid},
+	{LCreditCard, []int{19, 16, 15, 14, 13}, luhnValid},
 	{LSSN, []int{9}, validSSN},
 }
 
@@ -68,23 +68,38 @@ func detectDigitEntities(raw string) []Span {
 			runs = append(runs, run{d.String(), ix})
 		}
 	}
-	_ = runs
 	var out []Span
 	for _, r := range runs {
 		for _, rule := range digitRules {
-			hit := false
+			// slide rule-length windows inside longer runs: an ssn glued
+			// to an extra digit (or a spaced card) must not bypass.
+			best := -1
 			for _, l := range rule.lengths {
-				if len(r.digits) == l {
-					hit = true
+				if len(r.digits) < l {
+					continue
+				}
+				for s := 0; s+1 <= len(r.digits)-l+1; s++ {
+					if rule.check(r.digits[s : s+l]) {
+						best = l
+						break
+					}
+				}
+				if best > 0 {
 					break
 				}
 			}
-			if !hit || !rule.check(r.digits) {
+			if best <= 0 {
 				continue
 			}
-			st := r.idx[0]
-			en := r.idx[len(r.idx)-1] + 1
-			out = append(out, Span{st, en, rule.label, 1, "heuristic", raw[st:en]})
+			// emit the first valid window's byte range.
+			for s := 0; s+1 <= len(r.digits)-best+1; s++ {
+				if rule.check(r.digits[s : s+best]) {
+					st := r.idx[s]
+					en := r.idx[s+best-1] + 1
+					out = append(out, Span{st, en, rule.label, 1, "heuristic", raw[st:en]})
+					break
+				}
+			}
 			break
 		}
 	}
@@ -104,21 +119,61 @@ var textRules = []struct {
 	{LURL, regexp.MustCompile(`www\.[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?:/[^\s<>"'\\\])}]*)?`)},
 	{LIPAddress, regexp.MustCompile(`(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])`)},
 	{LIPAddress, regexp.MustCompile(`(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}`)},
-	{LJWT, regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_\-]+`)},
+	// full + compressed ipv6 (zone ids excluded: trailing %eth0 unmasks).
+	{LIPAddress, regexp.MustCompile(`(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}`)},
+	{LIPAddress, regexp.MustCompile(`(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{0,4}`)},
+	// any three-segment base64url token, not just claim-bearing jwts.
+	{LJWT, regexp.MustCompile(`eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_\-]+`)},
+	{LJWT, regexp.MustCompile(`[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)},
 	{LPrivateKey, regexp.MustCompile(`-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`)},
-	{LIBAN, regexp.MustCompile(`[A-Z]{2}[0-9]{2}[ ]?(?:[0-9A-Z]{4}[ ]?){2,6}[0-9A-Z]{0,4}`)},
+	{LIBAN, regexp.MustCompile(`(?:^|[^A-Za-z0-9])[A-Z]{2}[0-9]{2} ?(?:[0-9A-Z]{4} ?){2,6}[0-9A-Z]{0,4}(?:$|[^A-Za-z0-9])`)},
 	{LPhone, regexp.MustCompile(`(?:\+?1[-. ]?)?\(?[0-9]{3}\)?[-. ][0-9]{3}[-. ][0-9]{4}`)},
-	{LPhone, regexp.MustCompile(`\+[0-9][0-9 .\-()]{7,}[0-9]`)},
+	// bare 10-digit with area-code guard (2-9 lead both halves): +... math
+	// without digit runs stays out, plain numbers get masked.
+	{LPhone, regexp.MustCompile(`(?:^|[^0-9+])[2-9][0-9]{2}[2-9][0-9]{6}(?:$|[^0-9])`)},
+	{LPhone, regexp.MustCompile(`\+[0-9][0-9 .\-()]{6,}[0-9]`)},
 }
 
 func detectTextEntities(raw string) []Span {
 	var out []Span
 	for _, r := range textRules {
 		for _, loc := range r.re.FindAllStringIndex(raw, -1) {
-			out = append(out, Span{loc[0], loc[1], r.label, 1, "heuristic", raw[loc[0]:loc[1]]})
+			st, en := loc[0], loc[1]
+			// boundary-anchored rules (iban, bare phone) consume guard
+			// chars at the edges: trim back to the value alphabet so
+			// masking never eats json syntax. interior chars are value
+			// content and stay.
+			if r.label == LIBAN {
+				for st < en && !ibanByte(raw[st]) {
+					st++
+				}
+				for en > st && !ibanByte(raw[en-1]) {
+					en--
+				}
+			}
+			if r.label == LPhone {
+				for st < en && !phoneByte(raw[st]) {
+					st++
+				}
+				for en > st && !phoneByte(raw[en-1]) {
+					en--
+				}
+			}
+			if st >= en {
+				continue
+			}
+			out = append(out, Span{st, en, r.label, 1, "heuristic", raw[st:en]})
 		}
 	}
 	return out
+}
+
+func ibanByte(c byte) bool {
+	return '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || c == ' '
+}
+
+func phoneByte(c byte) bool {
+	return '0' <= c && c <= '9' || c == '+' || c == '(' || c == ')' || c == '-' || c == '.' || c == ' '
 }
 
 // secret keyword prefilter: only run the expensive generic-key regexes when
@@ -134,7 +189,14 @@ var (
 	genericKeyRe = regexp.MustCompile(`(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|auth[_-]?token|access[_-]?key|client[_-]?secret)\s*[:=]\s*['"]?([A-Za-z0-9_\-./+]{12,})['"]?`)
 	nvapiRe      = regexp.MustCompile(`nvapi-[A-Za-z0-9_\-]{16,}`)
 	ghpRe        = regexp.MustCompile(`gh[op]_[A-Za-z0-9]{20,}`)
+	ghsRe        = regexp.MustCompile(`ghs_[A-Za-z0-9]{20,}`)
+	ghrRe        = regexp.MustCompile(`ghr_[A-Za-z0-9]{20,}`)
+	githubPatRe  = regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`)
+	akiaRe       = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
 	skRe         = regexp.MustCompile(`sk-[A-Za-z0-9]{16,}`)
+	skAntRe      = regexp.MustCompile(`sk-ant-[A-Za-z0-9\-]{16,}`)
+	xoxRe        = regexp.MustCompile(`xox[bpas]-[A-Za-z0-9\-]{10,}`)
+	slackRe      = regexp.MustCompile(`xox[abpos]-[0-9]+-[0-9]+-[A-Za-z0-9]+`)
 )
 
 func hasSecretKeyword(raw string) bool {
@@ -147,25 +209,53 @@ func hasSecretKeyword(raw string) bool {
 	return false
 }
 
+// direct secret shapes: matched with no keyword gate. add new shapes here,
+// not behind the generic gate.
+var directSecretRes = []*regexp.Regexp{
+	nvapiRe, ghpRe, ghsRe, ghrRe, githubPatRe, akiaRe, skRe, skAntRe, xoxRe, slackRe,
+}
+
 func detectSecrets(raw string) []Span {
 	var out []Span
-	for _, loc := range nvapiRe.FindAllStringIndex(raw, -1) {
-		out = append(out, Span{loc[0], loc[1], LAPIKey, 1, "secret", raw[loc[0]:loc[1]]})
-	}
-	for _, loc := range ghpRe.FindAllStringIndex(raw, -1) {
-		out = append(out, Span{loc[0], loc[1], LAPIKey, 1, "secret", raw[loc[0]:loc[1]]})
-	}
-	for _, loc := range skRe.FindAllStringIndex(raw, -1) {
-		out = append(out, Span{loc[0], loc[1], LAPIKey, 1, "secret", raw[loc[0]:loc[1]]})
+	for _, re := range directSecretRes {
+		for _, loc := range re.FindAllStringIndex(raw, -1) {
+			out = append(out, Span{loc[0], loc[1], LAPIKey, 1, "secret", raw[loc[0]:loc[1]]})
+		}
 	}
 	if !hasSecretKeyword(raw) {
 		return out
 	}
-	for _, m := range genericKeyRe.FindAllStringSubmatchIndex(raw, -1) {
-		if len(m) < 4 || m[2] < 0 {
+	// sliding window: a keyword and secret in adjacent paragraphs must
+	// still gate together. run the generic match on overlapping 4k windows
+	// striding 2k so no keyword-secret pair splits across a boundary.
+	const win, stride = 4096, 2048
+	seen := map[[2]int]bool{}
+	for base := 0; base < len(raw); base += stride {
+		end := base + win
+		if end > len(raw) {
+			end = len(raw)
+		}
+		frag := raw[base:end]
+		if !hasSecretKeyword(frag) {
+			if end == len(raw) {
+				break
+			}
 			continue
 		}
-		out = append(out, Span{m[2], m[3], LAPIKey, 0.9, "secret", raw[m[2]:m[3]]})
+		for _, m := range genericKeyRe.FindAllStringSubmatchIndex(frag, -1) {
+			if len(m) < 4 || m[2] < 0 {
+				continue
+			}
+			st, en := base+m[2], base+m[3]
+			if seen[[2]int{st, en}] {
+				continue
+			}
+			seen[[2]int{st, en}] = true
+			out = append(out, Span{st, en, LAPIKey, 0.9, "secret", raw[st:en]})
+		}
+		if end == len(raw) {
+			break
+		}
 	}
 	return out
 }

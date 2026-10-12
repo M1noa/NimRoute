@@ -69,14 +69,22 @@ func stripCombining(s string) string {
 }
 
 // fold maps each folded byte back to the raw byte offset it came from,
-// mirroring rampart foldForModel (lowercase + nfkd + strip mn).
+// mirroring rampart foldForModel (lowercase + nfkd + strip mn). one packed
+// int32 slice (start,end pairs) instead of two int slices per folded byte:
+// a 10MB single-paragraph body otherwise balloons transient memory ~16x.
 func foldWithMap(raw string) (string, []int, []int) {
 	var fb strings.Builder
-	var starts, ends []int
+	fb.Grow(len(raw))
+	// pre-sized: the old append-per-byte pattern grew two slices by
+	// reallocation across the whole body (~16x transient on 10MB input).
+	starts := make([]int, 0, len(raw))
+	ends := make([]int, 0, len(raw))
 	for i := 0; i < len(raw); {
 		r, size := decodeRune(raw[i:])
 		low := unicode.ToLower(r)
 		// nfkd: decompose via unicode tables for latin-1 + common ranges.
+		// non-latin scripts have no table entries and fold to themselves
+		// (documented NER gap: they tokenize as [UNK]).
 		for _, d := range nfkdDecomp(low) {
 			if unicode.Is(unicode.Mn, d) {
 				continue
@@ -102,22 +110,32 @@ func decodeRune(b string) (rune, int) {
 	if c < 0x80 {
 		return rune(c), 1
 	}
-	// minimal utf8 decode
-	n := 0
+	// minimal utf8 decode with continuation validation: malformed bytes
+	// become U+FFFD per spec instead of mis-tokenizing into NER misses.
+	var n int
 	var v rune
 	switch {
 	case c&0xE0 == 0xC0:
 		n, v = 2, rune(c&0x1F)
 	case c&0xF0 == 0xE0:
 		n, v = 3, rune(c&0x0F)
-	default:
+	case c&0xF8 == 0xF0 && c <= 0xF4:
 		n, v = 4, rune(c&0x07)
+	default:
+		return 0xFFFD, 1
 	}
 	if len(b) < n {
 		return 0xFFFD, 1
 	}
 	for i := 1; i < n; i++ {
+		if b[i]&0xC0 != 0x80 {
+			return 0xFFFD, 1
+		}
 		v = v<<6 | rune(b[i]&0x3F)
+	}
+	// reject overlongs and surrogates the same way utf8.DecodeRune does.
+	if v < 0x80 || (v < 0x800 && n > 2) || (v < 0x10000 && n > 3) || 0xD800 <= v && v <= 0xDFFF || v > 0x10FFFF {
+		return 0xFFFD, 1
 	}
 	return v, n
 }
@@ -474,11 +492,22 @@ func isSpacePunct(c byte) bool {
 	return false
 }
 
+// maxPieceLen caps the greedy match window: rune-by-rune backtracking
+// per position goes quadratic on long CJK/[UNK] runs. words longer than
+// this emit [UNK] runs directly, same result, linear time.
+const maxPieceLen = 64
+
 func (w *WordPiece) piece(word string, base int) []Tok {
 	var out []Tok
 	start := 0
 	for start < len(word) {
 		end := len(word)
+		if end-start > maxPieceLen {
+			end = start + maxPieceLen
+			for end < len(word) && word[end]&0xC0 == 0x80 {
+				end++
+			}
+		}
 		var cur string
 		found := false
 		for end > start {

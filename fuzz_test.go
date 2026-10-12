@@ -7,13 +7,14 @@ import (
 )
 
 // RTK walks untrusted request bodies. no input shape may panic it, corrupt the
-// body, or change it when disabled.
-func TestRtkHostileBodies(t *testing.T) {
+// body, or change it when disabled. FuzzRtkCompressBody runs the hostile
+// corpus as seeds in normal `go test`, plus fuzzer-found inputs with -fuzz.
+func FuzzRtkCompressBody(f *testing.F) {
 	c := defaultConfig()
 	c.Rtk.Enabled = true
-	useConfig(t, &c)
+	useConfigForFuzz(f, &c)
 
-	bodies := []string{
+	seeds := []string{
 		``,
 		`{`,
 		`null`,
@@ -33,24 +34,24 @@ func TestRtkHostileBodies(t *testing.T) {
 		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{}}]}]}]}`,
 		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[1,2,3]}]}]}`,
 		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":"` + strings.Repeat("A", 100000) + `"}]}]}`,
+		// {"type":"text"} with missing/non-string text: the exact shape
+		// that panicked setTextParts (needs 500+ bytes to compress).
+		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"` + strings.Repeat("B", 600) + `"},{"type":"text"}]}]}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"text","text":"` + strings.Repeat("C", 600) + `"},{"type":"text","text":123}]}]}]}`,
 		`{"deeply":{"nested":{"a":{"b":{"c":[[[1]]]}}}}}`,
 		// type confusion: content is a number where a string was expected
 		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":{"a":1}}]}]}`,
 	}
-	for i, b := range bodies {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Errorf("body %d panicked: %v\n%s", i, r, b)
-				}
-			}()
-			out := rtkCompressBody([]byte(b))
-			// whatever comes back must still be parseable if the input was
-			if json.Valid([]byte(b)) && !json.Valid(out) {
-				t.Errorf("body %d: input valid, output invalid:\nin=%s\nout=%s", i, b, out)
-			}
-		}()
+	for _, s := range seeds {
+		f.Add(s)
 	}
+	f.Fuzz(func(t *testing.T, b string) {
+		out := rtkCompressBody([]byte(b))
+		// whatever comes back must still be parseable if the input was
+		if json.Valid([]byte(b)) && !json.Valid(out) {
+			t.Errorf("input valid, output invalid:\nin=%s\nout=%s", b, out)
+		}
+	})
 }
 
 // enabled must not modify bodies it does not recognise, and must be a strict

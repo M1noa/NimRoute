@@ -304,6 +304,9 @@ func TestSanitizeZenSchemaDropsOverBudgetRequired(t *testing.T) {
 // per-exit burn cannot mask the boundary. run: ZEN_CALIBRATE=1 go test -run
 // TestZenValidatorBoundaryLive. skipped otherwise (burns free-tier quota).
 func TestZenValidatorBoundaryLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live quota probe skipped in -short")
+	}
 	if os.Getenv("ZEN_CALIBRATE") == "" {
 		t.Skip("set ZEN_CALIBRATE=1 to probe the live validator")
 	}
@@ -374,9 +377,12 @@ func TestZenValidatorBoundaryLive(t *testing.T) {
 // enum values or the plan subtree so the request passes.
 func TestSanitizeZenSchemaCCRealTool(t *testing.T) {
 	useConfig(t, schemaDepthTestConfig())
-	raw, err := os.ReadFile("/tmp/failing_input_schema.json")
+	// checked-in synthetic fixture (12-deep chain + enum leaf past
+	// budget): exercises the captured-failure boundary without needing a
+	// live claude code capture in /tmp.
+	raw, err := os.ReadFile("testdata/cc_real_tool_schema.json")
 	if err != nil {
-		t.Skip("no captured failing schema; run claude code against scratch to produce it")
+		t.Fatalf("missing fixture: %v", err)
 	}
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {

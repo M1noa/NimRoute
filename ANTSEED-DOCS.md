@@ -1,8 +1,9 @@
 # ANTSEED-DOCS.md — AntSeed reverse engineering: API, protocol, VPN
 
 > source: `git clone --depth 1 https://github.com/Antseed/antseed` + its
-> `apps/website/docs/`. file:line refs point into that clone. this file should be
-> enough on its own to reimplement the buyer side in Go.
+> `apps/website/docs/`, at the pinned rev in git log (re-clone to verify).
+> file:line refs point into that clone AT THAT REV; line numbers drift upstream.
+> this file should be enough on its own to reimplement the buyer side in Go.
 
 ## 0. what antseed is
 

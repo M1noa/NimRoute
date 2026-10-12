@@ -130,6 +130,13 @@ credits rampart CC BY 4.0). what remains is wiring + verification:
 - verify the scan cache keys on paragraph hash + config version and skips
   rescan of unchanged history; add a cache-hit counter to `/status`
   (fits item 2 work).
+  partial 2026-10-08: `-tags ner` builds clean; singleton loads once per
+  (model, lib); bogus path degrades to nil (`TestNerMissingWeightsDegrades`
+  both builds). key = sha256(ver + 0 + paragraph), `Ver: "v1"`
+  (`TestScanCacheKeysOnVersion`). heuristics benchmark: `RegexUSPerKB`
+  logged at startup when anonymize on (live: 574.9 us/KB, masked turn
+  verified); `nim-perf.jsonl` already gitignored. left: weights + NER
+  ms/request + hit counter.
 - benchmark: regex us/KB + NER ms/request, log at startup when ner enabled.
 - `fetch_model.sh` downloads weights; never commit them.
 
@@ -148,13 +155,19 @@ lanes exist (`zenlanes.go`) but several outline behaviors are missing:
   rate-limited before the exit is pinned.
 - lane cap default is 5; outline asks 6. change default `lanes: 5` -> `6`
   in example + `laneCap` fallback, keep user values.
+  stale 2026-10-08: live default is 25 (`laneCap` fallback, example,
+  live config 18-25). the outline's 5->6 predates shared-lane spread;
+  do not apply. remaining: per-(proxy,session) lock, two-tier refresh
+  knob, pre-pin health probe.
 - overflow past cap: assign to least-recently-used lane (already does via
   shared pool fallback; verify under a 8-concurrent test).
+  done 2026-10-08: `TestOverflowSpreadsConcurrently` (8 distinct hdr
+  keys vs cap 4: table stays capped, lanes spread).
 
 ## 9. model_info coverage audit [large]
 
 done (2026-10-05): `models.params` globs replaced by `model_info.jsonc`
-(102 entries: 81 nim + 14 zen + 7 freepi). sampling defaults are gone;
+(108 entries: 33 nvidia + 15 opencode + 7 freepi + 5 antseed + rest. 2026-10-08 recount; earlier "102" predates antseed). sampling defaults are gone;
 `injectParams` only folds camelCase and strips `_nim`.
 
 - on startup, log models in `/v1/models` output with no model_info entry
@@ -163,6 +176,12 @@ done (2026-10-05): `models.params` globs replaced by `model_info.jsonc`
   has a model_info entry.
 - keep `inject.params: false` as the escape hatch (skips normalization);
   `_nim` strip is part of normalization.
+
+done 2026-10-08: `missingModelInfo` in main.go warns per id from
+`refreshOpencodeModels` (live check: 11/11 served ids resolve, no
+warnings); test `TestZenModelIDsHaveModelInfo` (fake zen server +
+controlled catalog). escape hatch verified pre-existing
+(`injectParams` gate + `TestConfigToggles`).
 
 ## 10. pool tuning: calm the refresh storms [medium]
 
@@ -182,6 +201,22 @@ but the churn is wasteful.
 - consider `lane_min_gap_ms` 1500 -> 2000 if single-lane bursts keep
   429ing the same exit (check: repeated 429s on one lane with distinct
   proxies = gap too tight; 429s across many lanes = pool stale).
+
+done 2026-10-08: default 2 -> 4 + `pool_refresh_cooldown_secs`
+(default 120, 0 = 120, negative disables) in config.go/example;
+`noteRateLimit` returns bool, trips inside the window skip with a debug
+log and reset the counter (`poolRefreshDue` is the testable decision).
+test `TestPoolRefreshCooldown`. log showed 9 refreshes in ~15s before;
+gap left at 1500 (no evidence single-lane bursts need 2000).
+live 2026-10-08: cooldown skips firing (5 trips skipped 7s-1m54s after
+last refresh, debug log). gap stays 1500: 429s spread across lanes in
+the log, no single-lane burst pattern.
+fix 2026-10-09: production showed 2 fires 7s apart — timestamp stamped
+only on verify completion (~30s+), so a trip during an in-flight refresh
+saw a stale stamp and logged a duplicate fire (collapsed via TryLock,
+harmless but noisy). `noteRateLimit` now stamps at fire time;
+completion re-stamps. test `TestRefreshFireStamps` (refresh mutex held,
+async fire collapses, no network).
 
 ## 11. claude code fetch tool 403 FreeTierError, now 502 [medium]
 
@@ -203,10 +238,20 @@ others, not all tools) historically 403 `FreeTierError`, now 502
 - verify: unit test for cooldown skip + counter reset; live check that
   refreshes drop to ~1 per burst in the log.
 
-## 11. cli flags that override config [small]
+done 2026-10-08: log forensics says proxy-exhausted, not upstream
+passthrough — all 5 retries reused one dead proxy (`proxyconnect:
+network is unreachable` x5, same exit). root cause: net-error branch
+called `dropProxy` but never cleared the lane pin, so `laneProxyFor`
+re-picked the dead exit every retry. fix: `laneReproxy` after
+`dropProxy` in both paths (anthropic.go, main.go); solo dead exit
+still attempts (keep-last + keep-pin fallbacks unchanged). test
+`TestNetErrMovesLaneOffDeadExit`; live :5420 turn 200 with 429
+rotation onto a fresh exit intact.
 
-no flag parsing exists today: `os.Args[1] == "probe"` (main.go:4453) and
-the `CONFIG_FILE` env var (config.go:387) are the only knobs. flags are
+## 14. cli flags that override config [small]
+
+no flag parsing exists today: `os.Args[1] == "probe"` (see `parseFlags` in main.go) and
+the `CONFIG_FILE` env var (see `configPath` in config.go) are the only knobs. flags are
 for easy testing without editing `config.yml`.
 
 - parse with the stdlib `flag` package at entry: `--config`,
@@ -220,6 +265,15 @@ for easy testing without editing `config.yml`.
 - no flags = byte-identical behavior to today.
 - test: `--port` listens on the override, `--lanes` caps lanes,
   `--debug` flips log verbosity, defaults unchanged without flags.
+
+done 2026-10-08: hand-rolled `parseFlags` in main.go (`--config`,
+`--port`, `--lanes`, `--debug`, both `--f v` / `--f=v`, both orders
+around `probe`, unknown flags ignored). applied in `serverMainFlags`
+after load, before pool build/listen; `--port` wins over PORT env;
+`probe` honors `--config`. no `--monitor` (item 12 skipped).
+tests `TestParseFlags`, `TestFlagOverrides`; live `--lanes 4` shows
+cap 4 on scratch :5420.
+plus: `--help`/`-h` prints usage and exits (`TestHelpFlag`).
 
 ## 12. perf monitoring: stage timings + resource sampling [large]
 
@@ -259,6 +313,8 @@ row so a slow request can be correlated with memory pressure.
   `config.yml.example` + defaults in `defaultConfig()`; default-false
   bool, so no raw-doc presence check needed. `--monitor` flag from
   item 11 as the quick toggle.
+  done 2026-10-08: keys + example + `--monitor` flag (`TestMonitorFlag`).
+  rows not yet written (the large remainder).
 - verify: unit test that disabled monitor writes nothing and that
   `proxy_overhead = total - upstream_total` on a fake timeline; live
   check a streaming request row carries `ttft`, `model_tps`, and rss.
@@ -273,15 +329,18 @@ after 5 attempts (`max_retries: 4`) the loop falls through and writes
 the last upstream status to the client: req-256 got `<- 429` with
 0 bytes after 1m5s, req-305 the same after 17s. two compounding bugs:
 
-- the 429 path (main.go:3388) closes the body then `continue`s, so the
+- the 429 path (see the 429 branch in `handleOpenCode` in main.go) closes the body then `continue`s, so the
   post-loop code re-reads a closed body and forwards an empty 429. the
   client sees a bodyless 429 and gives up.
-- `hedgedDo` (zenlanes.go:330) lets a fast 429 win: the primary 429s in
+- `hedgedDo` (zenlanes.go) lets a fast 429 win: the primary 429s in
   200ms, the hedge is cancelled, a success 1s behind it is thrown away.
 
 one open question: several `dial tcp 47.90.229.219:443: refused` lines
 name a dial target that is not the logged proxy, so a primary-side vs
 hedge-side mixup can't be ruled out yet.
+resolved 2026-10-11: with per-side proxy labels live, every dial target
+matches its logged proxy (primary and hedge alike). socks4 dials show
+the exit ip directly, http-connect shows the proxy — no confusion.
 
 - track the last failure kind across the loop (`handleOpenCode`,
   `handleOpenCodeAnthropic`, `zenPost`): retryable (429/529, net error)
@@ -295,14 +354,27 @@ hedge-side mixup can't be ruled out yet.
   falls into the drain.
 - log hedge-side errors with their own proxy label, so the dial-target
   mismatch is answerable next time.
+  done 2026-10-08: both hedge funcs log `hedge error` with own proxy
+  (skipped when cancelled, so only real failures show).
 - never forward an empty upstream error: synthesize JSON with 502/503
   + `Retry-After` on the retryable-exhausted path instead of the stale
   429. check what opencode retries on and match it.
+  done 2026-10-08: `exhausted429` (503 + Retry-After: 30, non-empty
+  JSON) wired into both 429 branches on last retry; falls through to
+  the normal forward. test `TestExhausted429Synthesizes`.
+- test: fake upstream 4x429 then 200 -> client 200.
+  done 2026-10-08: `TestRetryLoopSurvives429s` (fake zen, 5 hits, 200).
 - the refresh-storm half of this log (2-3 refreshes per burst) is
   already item 10's; this item is only the client-facing tail.
 - test: fake upstream 4x429 then 200 -> client 200; all-429 -> JSON
   502/503 with a non-empty body, never a bare 429; fast-429 vs
   slow-200 hedge -> 200 wins.
+  done 2026-10-09: `TestRetryLoopAll429Synthesizes` (OAI path: 503 +
+  Retry-After + non-empty body through the real client write) and
+  `TestAnthropicPathAll429Synthesizes` (same on /v1/messages). left:
+  drain + hedge-wait (the involved half). note: fast-429-beats-slow-200
+  is current `hedgedDo` behavior by design (first response wins);
+  changing it IS the hedge-wait rework, do not "fix" without it.
 
 ## left open
 
@@ -393,9 +465,9 @@ one line per item, checkbox marks state.
       complete; silent when disabled
 - [x] `/health`, `/v1/models`, `/v1/messages/count_tokens`, `claude-*`
       mapping all 200
-- [x] all 13 non-deepseek models swept on `/v1/messages`. **1 of 13 passes:
+- [x] (2026-10-07 sweep, `opencode/*` scope) all 13 non-deepseek opencode models swept on `/v1/messages`. **1 of 13 passes:
       space-bunny-free.** the other 12 fail, and the failure is upstream, not
-      the proxy — evidence:
+      the proxy — evidence: (14 non-deepseek opencode ids exist now; conclusion predates freepi/antseed backends)
   - 56 distinct exits attempted across the sweep; every other model drew
     403 `FreeTierError` or 429 on all of them
   - space-bunny hit **zero** blocks on those same exits in the same run and

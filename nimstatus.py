@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -34,11 +35,26 @@ def today_str():
     return datetime.date.today().isoformat()
 
 
+_jsonl_cache = {"mtime": 0, "size": 0, "out": None}
+
+
 def jsonl_stats():
-    """All-time + today totals from nim-usage.jsonl. Returns dict."""
+    """All-time + today totals from nim-usage.jsonl. Returns dict.
+
+    cached on (mtime, size): the tail loop calls this every second and a
+    20MB re-parse per tick pegs a core on a busy proxy.
+    """
+    path = os.path.join(ROOT, "nim-usage.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0},
+                "since": ""}
+    if (st.st_mtime, st.st_size) == (_jsonl_cache["mtime"], _jsonl_cache["size"]) \
+            and _jsonl_cache["out"] is not None:
+        return _jsonl_cache["out"]
     out = {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0},
            "since": ""}
-    path = os.path.join(ROOT, "nim-usage.jsonl")
     today = today_str()
     try:
         with open(path) as f:
@@ -59,11 +75,13 @@ def jsonl_stats():
                     out["today"]["tok"] += tok
     except OSError:
         pass
+    _jsonl_cache["mtime"], _jsonl_cache["size"], _jsonl_cache["out"] = \
+        st.st_mtime, st.st_size, out
     return out
 
 
 def fmt_int(n):
-    return "%s" % f"{n:,}"
+    return f"{n:,}"
 
 
 def fmt_tok(n):
@@ -103,27 +121,47 @@ def plain_status(d):
         c.append("antseed %d peers, %d offers: %s" % (
             antseed.get("peers", 0), antseed.get("offers", 0),
             ", ".join("antseed/" + m for m in antseed.get("models") or [])))
+    rt = d.get("route") or {}
+    if rt.get("enabled"):
+        lat = rt.get("latency_ms") or {}
+        lat_s = ", ".join("%s %sms" % (b, lat[b]) for b in sorted(lat)) or "no samples"
+
+        def _rid(r):
+            return r.get("id", "?") if isinstance(r, dict) else r
+        c.append("route [%s] %d ids (%s): %s" % (
+            rt.get("strategy", "?"), rt.get("count", 0), lat_s,
+            ", ".join(_rid(r) for r in rt.get("routes") or [])))
     return "\n".join(c)
 
 
+def fmt_ms(ms):
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return "·"
+    if ms <= 0:
+        return "·"
+    if ms >= 10000:
+        return "%.1fs" % (ms / 1000)
+    if ms >= 1000:
+        return "%.2fs" % (ms / 1000)
+    return "%dms" % ms
+
+
 def merged_table(d):
-    """One table: lane + its exit (host, cc, ms) + req + tokens + state."""
+    """One table: lane + its exit (host, cc, avg) + req + tokens."""
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
     exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
     t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
               pad_edge=False)
-    t.add_column("", width=2)
-    t.add_column("lane", style="cyan")
+    t.add_column("lane", style="slate_blue1")
     t.add_column("exit")
     t.add_column("cc")
-    t.add_column("ms", justify="right")
+    t.add_column("avg", justify="right")
     t.add_column("req", justify="right")
     t.add_column("tok", justify="right")
-    t.add_column("state")
     for l in lanes:
-        mark = Text("●", style="green")
-        state = Text("live", style="dim")
         proxy = l.get("proxy") or ""
         e = exits.get(proxy, {})
         if proxy:
@@ -131,6 +169,9 @@ def merged_table(d):
             exit_t = Text(host)
         else:
             exit_t = Text("—", style="dim")
+        # avg prefers the lane's own finished-request mean; falls back
+        # to the exit's live first-byte ewma.
+        avg = l.get("avg_ms") or e.get("avg_ms") or e.get("latency_ms")
         # per-model breakdown on hover-equivalent: suffix the count with the
         # top model so a busy lane says what it served.
         tok = l.get("total_tokens", 0)
@@ -141,9 +182,9 @@ def merged_table(d):
             tok_t.append(" " + top.split("/")[-1][:12], style="dim")
         else:
             tok_t = Text(fmt_tok(tok), style="dim")
-        t.add_row(mark, (l.get("id") or "?")[:14], exit_t,
-                  str(e.get("country", "·")), str(e.get("latency_ms", "·")),
-                  str(l.get("requests", 0)), tok_t, state)
+        t.add_row((l.get("id") or "?")[:14], exit_t,
+                  str(e.get("country", "·")), fmt_ms(avg),
+                  str(l.get("requests", 0)), tok_t)
     return t
 
 
@@ -169,16 +210,29 @@ def usage_bar(pct, width=10):
     return bar
 
 
-PROVIDER_STYLES = {"opencode": "cyan", "freepi": "magenta", "antseed": "blue", "nvidia": "green"}
+# muted slate palette: provider names carry the color, values stay dim.
+PROVIDER_STYLES = {"opencode": "slate_blue1", "freepi": "medium_purple3",
+                   "antseed": "steel_blue", "nvidia": "dark_sea_green"}
 
 # usage multipliers come from /status per-account "mults" (parsed live from
 # the freepi catalog display names, e.g. "GLM 5.3 Flash · ~0.7x usage").
-# real spend is measured per request in the cost column.
+
+
+def health_cell(health, model):
+    """Status cell: ✓ working, red code when broken, · when unknown."""
+    h = (health or {}).get(model) or {}
+    state = h.get("state", "unknown")
+    if state == "working":
+        return Text("✓", style="green")
+    if state == "broken":
+        code = h.get("code")
+        return Text(str(code) if code else "err", style="red")
+    return Text("·", style="dim")
 
 
 def build_renderable(d, stats):
     parts = []
-    hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold cyan")
+    hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold slate_blue1")
     hdr.append("  up %s" % d.get("uptime", "?"), style="dim")
     hdr.append("  load %d/%d" % (d.get("concurrent", 0),
                                  d.get("sem_limit", 0)))
@@ -186,19 +240,14 @@ def build_renderable(d, stats):
         ok = bool(d.get("available"))
         hdr.append("  keys %d/%d" % (d.get("available", 0),
                                      d.get("total", 0)),
-                   style="green" if ok else "red")
+                   style="dark_sea_green" if ok else "red")
     parts.append(hdr)
     parts.append(merged_table(d))
     parts.append(Text("convo = sticky conversation · shared = overflow pool · hdr = pinned header",
                        style="dim"))
     oc = d.get("opencode") or {}
     oc_models = list(oc.get("models") or [])
-    costs = {}
-    for mid, t in ((d.get("usage") or {}).get("by_model") or {}).items():
-        c = t.get("cost_usd", 0) if isinstance(t, dict) else 0
-        r = t.get("requests", 0) if isinstance(t, dict) else 0
-        if r:
-            costs[mid] = c
+    health = d.get("health") or {}
     fp = d.get("freepi") or {}
     fp_models, fp_rows, fp_mults = [], [], {}
     for acct in fp.get("accounts") or []:
@@ -235,7 +284,7 @@ def build_renderable(d, stats):
                   pad_edge=False)
         for name, _ in cols:
             t.add_column(name, style=PROVIDER_STYLES.get(name, "dim"))
-            t.add_column("cost", justify="right", style="dim")
+            t.add_column("status", justify="right", style="dim")
             if name == "freepi":
                 t.add_column("mult", justify="right", style="dim")
         widest = max(len(ms) for _, ms in cols)
@@ -245,8 +294,7 @@ def build_renderable(d, stats):
                 cells.append(Text(val, style=PROVIDER_STYLES.get(name, "dim")))
                 if val:
                     full = val if "/" in val else name + "/" + val
-                    c = costs.get(full, 0)
-                    cells.append(Text("$%.2g" % c if c else "·", style="dim"))
+                    cells.append(health_cell(health, full))
                     if name == "freepi":
                         bare = full.split("/", 1)[-1]
                         cells.append(Text(fp_mults.get(bare, "·"), style="dim"))
@@ -265,10 +313,32 @@ def build_renderable(d, stats):
         line.append(usage_bar(pct))
         line.append(" %s day · %d today" % (fmt_pct(pct), rtoday), style="dim")
         parts.append(line)
+    rt = d.get("route") or {}
+    if rt.get("enabled") and rt.get("routes"):
+        rt_t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
+                     pad_edge=False)
+        rt_t.add_column("route", style="gold1")
+        rt_t.add_column("via", style="dim")
+        lat = rt.get("latency_ms") or {}
+        order = {"opencode": 0, "antseed": 1, "freepi": 2, "nvidia": 3}
+        for row in rt.get("routes") or []:
+            if isinstance(row, dict):
+                rid, via = row.get("id", "?"), row.get("via") or []
+            else:  # older server shape: bare id strings
+                rid, via = row, []
+            via = [b for b in sorted(via, key=lambda b: order.get(b, 9))]
+            rt_t.add_row(rid, " · ".join(via) or "·")
+        lat_s = "  ".join("%s %sms" % (b, lat[b]) for b in
+                           sorted(lat, key=lambda b: order.get(b, 9)))
+        cap = "route [%s] %d ids" % (rt.get("strategy", "?"), rt.get("count", 0))
+        if lat_s:
+            cap += "  ·  fastest: " + lat_s
+        parts.append(Text(cap, style="dim"))
+        parts.append(rt_t)
     p = d.get("pool") or {}
     pool_t = Text()
     pool_t.append("pool  ", style="dim")
-    pool_t.append("%d verified" % p.get("verified", 0), style="green")
+    pool_t.append("%d verified" % p.get("verified", 0), style="dark_sea_green")
     pool_t.append(" · ", style="dim")
     pool_t.append("%d dropped" % p.get("dropped_total", 0),
                   style="red" if p.get("dropped_total", 0) else "dim")
@@ -278,10 +348,10 @@ def build_renderable(d, stats):
     use_t = Text()
     use_t.append("today ", style="dim")
     use_t.append("%s req" % fmt_int(stats["today"]["req"]), style="bold white")
-    use_t.append(" · %s tok" % fmt_tok(stats["today"]["tok"]), style="cyan")
+    use_t.append(" · %s tok" % fmt_tok(stats["today"]["tok"]), style="slate_blue1")
     use_t.append("   │   all-time ", style="dim")
     use_t.append("%s req" % fmt_int(stats["all"]["req"]), style="bold white")
-    use_t.append(" · %s tok" % fmt_tok(stats["all"]["tok"]), style="cyan")
+    use_t.append(" · %s tok" % fmt_tok(stats["all"]["tok"]), style="slate_blue1")
     if stats["since"]:
         use_t.append(" since %s" % stats["since"], style="dim")
     parts.append(use_t)
@@ -326,14 +396,30 @@ def main():
             except KeyboardInterrupt:
                 pass
     elif cmd == "logs":
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        try:
+            n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        except ValueError:
+            print("usage: nimstatus.py logs [N]")
+            return 1
         log = os.path.join(ROOT, "nimroute.log")
         try:
-            with open(log) as f:
-                lines = f.readlines()[-n:]
+            # bounded tail seek: no whole-file read on a big log.
+            with open(log, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                blk, pos, buf = 8192, size, b""
+                while pos > 0 and buf.count(b"\n") <= n:
+                    step = blk if pos >= blk else pos
+                    pos -= step
+                    f.seek(pos)
+                    buf = f.read(step) + buf
+                lines = buf.splitlines()[-n:]
+                lines = [ln.decode("utf-8", "replace") + "\n" for ln in lines]
         except OSError as e:
             print("(log read failed: %s)" % e)
             return 1
+        # redact embedded proxy credentials when redaction failed upstream.
+        lines = [re.sub(r"://[^/@\s]+@[^\s]+", "://***@", ln) for ln in lines]
         if RICH:
             con = Console()
             for line in lines:

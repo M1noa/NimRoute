@@ -8,6 +8,9 @@ import (
 // shape-preserving fakes selected by hmac bytes. same (label, original)
 // always yields the same fake; fakes look valid (luhn cards, real domains).
 
+// pools are deliberately small (40 first / ~30 last / 5 domains):
+// distinct originals collide visibly before uniquify appends "~n".
+// enlarge only with real-looking entries; realism matters more than size.
 var firstNames = []string{
 	"Julie", "Marcus", "Priya", "Tomas", "Aisha", "Henrik", "Lena", "Omar",
 	"Sofia", "Dmitri", "Nadia", "Carlos", "Ingrid", "Ravi", "Elena", "Kwame",

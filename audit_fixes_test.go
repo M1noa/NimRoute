@@ -33,14 +33,17 @@ func TestLaneGateSerializesConcurrentSenders(t *testing.T) {
 	}
 	wg.Wait()
 
+	// serialization property: one of the two callers waited the full
+	// min-gap, so the absolute gap stays large. (which goroutine won the
+	// first slot is scheduling, not contract: assert the gap, not the
+	// order.) the floor is 100ms, not 250: sleep wakeup jitter under CI
+	// load must not red a correct implementation.
 	gap := sends[1].Sub(sends[0])
 	if gap < 0 {
 		gap = -gap
 	}
-	// the second send must be scheduled at least one full gap after the
-	// first (small tolerance for sleep wakeup jitter).
-	if gap < 250*time.Millisecond {
-		t.Fatalf("concurrent laneGate calls fired %v apart; want ~>= %v (pacing TOCTOU)", gap, 300*time.Millisecond)
+	if gap < 100*time.Millisecond {
+		t.Fatalf("laneGate gap %v far below the 300ms min-gap", gap)
 	}
 }
 

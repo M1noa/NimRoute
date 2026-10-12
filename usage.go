@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -11,9 +12,13 @@ import (
 // disabled when usage.enabled is false (zero file, zero counters).
 
 var (
-	usageMu  sync.Mutex
-	usageOut *json.Encoder
-	usageFd  *os.File
+	usageMu   sync.Mutex
+	usageOut  *json.Encoder
+	usageFd   *os.File
+	usagePath string
+	// usageWarnOnce logs a dead usage sink exactly once instead of
+	// spamming per request (full disk, renamed inode).
+	usageWarnOnce sync.Once
 )
 
 type UsageRecord struct {
@@ -45,13 +50,99 @@ type usageTotals struct {
 	Cost       float64 `json:"cost_usd,omitempty"`
 }
 
+// modelHealth is the /status view of one model's recent behavior:
+// working after any success, broken with the code after 3 same-error
+// outcomes in a row across 2+ sellers, unknown before either.
+type modelHealth struct {
+	State string `json:"state"` // working, broken, unknown
+	Code  int    `json:"code,omitempty"`
+}
+
+// modelOutcome is one finished request: error code (0 = success) and
+// the seller/account/key that served it.
+type modelOutcome struct {
+	code int
+	key  string
+}
+
 var (
 	totalsMu sync.Mutex
 	totals   = map[string]*usageTotals{}
 	// totalsByKey mirrors totals keyed by record KeyName (e.g.
 	// "freepi:<account>). only populated when KeyName is set.
 	totalsByKey = map[string]*usageTotals{}
+	// outcomesByModel is the recent per-model outcome ring (newest
+	// last, capped) feeding modelHealth.
+	outcomesByModel = map[string][]modelOutcome{}
 )
+
+// noteModelOutcome records one finished request for health. ok =
+// upstream 2xx; code = upstream status on failure; key = seller,
+// account, or key name ("" when unknown).
+func noteModelOutcome(model string, ok bool, code int, key string) {
+	if model == "" {
+		return
+	}
+	totalsMu.Lock()
+	defer totalsMu.Unlock()
+	noteModelOutcomeLocked(model, ok, code, key)
+}
+
+// noteModelOutcomeLocked is noteModelOutcome with the lock held
+// (logUsage folds it in without re-locking).
+func noteModelOutcomeLocked(model string, ok bool, code int, key string) {
+	o := modelOutcome{key: key}
+	if !ok {
+		o.code = code
+	}
+	outcomesByModel[model] = append(outcomesByModel[model], o)
+	if len(outcomesByModel[model]) > 20 {
+		outcomesByModel[model] = outcomesByModel[model][len(outcomesByModel[model])-20:]
+	}
+}
+
+// modelHealthFor folds a model's recent outcomes: any success in the
+// window = working. else the last 3 failures with the same code across
+// 2+ sellers = broken (single-seller streaks are proxy trouble, not a
+// dead model). anything less = unknown.
+func modelHealthFor(model string) modelHealth {
+	totalsMu.Lock()
+	defer totalsMu.Unlock()
+	return modelHealthLocked(model)
+}
+
+func modelHealthLocked(model string) modelHealth {
+	oc := outcomesByModel[model]
+	for _, o := range oc {
+		if o.code == 0 {
+			return modelHealth{State: "working"}
+		}
+	}
+	if len(oc) >= 3 {
+		last := oc[len(oc)-3:]
+		if last[0].code != 0 && last[0].code == last[1].code && last[1].code == last[2].code {
+			keys := map[string]bool{}
+			for _, o := range last {
+				keys[o.key] = true
+			}
+			if len(keys) >= 2 {
+				return modelHealth{State: "broken", Code: last[2].code}
+			}
+		}
+	}
+	return modelHealth{State: "unknown"}
+}
+
+// modelHealthSnapshot returns health for every model with outcomes.
+func modelHealthSnapshot() map[string]modelHealth {
+	totalsMu.Lock()
+	defer totalsMu.Unlock()
+	out := make(map[string]modelHealth, len(outcomesByModel))
+	for m := range outcomesByModel {
+		out[m] = modelHealthLocked(m)
+	}
+	return out
+}
 
 func logUsage(r UsageRecord) {
 	if !cfg().Usage.Enabled {
@@ -59,14 +150,27 @@ func logUsage(r UsageRecord) {
 	}
 	usageMu.Lock()
 	if usageOut != nil {
-		usageOut.Encode(r)
+		if err := usageOut.Encode(r); err != nil {
+			usageWarnOnce.Do(func() {
+				log.Printf("WARN: usage log unwritable, recording stopped: %v", err)
+			})
+		}
 	}
 	usageMu.Unlock()
 	totalsMu.Lock()
-	t := totals[r.Model]
+	// client-supplied model ids are unbounded: cap the map and fold
+	// overflow into one bucket, or unique-model loops OOM the proxy.
+	model := r.Model
+	if t := totals[model]; t == nil && len(totals) >= 4096 {
+		model = "(other)"
+	}
+	if model == "" {
+		model = "(other)"
+	}
+	t := totals[model]
 	if t == nil {
 		t = &usageTotals{}
-		totals[r.Model] = t
+		totals[model] = t
 	}
 	t.Requests++
 	t.Prompt += r.PromptTokens
@@ -75,6 +179,14 @@ func logUsage(r UsageRecord) {
 		t.Errors++
 	}
 	t.Cost += r.CostUSD
+	// health feeds off the same record: success = any 2xx, failure =
+	// the status code, attributed to the serving key. unknown status
+	// (0, never sent) records nothing.
+	if r.StatusCode >= 200 && r.StatusCode < 300 {
+		noteModelOutcomeLocked(model, true, 0, r.KeyName)
+	} else if r.StatusCode >= 400 {
+		noteModelOutcomeLocked(model, false, r.StatusCode, r.KeyName)
+	}
 	if r.KeyName != "" {
 		kt := totalsByKey[r.KeyName]
 		if kt == nil {
@@ -123,7 +235,8 @@ func initUsageLog() {
 	if path == "" {
 		path = "nim-usage.jsonl"
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// usage records carry key names and upstream error text: 0600.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Printf("WARN: cannot open %s: %v", path, err)
 		return
@@ -131,7 +244,32 @@ func initUsageLog() {
 	usageMu.Lock()
 	usageFd = f
 	usageOut = json.NewEncoder(f)
+	usagePath = path
 	usageMu.Unlock()
+}
+
+// reinitUsageLog reopens the usage file when usage.path changes under
+// hot-reload; a renamed inode would otherwise eat writes forever.
+func reinitUsageLog() {
+	if !cfg().Usage.Enabled {
+		closeUsageLog()
+		usageMu.Lock()
+		usagePath = ""
+		usageMu.Unlock()
+		return
+	}
+	path := cfg().Usage.Path
+	if path == "" {
+		path = "nim-usage.jsonl"
+	}
+	usageMu.Lock()
+	same := usageFd != nil && usagePath == path
+	usageMu.Unlock()
+	if same {
+		return
+	}
+	closeUsageLog()
+	initUsageLog()
 }
 
 // sseUsageTee scans chat sse bytes for a usage chunk, returns prompt/comp.
@@ -147,11 +285,21 @@ func sseUsageTee(b []byte) (prompt, comp int) {
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
-		if len(line) < 6 || string(line[:6]) != "data: " {
+		// accept "data:" with or without the space (both are
+		// spec-legal); skip non-object lines before unmarshalling.
+		data := line
+		if len(data) >= 5 && string(data[:5]) == "data:" {
+			data = data[5:]
+			if len(data) > 0 && data[0] == ' ' {
+				data = data[1:]
+			}
+		} else {
 			continue
 		}
-		data := line[6:]
 		if len(data) == 0 || data[0] != '{' {
+			continue
+		}
+		if !strings.Contains(string(data), `"usage"`) {
 			continue
 		}
 		var ch struct {

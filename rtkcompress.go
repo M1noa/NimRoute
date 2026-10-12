@@ -119,21 +119,35 @@ func setTextParts(raw any, text string) bool {
 		if !ok || pm["type"] != "text" {
 			return false
 		}
-		parts = append(parts, pm["text"].(string))
+		// client-controlled shape: a non-string text panics the
+		// handler without this guard.
+		s, ok := pm["text"].(string)
+		if !ok {
+			return false
+		}
+		parts = append(parts, s)
 	}
 	if len(parts) == 0 {
 		return false
 	}
+	m0, ok := arr[0].(map[string]any)
+	if !ok {
+		return false
+	}
 	// single text block: keep it a block, carry the joined text
 	if len(parts) == 1 {
-		arr[0].(map[string]any)["text"] = text
+		m0["text"] = text
 		return true
 	}
 	// multiple: first holds everything, rest blanked so the model does not
 	// read the same text twice
-	arr[0].(map[string]any)["text"] = text
+	m0["text"] = text
 	for _, p := range arr[1:] {
-		p.(map[string]any)["text"] = ""
+		pm, ok := p.(map[string]any)
+		if !ok {
+			return false
+		}
+		pm["text"] = ""
 	}
 	return true
 }

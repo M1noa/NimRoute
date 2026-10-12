@@ -2,7 +2,7 @@
 # freepi login helper (stdlib only). runs the github device flow and saves
 # the jwt to a local file for freepi_probe.py.
 # usage: python3 scripts/freepi_login.py [--out freepi_jwt.txt]
-import json, os, sys, time, urllib.request, urllib.error
+import argparse, json, os, sys, time, urllib.request, urllib.error
 
 BASE = "https://api.freepi.ai"
 CONSENT_VERSION = "2"
@@ -26,14 +26,13 @@ def api(method, path, body=None, token=None):
 
 
 def main():
-    out = "freepi_jwt.txt"
-    into_config = ""
-    args = sys.argv[1:]
-    for i, a in enumerate(args):
-        if a == "--out" and i + 1 < len(args):
-            out = args[i + 1]
-        if a == "--into-config" and i + 1 < len(args):
-            into_config = args[i + 1]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="freepi_jwt.txt",
+                    help="jwt file (probe reads it; --into-config flow ignores it)")
+    ap.add_argument("--into-config", default="",
+                    help="config.yml path: append the jwt as a named account")
+    args = ap.parse_args()
+    out, into_config = args.out, args.into_config
 
     st, dev = api("POST", "/auth/github/device", {})
     assert st == 200 and "session_id" in dev, f"device start failed: {st} {dev}"
@@ -64,8 +63,11 @@ def main():
             break
         time.sleep(max(interval, res.get("retry_after", 0)))
 
-    open(out, "w").write(res["token"])
-    print(f"saved jwt to {out}")
+    # owner-only: the jwt is a 90-day credential.
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(res["token"])
+    print(f"saved jwt to {out} (mode 600)")
 
     st, me = api("GET", "/me", token=res["token"])
     print(f"token check: HTTP {st} {me if st != 200 else me.get('handle')}")
@@ -92,15 +94,25 @@ def save_into_config(path, jwt, handle):
     block = '\n    - name: "%s"\n      jwt: "%s"\n' % (name, jwt)
     if re.search(r"(?m)^freepi:\s*$", s):
         # section exists: append under accounts: (create it if missing).
-        if re.search(r"(?m)^  accounts:\s*$", s):
-            s = re.sub(r"(?m)^(  accounts:\s*\n(?:.*\n)*?)(?=\n\S|\Z)",
-                        lambda m: m.group(0) + block, s, count=1)
-            # fallback when accounts: is the last block: plain append.
-            if block not in s:
-                s = s.rstrip() + "\n" + block
+        # located by line index within the freepi: block: the old lazy
+        # regex ran to eof and spliced the jwt under the wrong section
+        # when accounts: was followed by a section with no blank line.
+        lines = s.split("\n")
+        try:
+            fstart = next(i for i, l in enumerate(lines) if re.match(r"^freepi:\s*$", l))
+        except StopIteration:
+            fstart = -1
+        fend = next((i for i in range(fstart + 1, len(lines))
+                     if re.match(r"^\S", lines[i])), len(lines))
+        ai = next((i for i in range(fstart + 1, fend)
+                   if re.match(r"^  accounts:\s*$", lines[i])), None)
+        if ai is None:
+            lines[fend:fend] = ["  enabled: true", "  accounts:", block.rstrip("\n")]
         else:
-            s = re.sub(r"(?m)^freepi:\s*\n",
-                        "freepi:\n  enabled: true\n  accounts:\n" + block, s, count=1)
+            aj = next((i for i in range(ai + 1, fend)
+                       if re.match(r"^  \S", lines[i])), fend)
+            lines[aj:aj] = [block.rstrip("\n")]
+        s = "\n".join(lines)
     else:
         s = s.rstrip() + ("\n# --- freepi: ad-supported free models (see FREEPI-DOCS.md) ---\n"
                           "freepi:\n  enabled: true\n  accounts:\n" + block)

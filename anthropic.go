@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptrace"
 	"os"
@@ -161,16 +162,12 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 
 	clientModel = req.Model
 	upstreamModel = mapClaudeModel(clientModel)
-	// claude code 1m alias: strip only when the suffixed id is unknown
-	// and the base resolves (catalog or claude_map). a backend that
-	// genuinely serves a [1m] id keeps its own.
-	if lookupModelInfo(upstreamModel) == nil {
-		if base, ok := baseModelID(upstreamModel); ok {
-			remapped := mapClaudeModel(base)
-			if lookupModelInfo(remapped) != nil || remapped != base {
-				upstreamModel = remapped
-			}
-		}
+	// claude code 1m alias: no backend serves a [1m] id, so strip the
+	// suffix unconditionally (a claude_map hit on the bare base still
+	// applies). catalog lookups stay downstream, never gate the strip:
+	// a missing catalog file must not break routing.
+	if base, ok := baseModelID(upstreamModel); ok {
+		upstreamModel = mapClaudeModel(base)
 	}
 	isStream = req.Stream
 
@@ -213,6 +210,9 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 	}
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
+	}
+	if req.TopK != nil {
+		out["top_k"] = *req.TopK
 	}
 	if len(req.StopSequences) > 0 {
 		out["stop"] = req.StopSequences
@@ -325,6 +325,11 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 		case "text":
 			textParts = append(textParts, b.Text)
 		case "tool_result":
+			// empty ids carry no correlation upstream: skip instead of
+			// sending tool_call_id "".
+			if b.ToolUseID == "" {
+				continue
+			}
 			text, imgs := toolResultParts(b.Content)
 			if b.IsError {
 				text = "Error: " + text
@@ -383,6 +388,8 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 	var textParts []string
 	var toolCalls []map[string]any
 	var thinkingParts []string
+	var thinkingSigs []string
+	thinkingRedacted := false
 
 	for _, b := range blocks {
 		switch b.Type {
@@ -391,10 +398,17 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 		case "thinking", "redacted_thinking":
 			// zen's interleaved-reasoning models (space-bunny, big-pickle)
 			// expect prior reasoning back on assistant messages as
-			// reasoning_content, matching opencode's transform. drop the
-			// signature; it is opaque and zen does not require it.
+			// reasoning_content, matching opencode's transform. the
+			// signature rides along so providers that verify the chain
+			// keep working; redacted blocks stay typed.
 			if b.Thinking != "" {
 				thinkingParts = append(thinkingParts, b.Thinking)
+			}
+			if b.Signature != "" {
+				thinkingSigs = append(thinkingSigs, b.Signature)
+			}
+			if b.Type == "redacted_thinking" {
+				thinkingRedacted = true
 			}
 		case "tool_use":
 			input := "{}"
@@ -412,17 +426,21 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 		}
 	}
 
-	msg := map[string]any{"role": "assistant"}
-	if len(textParts) > 0 {
-		msg["content"] = strings.Join(textParts, "\n")
-	} else {
-		msg["content"] = nil
-	}
+	// empty turns stay valid upstream: nil content is rejected, "" is not.
+	msg := map[string]any{"role": "assistant", "content": strings.Join(textParts, "\n")}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
 	if len(thinkingParts) > 0 {
 		msg["reasoning_content"] = strings.Join(thinkingParts, "\n")
+	}
+	// preserve the provider signature chain and the redacted marker so
+	// verified-reasoning providers keep working across the conversion.
+	if len(thinkingSigs) > 0 {
+		msg["reasoning_content_signature"] = strings.Join(thinkingSigs, "\n")
+	}
+	if thinkingRedacted {
+		msg["reasoning_content_redacted"] = true
 	}
 	return []map[string]any{msg}
 }
@@ -515,15 +533,8 @@ func contentOf(text []string, imgs []map[string]any) any {
 	return arr
 }
 
-// toolResultText flattens a tool_result body to the string a role:"tool"
-// message can carry.
-func toolResultText(raw json.RawMessage) string {
-	text, _ := toolResultParts(raw)
-	return text
-}
-
 // toolResultParts splits a tool_result body into its text and its images.
-// text-only callers use toolResultText; images need a separate multimodal
+// images need a separate multimodal
 // user message because role:"tool" cannot carry them.
 func toolResultParts(raw json.RawMessage) (string, []map[string]any) {
 	if len(raw) == 0 {
@@ -661,10 +672,13 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 		}
 
 		for _, tc := range msg.ToolCalls {
+			// unparseable args mean a corrupt turn: emit {} and let the
+			// model re-ask, instead of inventing a client-visible field.
 			input := map[string]any{}
 			if tc.Function.Arguments != "" {
 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
-					input = map[string]any{"_raw": tc.Function.Arguments}
+					acclog.Printf("!! tool args unparseable for %s, sending {}", tnames.resolve(tc.Function.Name))
+					input = map[string]any{}
 				}
 			}
 			content = append(content, map[string]any{
@@ -687,8 +701,10 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 			stopReason = "end_turn"
 		case "length":
 			stopReason = "max_tokens"
-		case "tool_calls":
+		case "tool_calls", "function_call":
 			stopReason = "tool_use"
+		case "content_filter":
+			stopReason = "refusal"
 		}
 	}
 
@@ -738,7 +754,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 	body = sseNormalize(body)
 
 	msgID := "msg_" + randHex(24)
-	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":%s,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, jsonStr(clientModel))
 	written += writeSSE(w, "message_start", preamble)
 	written += writeSSE(w, "ping", `{"type":"ping"}`)
 	if fl != nil {
@@ -746,11 +762,15 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 	}
 
 	// the text block opens lazily: a reasoning turn claims index 0 for the
-	// thinking block and the answer follows at index 1.
+	// thinking block and the answer follows at index 1. post-tool text
+	// opens a fresh block after the tools (textCount tracks how many text
+	// blocks have opened, so indices never collide).
 	thinkIdx := -1
 	textIdx := 0
 	textOpen := false
-	textClosed := false
+	textCount := 0
+	lastToolIdx := 0
+	toolBase := 0
 	thinkClosed := false
 	closeThinking := func() {
 		if thinkIdx >= 0 && !thinkClosed {
@@ -759,18 +779,27 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		}
 	}
 	closeText := func() {
-		if textOpen && !textClosed {
+		if textOpen {
 			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, textIdx))
-			textClosed = true
+			textOpen = false
 		}
+	}
+	openText := func() {
+		if textOpen {
+			return
+		}
+		textIdx = boolInt(thinkIdx >= 0) + textCount + lastToolIdx
+		textCount++
+		written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
+		textOpen = true
 	}
 	hasToolCalls := false
 	toolIdxMap := map[int]int{}
-	lastToolIdx := 0
 	hasSentStopReason := false
 	var strip sentinelStripper
 	flushStrip := func() {
-		if tail := strip.flush(); tail != "" && !hasToolCalls && !textClosed {
+		if tail := strip.flush(); tail != "" {
+			openText()
 			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(tail)))
 		}
 	}
@@ -793,6 +822,15 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 					Content          string `json:"content"`
 					Reasoning        string `json:"reasoning"`
 					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Type     string `json:"type"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"message"`
 				Delta struct {
 					Content string `json:"content"`
@@ -829,6 +867,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 			chunk.Choices[0].Delta.Content += m.Content
 			chunk.Choices[0].Delta.Reasoning += m.Reasoning
 			chunk.Choices[0].Delta.ReasoningContent += m.ReasoningContent
+			chunk.Choices[0].Delta.ToolCalls = append(chunk.Choices[0].Delta.ToolCalls, m.ToolCalls...)
 			if chunk.Choices[0].FinishReason == nil {
 				chunk.Choices[0].FinishReason = strPtr("stop")
 			}
@@ -864,12 +903,11 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%s}}`, jsonStr(think)))
 		}
 
-		// text delta
-		if choice.Delta.Content != "" && !hasToolCalls && !textClosed {
-			if !textOpen {
-				written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
-				textOpen = true
-			}
+		// text delta. post-tool text opens a fresh block after the
+		// tools instead of being dropped (interleaved models emit text
+		// after tool calls; the old gate truncated the turn).
+		if choice.Delta.Content != "" {
+			openText()
 			if clean := strip.push(choice.Delta.Content); clean != "" {
 				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(clean)))
 			}
@@ -886,7 +924,13 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 			// tools follow whatever blocks already opened (thinking, text).
 			// each upstream tool index gets its own block index: deltas for a
 			// second call in the same chunk must not reuse the first's index.
-			base := boolInt(thinkIdx >= 0) + boolInt(textOpen)
+			// textCount (not textOpen) so a closed text block keeps its index.
+			// the first base wins for the stop loop below: later text blocks
+			// open after the tools and must not shift their stops.
+			base := boolInt(thinkIdx >= 0) + textCount
+			if lastToolIdx == 0 {
+				toolBase = base
+			}
 			for _, tc := range choice.Delta.ToolCalls {
 				idx, open := toolIdxMap[tc.Index]
 				if !open {
@@ -913,7 +957,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 
 			closeThinking()
 
-			toolBase := boolInt(thinkIdx >= 0) + boolInt(textOpen)
+			// toolBase captured at first tool open above
 			for i := 0; i < lastToolIdx; i++ {
 				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 			}
@@ -944,7 +988,7 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 
 		closeThinking()
 
-		toolBase := boolInt(thinkIdx >= 0) + boolInt(textOpen)
+		// toolBase captured at first tool open above
 		for i := 0; i < lastToolIdx; i++ {
 			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 		}
@@ -1094,19 +1138,44 @@ func (s *respStreamer) feed(body []byte, last bool) {
 		switch evt.Type {
 		case "response.output_item.added":
 			if evt.Item != nil && evt.Item.Type == "function_call" {
+				// resolve once, use the same id for open/delta/close:
+				// tools with an empty ItemID never closed before.
 				id := evt.ItemID
 				if id == "" {
 					id = evt.Item.ID
 				}
+				if id == "" {
+					id = evt.Item.CallID
+				}
 				s.openTool(id, evt.Item.CallID, evt.Item.Name)
 			}
 		case "response.function_call_arguments.delta":
-			if _, ok := s.toolIdx[evt.ItemID]; ok && evt.Delta != "" {
-				s.written += writeSSE(s.w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, s.toolIdx[evt.ItemID], jsonStr(evt.Delta)))
+			// open on demand: arg deltas can precede the added event.
+			id := evt.ItemID
+			if id == "" && evt.Item != nil {
+				id = evt.Item.ID
+				if id == "" {
+					id = evt.Item.CallID
+				}
+			}
+			if id != "" && evt.Delta != "" {
+				name := ""
+				if evt.Item != nil {
+					name = evt.Item.Name
+				}
+				s.openTool(id, id, name)
+				s.written += writeSSE(s.w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, s.toolIdx[id], jsonStr(evt.Delta)))
 			}
 		case "response.output_item.done":
 			if evt.Item != nil && evt.Item.Type == "function_call" {
-				s.closeTool(evt.ItemID)
+				id := evt.ItemID
+				if id == "" {
+					id = evt.Item.ID
+				}
+				if id == "" {
+					id = evt.Item.CallID
+				}
+				s.closeTool(id)
 			}
 		case "response.output_text.delta":
 			s.openText()
@@ -1144,7 +1213,7 @@ func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, bo
 	}
 
 	msgID := "msg_" + randHex(24)
-	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":%s,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, jsonStr(clientModel))
 	s.written += writeSSE(w, "message_start", preamble)
 	s.written += writeSSE(w, "ping", `{"type":"ping"}`)
 	s.flush()
@@ -1186,11 +1255,12 @@ func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, bo
 		}
 	}
 	if !done {
+		// a truncated stream may never send response.completed: the
+		// client must still get message_stop, not a hanging turn.
 		if len(carry) > 0 {
 			s.feed(append(carry, '\n'), true)
-		} else {
-			s.finish()
 		}
+		s.finish()
 	}
 	return s.written, s.promptT, s.compT
 }
@@ -1206,7 +1276,7 @@ func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel s
 	}
 
 	msgID := "msg_" + randHex(24)
-	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":"%s","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, clientModel)
+	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":%s,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, jsonStr(clientModel))
 	s.written += writeSSE(w, "message_start", preamble)
 	s.written += writeSSE(w, "ping", `{"type":"ping"}`)
 	s.flush()
@@ -1218,9 +1288,10 @@ func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel s
 	return s.written, s.promptT, s.compT
 }
 
-// toolsOffered reports whether a /responses-shaped request body offers any
-// non-empty-named function tools. tool_choice "none" offers nothing: the
-// gate stubs on tool-less bodies must never trigger a nudge.
+// toolsOffered reports whether a request body offers any non-empty-named
+// function tools. works for chat and /responses shapes alike. tool_choice
+// "none" offers nothing: the gate stubs on tool-less bodies must never
+// trigger a nudge.
 func toolsOffered(body []byte) bool {
 	var m struct {
 		ToolChoice any `json:"tool_choice"`
@@ -1235,8 +1306,15 @@ func toolsOffered(body []byte) bool {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return false
 	}
-	if m.ToolChoice == "none" {
-		return false
+	switch tc := m.ToolChoice.(type) {
+	case string:
+		if tc == "none" {
+			return false
+		}
+	case map[string]any:
+		if t, _ := tc["type"].(string); t == "none" {
+			return false
+		}
 	}
 	for _, t := range m.Tools {
 		if t.Type != "" && t.Type != "function" {
@@ -1339,6 +1417,309 @@ func isWaitOnly(body []byte) bool {
 	return strings.TrimSpace(text) == waitSentinel
 }
 
+// scanChatSSE returns the concatenated delta content and whether any
+// tool_calls deltas appeared in a chat/completions SSE body. buffered
+// plain-json bodies (a single object, no data: lines) are normalized
+// first so the freepi path scans the same way.
+func scanChatSSE(body []byte) (text string, hasCalls bool) {
+	body = sseNormalize(body)
+	var sb strings.Builder
+	for _, raw := range bytes.Split(body, []byte("\n")) {
+		line := string(bytes.TrimSpace(raw))
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var ch struct {
+			Choices []struct {
+				Message *struct {
+					Content   string `json:"content"`
+					ToolCalls []any  `json:"tool_calls"`
+				} `json:"message"`
+				Delta struct {
+					Content   string `json:"content"`
+					ToolCalls []any  `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &ch); err != nil {
+			continue
+		}
+		for _, c := range ch.Choices {
+			if c.Message != nil {
+				sb.WriteString(c.Message.Content)
+				if len(c.Message.ToolCalls) > 0 {
+					hasCalls = true
+				}
+			}
+			sb.WriteString(c.Delta.Content)
+			if len(c.Delta.ToolCalls) > 0 {
+				hasCalls = true
+			}
+		}
+	}
+	return sb.String(), hasCalls
+}
+
+// scanChatJSON is scanChatSSE for a folded chat completion object.
+func scanChatJSON(body []byte) (text string, hasCalls bool) {
+	var c struct {
+		Choices []struct {
+			Message struct {
+				Content   any   `json:"content"`
+				ToolCalls []any `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &c); err != nil || len(c.Choices) == 0 {
+		return "", false
+	}
+	m := c.Choices[0].Message
+	switch t := m.Content.(type) {
+	case string:
+		text = t
+	case []any:
+		for _, p := range t {
+			if pm, ok := p.(map[string]any); ok {
+				if s, _ := pm["text"].(string); s != "" {
+					text += s
+				}
+			}
+		}
+	}
+	return text, len(m.ToolCalls) > 0
+}
+
+// nudgeReprompt is the shared reprompt text for both shapes.
+func nudgeReprompt() string {
+	return "You have tools available in this conversation. If any tool applies to the task above, call it now instead of describing what you would do. " +
+		"Do not narrate progress or restate what you already wrote. " +
+		"If you are waiting on the user to answer, or the task is fully done, reply with exactly " + waitSentinel + " and nothing else. " +
+		"Do not answer your own questions or assume the user's reply."
+}
+
+// nudgeContinuationChat builds a follow-up chat/completions body: the prior
+// messages plus the assistant's text and a nudge to use the offered tools.
+func nudgeContinuationChat(oaiBody []byte, priorText string) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(oaiBody, &m); err != nil {
+		return nil
+	}
+	msgs, _ := m["messages"].([]any)
+	msgs = append(msgs, map[string]any{"role": "assistant", "content": priorText})
+	msgs = append(msgs, map[string]any{"role": "user", "content": nudgeReprompt()})
+	m["messages"] = msgs
+	delete(m, "nudge_no_tools")
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// stripChatTerminal drops the terminal data: lines ([DONE] plus the final
+// finish_reason chunk) off a chat SSE body so concatenation with a retry
+// body plays as one stream. non-terminal lines pass through untouched.
+func stripChatTerminal(body []byte) []byte {
+	lines := strings.Split(string(body), "\n")
+	end := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "event: ") {
+			continue
+		}
+		if !strings.HasPrefix(t, "data: ") {
+			break
+		}
+		data := strings.TrimPrefix(t, "data: ")
+		if data == "[DONE]" {
+			end = i
+			continue
+		}
+		var ch struct {
+			Choices []struct {
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &ch) == nil && len(ch.Choices) > 0 &&
+			ch.Choices[0].FinishReason != nil {
+			end = i
+			continue
+		}
+		break
+	}
+	return []byte(strings.Join(lines[:end], "\n"))
+}
+
+// mergeChatSSE concatenates buffered chat SSE bodies into one stream:
+// terminal lines are stripped from every body but the last.
+func mergeChatSSE(bodies [][]byte) []byte {
+	var out bytes.Buffer
+	for i, b := range bodies {
+		if i < len(bodies)-1 {
+			b = stripChatTerminal(b)
+		}
+		out.Write(b)
+		if !bytes.HasSuffix(out.Bytes(), []byte("\n")) {
+			out.WriteByte('\n')
+		}
+	}
+	return out.Bytes()
+}
+
+// nudgeChatGates runs the shared gates: master switch, per-model flag,
+// offered tools, streak cap, and non-empty tool-less text. returns the
+// text when the nudge may fire, "" when it must not.
+func nudgeChatGates(session, clientModel string, posted []byte, text string, hasCalls bool) string {
+	if !nudgeEnabled(clientModel) {
+		dbglog.Printf("  nudge skip model=%s reason=disabled", clientModel)
+		return ""
+	}
+	if !toolsOffered(posted) {
+		dbglog.Printf("  nudge skip model=%s reason=no-tools-offered", clientModel)
+		return ""
+	}
+	if hasCalls {
+		nudgeStreaks.note(session, true)
+		return ""
+	}
+	if !nudgeStreaks.allowed(session) {
+		dbglog.Printf("  nudge skip model=%s reason=streak-cap", clientModel)
+		return ""
+	}
+	if strings.Contains(text, waitSentinel) {
+		return ""
+	}
+	if strings.TrimSpace(text) == "" {
+		dbglog.Printf("  nudge skip model=%s reason=empty-text", clientModel)
+		return ""
+	}
+	return text
+}
+
+// noteNudgeRetry records the streak and logs after a nudge repost.
+// returns true when the retry called tools (caller keeps it).
+func noteNudgeRetry(session, clientModel string, nb2 []byte, text string, hasCalls bool, backend string) bool {
+	if !hasCalls {
+		nudgeStreaks.note(session, false)
+		if strings.TrimSpace(text) == waitSentinel {
+			acclog.Printf("  %s nudge model=%s waiting, swallowing retry", backend, clientModel)
+		} else {
+			acclog.Printf("  %s nudge model=%s no-calls, swallowing retry text=%q", backend, clientModel, errSnippet([]byte(text), 120))
+		}
+		return false
+	}
+	nudgeStreaks.note(session, true)
+	acclog.Printf("  %s nudge model=%s calls=%v bytes=%d", backend, clientModel, hasCalls, len(nb2))
+	return true
+}
+
+// tryNudgeChat runs the no-tools continue for chat/completions bodies:
+// same gates as the responses path, continuation on messages[], retry
+// scanned as SSE or folded JSON. returns the retry body, or nil when the
+// nudge doesn't fire (or the retry called nothing) so callers keep the
+// original. backend names the log prefix (opencode, freepi, antseed, nvidia).
+func tryNudgeChat(session, clientModel, backend string, posted, rb []byte, post func(nb []byte) []byte) []byte {
+	text, hasCalls := scanChatSSE(rb)
+	if nudgeChatGates(session, clientModel, posted, text, hasCalls) == "" {
+		return nil
+	}
+	nb := nudgeContinuationChat(posted, text)
+	if nb == nil {
+		return nil
+	}
+	nb2 := post(nb)
+	if nb2 == nil {
+		return nil
+	}
+	text2, nHasCalls := scanChatSSE(nb2)
+	if !noteNudgeRetry(session, clientModel, nb2, text2, nHasCalls, backend) {
+		return nil
+	}
+	return nb2
+}
+
+// tryNudgeJSON is tryNudgeChat for already-folded chat completion objects
+// (backends that fetch with stream=false): scan/merge JSON throughout.
+func tryNudgeJSON(session, clientModel, backend string, posted, rb []byte, post func(nb []byte) []byte) []byte {
+	text, hasCalls := scanChatJSON(rb)
+	if nudgeChatGates(session, clientModel, posted, text, hasCalls) == "" {
+		return nil
+	}
+	nb := nudgeContinuationChat(posted, text)
+	if nb == nil {
+		return nil
+	}
+	nb2 := post(nb)
+	if nb2 == nil {
+		return nil
+	}
+	text2, nHasCalls := scanChatJSON(nb2)
+	if !noteNudgeRetry(session, clientModel, nb2, text2, nHasCalls, backend) {
+		return nil
+	}
+	return nb2
+}
+
+// mergeChatJSON folds a nudge retry into a chat completion object: texts
+// concatenate, the retry's tool calls win, usage sums when both present.
+func mergeChatJSON(first, retry []byte) []byte {
+	var f, r struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Role      string `json:"role"`
+				Content   any    `json:"content"`
+				ToolCalls []any  `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage map[string]any `json:"usage"`
+	}
+	if json.Unmarshal(first, &f) != nil || json.Unmarshal(retry, &r) != nil ||
+		len(f.Choices) == 0 || len(r.Choices) == 0 {
+		return first
+	}
+	textOf := func(v any) string {
+		s, _ := v.(string)
+		return s
+	}
+	ct := textOf(f.Choices[0].Message.Content) + textOf(r.Choices[0].Message.Content)
+	calls := r.Choices[0].Message.ToolCalls
+	if len(calls) == 0 {
+		calls = f.Choices[0].Message.ToolCalls
+	}
+	f.Choices[0].Message.Content = stripWaitSentinel(ct)
+	if len(calls) > 0 {
+		f.Choices[0].Message.ToolCalls = calls
+	}
+	if fr := r.Choices[0].FinishReason; fr != nil {
+		f.Choices[0].FinishReason = fr
+	}
+	for k, rv := range r.Usage {
+		if fv, ok := f.Usage[k]; ok {
+			if a, ok := fv.(float64); ok {
+				if b, ok := rv.(float64); ok {
+					f.Usage[k] = a + b
+					continue
+				}
+			}
+		}
+		f.Usage[k] = rv
+	}
+	if b, err := json.Marshal(f); err == nil {
+		return b
+	}
+	return first
+}
+
 // stripWaitSentinel removes the internal wait sentinel so it never reaches
 // the client. the model sometimes echoes it with extra words attached.
 func stripWaitSentinel(s string) string {
@@ -1394,8 +1775,8 @@ func (s *sentinelStripper) flush() string {
 // sends when text arrives without deltas or calls complete in one item.
 func scanResponsesSSE(body []byte) (text string, hasCalls bool) {
 	var sb strings.Builder
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
+	for _, raw := range bytes.Split(body, []byte("\n")) {
+		line := string(bytes.TrimSpace(raw))
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -1493,8 +1874,13 @@ func (s *nudgeState) note(session string, calledTools bool) {
 		delete(s.n, session)
 		return
 	}
+	// bounded without punishing everyone: evict one arbitrary entry
+	// instead of wiping every session's streak cap.
 	if len(s.n) > 8192 {
-		s.n = map[string]int{}
+		for k := range s.n {
+			delete(s.n, k)
+			break
+		}
 	}
 	s.n[session]++
 }
@@ -1508,34 +1894,14 @@ var nudgeStreaks = &nudgeState{}
 // callers merge: stream sites append the retry as a second body,
 // buffered sites fold mergeResponsesSSE([rb, retry]) before converting.
 func tryNudgeResponses(session, clientModel string, posted, rb []byte, post func(nb []byte) []byte) []byte {
-	if !nudgeEnabled(clientModel) {
-		dbglog.Printf("  nudge skip model=%s reason=disabled", clientModel)
-		return nil
-	}
-	if !toolsOffered(posted) {
-		dbglog.Printf("  nudge skip model=%s reason=no-tools-offered", clientModel)
-		return nil
-	}
 	text, hasCalls := scanResponsesSSE(rb)
-	if hasCalls {
-		nudgeStreaks.note(session, true)
-		return nil
-	}
-	if !nudgeStreaks.allowed(session) {
-		dbglog.Printf("  nudge skip model=%s reason=streak-cap", clientModel)
-		return nil
-	}
-	if strings.Contains(text, waitSentinel) {
-		return nil
-	}
-	if strings.TrimSpace(text) == "" {
-		dbglog.Printf("  nudge skip model=%s reason=empty-text", clientModel)
-		return nil
-	}
 	// no question exemption: the reprompt tells the model to emit
 	// only waitSentinel when waiting, so nudging past a question
 	// is safe. exempting questions let greetings loop forever
 	// with no tool calls and no nudge ever firing.
+	if nudgeChatGates(session, clientModel, posted, text, hasCalls) == "" {
+		return nil
+	}
 	nb := nudgeContinuation(posted, text)
 	if nb == nil {
 		return nil
@@ -1545,21 +1911,9 @@ func tryNudgeResponses(session, clientModel string, posted, rb []byte, post func
 		return nil
 	}
 	text2, nHasCalls := scanResponsesSSE(nb2)
-	if !nHasCalls {
-		nudgeStreaks.note(session, false)
-		// retry called nothing: swallowing keeps the turn to one
-		// assistant message so the agent acts instead of narrating
-		// twice. covers wait-only plus any tool-less text (which may
-		// carry the wait sentinel with extra words attached).
-		if isWaitOnly(nb2) {
-			acclog.Printf("  opencode nudge model=%s waiting, swallowing retry", clientModel)
-		} else {
-			acclog.Printf("  opencode nudge model=%s no-calls, swallowing retry text=%q", clientModel, errSnippet([]byte(text2), 120))
-		}
+	if !noteNudgeRetry(session, clientModel, nb2, text2, nHasCalls, "opencode") {
 		return nil
 	}
-	nudgeStreaks.note(session, true)
-	acclog.Printf("  opencode nudge model=%s calls=%v bytes=%d", clientModel, nHasCalls, len(nb2))
 	return nb2
 }
 
@@ -1663,6 +2017,22 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 
 	acclog.Printf("%s -> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", reqID, clientModel, upstreamModel, isStream, len(oaiBody))
 
+	if strings.HasPrefix(upstreamModel, "route/") {
+		if !routeEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (route disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "route is disabled; set route.enabled: true in config.yml")
+			return
+		}
+		key := strings.TrimPrefix(upstreamModel, "route/")
+		if strings.TrimSpace(key) == "" {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "route: empty model name")
+			return
+		}
+		acclog.Printf("%s routed to route=%s", reqID, key)
+		p.handleRouteAnthropic(w, r, body, oaiBody, clientModel, key, tnames, isStream, start, reqID)
+		return
+	}
+
 	// Route opencode/* models to zen endpoint
 	if strings.HasPrefix(upstreamModel, "opencode/") {
 		if !zenEnabled() {
@@ -1725,6 +2095,13 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	acclog.Printf("%s routed to nvidia target=%s model=%s", reqID, target, upstreamModel)
 	p.concurrentNV.Add(1)
 	defer p.concurrentNV.Add(-1)
+	p.handleNvidiaAnthropic(w, r, oaiBody, body, clientModel, upstreamModel, tnames, isStream, start, reqID)
+}
+
+// handleNvidiaAnthropic serves /v1/messages via nim. split from
+// handleAnthropic so the route dispatcher can try it as one candidate.
+func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oaiBody, body []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time, reqID string) {
+	target := nvidiaBase + "/chat/completions"
 	fwd := http.Header{
 		"Content-Type": {"application/json"},
 		"Accept":       {"application/json"},
@@ -1776,12 +2153,25 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	// session for the streak cap: lanes key on x-session-id verbatim.
+	session := r.Header.Get("x-session-id")
+	nvidiaPost := func(nb []byte) []byte {
+		nu, err := p.callUpstream(r.Context(), r.Method, target, nb, fwd, upstreamModel, r.RemoteAddr)
+		if err != nil || nu == nil || nu.StatusCode != http.StatusOK {
+			return nil
+		}
+		return nu.Body
+	}
 	if isStream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
-		written, promptT, compT := streamAnthropic(w, u.Body, clientModel, tnames)
+		body := u.Body
+		if retry := tryNudgeChat(session, clientModel, "nvidia", oaiBody, body, nvidiaPost); retry != nil {
+			body = mergeChatSSE([][]byte{body, retry})
+		}
+		written, promptT, compT := streamAnthropic(w, body, clientModel, tnames)
 
 		p.Postpone(u.KeyObj, 1500*time.Millisecond)
 		p.Clear429(u.KeyObj)
@@ -1805,13 +2195,32 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [%s]", elapsed.Round(time.Millisecond), written, u.Key)
 	} else {
-		out, errMsg, _ := openAIToAnthropic(u.Body, clientModel, tnames)
+		// non-stream nvidia may arrive as SSE or plain JSON: fold
+		// SSE first, then nudge on the folded JSON throughout.
+		foldChat := func(b []byte) []byte {
+			if strings.Contains(string(b), "data: ") {
+				return sseToNonStream(b, upstreamModel, tnames)
+			}
+			return b
+		}
+		folded := foldChat(u.Body)
+		postFolded := func(nb []byte) []byte {
+			rb := nvidiaPost(nb)
+			if rb == nil {
+				return nil
+			}
+			return foldChat(rb)
+		}
+		if retry := tryNudgeJSON(session, clientModel, "nvidia", oaiBody, folded, postFolded); retry != nil {
+			folded = mergeChatJSON(folded, retry)
+		}
+		out, errMsg, _ := openAIToAnthropic(folded, clientModel, tnames)
 		if errMsg != "" {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
 			return
 		}
 
-		prompT, compT, _ := respTokens(u.Body)
+		prompT, compT, _ := respTokens(folded)
 
 		p.Postpone(u.KeyObj, 1500*time.Millisecond)
 		p.Clear429(u.KeyObj)
@@ -1923,21 +2332,15 @@ func extractErrMessage(body string) string {
 
 func randHex(n int) string {
 	b := make([]byte, n/2+1)
-	rand.Read(b)
+	// crypto/rand failure leaves zero bytes: fail the mint, never hand
+	// out a predictable id.
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("crypto/rand failed: %v", err)
+	}
 	return fmt.Sprintf("%x", b)[:n]
 }
 
 const b62chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-func randBase62(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	out := make([]byte, n)
-	for i := range b {
-		out[i] = b62chars[int(b[i])%62]
-	}
-	return string(out)
-}
 
 // zenID mirrors packages/schema/src/identifier.ts: timestamp ms * 0x1000 +
 // per-ms counter, 6 bytes big-endian hex (complemented when descending),
@@ -1966,7 +2369,9 @@ func zenID(descending bool) string {
 	timeHex := fmt.Sprintf("%012x", masked)
 	// crypto random, same charset/modulo as identifier.ts
 	rb := make([]byte, 14)
-	rand.Read(rb)
+	if _, err := rand.Read(rb); err != nil {
+		log.Fatalf("crypto/rand failed: %v", err)
+	}
 	rb62 := make([]byte, 14)
 	for i := range rb {
 		rb62[i] = b62chars[int(rb[i])%62]
@@ -2018,10 +2423,23 @@ func zenDebugCapture(tag string, v any) {
 	if dir == "" {
 		return
 	}
-	os.MkdirAll(dir, 0o755)
+	os.MkdirAll(dir, 0o700)
 	n := zenDebugSeq.Add(1)
+	// captures hold headers + bodies: redact credential headers and keep
+	// the files owner-only.
+	if m, ok := v.(map[string]any); ok {
+		if h, ok := m["headers"].(http.Header); ok {
+			rh := h.Clone()
+			for _, k := range []string{"Authorization", "X-Api-Key", "Cookie", "X-Session-Id"} {
+				if _, present := rh[http.CanonicalHeaderKey(k)]; present {
+					rh.Set(k, "REDACTED")
+				}
+			}
+			m["headers"] = rh
+		}
+	}
 	if b, err := json.Marshal(v); err == nil {
-		os.WriteFile(fmt.Sprintf("%s/%s-%05d.json", dir, tag, n), b, 0o644)
+		os.WriteFile(fmt.Sprintf("%s/%s-%05d.json", dir, tag, n), b, 0o600)
 	}
 }
 
@@ -2036,6 +2454,13 @@ func zenApplyHeaders(req *http.Request, sessionID string, client http.Header, re
 		h := client.Clone()
 		for _, k := range []string{"Connection", "Accept-Encoding", "Content-Length", "Transfer-Encoding", "Te"} {
 			h.Del(k)
+		}
+		// client credentials and spoofable opencode identity never ride
+		// along, even in debug passthrough: the proxy sets its own.
+		for k := range h {
+			if !zenHeaderForwarded(k) {
+				h.Del(k)
+			}
 		}
 		req.Header = h
 	} else {
@@ -2056,12 +2481,29 @@ func estimateTokens(body []byte) int {
 		return 1000
 	}
 
-	chars := 0
-	if len(req.System) > 0 {
-		chars += len(req.System)
+	// decoded text only: raw json bytes count base64 images and
+	// syntax as tokens, inflating the estimate several-fold.
+	textOf := func(raw json.RawMessage) int {
+		if len(raw) == 0 {
+			return 0
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return len(s)
+		}
+		var blocks []anthropicBlock
+		if json.Unmarshal(raw, &blocks) != nil {
+			return 0
+		}
+		n := 0
+		for _, b := range blocks {
+			n += len(b.Text) + len(b.Thinking)
+		}
+		return n
 	}
+	chars := textOf(req.System)
 	for _, msg := range req.Messages {
-		chars += len(msg.Content)
+		chars += textOf(msg.Content)
 	}
 	for _, tool := range req.Tools {
 		chars += len(tool.Name) + len(tool.Description) + len(tool.InputSchema)
@@ -2109,10 +2551,10 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	if os.Getenv("ZEN_DUMP") != "" {
 		t := time.Now().UnixNano()
 		p := fmt.Sprintf("/tmp/zenreq_%d.json", t)
-		os.WriteFile(p, oaiBody, 0o644)
+		os.WriteFile(p, oaiBody, 0o600)
 		acclog.Printf("ZEN_DUMP request %d bytes -> %s", len(oaiBody), p)
 		pi := fmt.Sprintf("/tmp/zenin_%d.json", t)
-		os.WriteFile(pi, origBody, 0o644)
+		os.WriteFile(pi, origBody, 0o600)
 		acclog.Printf("ZEN_DUMP inbound %d bytes -> %s", len(origBody), pi)
 	}
 
@@ -2172,7 +2614,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			zenApplyHeaders(req, sessionID, r.Header, reqID, zenRetries, target, proxy, zenModel)
 			if zenRetries > 0 {
-				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), sessionID, redactProxyUserinfo(proxy), lane.id)
+				acclog.Printf("  opencode retry %d/%d session=%s proxy=%s lane=%s", zenRetries, zenRetryLabel(), partialSession(sessionID), redactProxyUserinfo(proxy), lane.id)
 			}
 
 			hedgeAfter := hedgeDelay()
@@ -2198,7 +2640,18 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					zenApplyHeaders(hreq, laneSession(hl), r.Header, reqID, "hedge", target, hp, zenModel)
 					hup, huerr := hcl.Do(hreq)
 					if huerr == nil {
-						noteExitOK(hp)
+						// transport success is not a served
+						// request: only a 200 stamps health.
+						if hup.StatusCode == http.StatusOK {
+							noteExitOK(hp)
+						} else if hup.StatusCode == http.StatusTooManyRequests {
+							noteExit429(hp)
+						}
+					} else if hctx.Err() == nil {
+						// own proxy label: primary-side vs hedge-side
+						// mixups are answerable next time.
+						acclog.Printf("  opencode hedge error model=%s country=%s proxy=%s lane=%s: %v",
+							clientModel, proxyCountry(hp), redactProxyUserinfo(hp), hl.id, huerr)
 					}
 					return hup, huerr
 				}, hedgeAfter)
@@ -2214,6 +2667,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			if err != nil {
 				dropProxy(proxy)
+				laneReproxy(lane, zenModel)
 				rotating = true
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
 				if noteZenNetworkError() {
@@ -2229,18 +2683,25 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
+				st := up.StatusCode
 				up.Body.Close()
 				acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
-					up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
+					st, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
 				noteExit429(proxy)
-				lane = laneFailover(lane)
-				sessionID = laneRotate(lane, zenModel)
-				rotating = true
-				zenBackoffCtx(r.Context(), zenRetries)
-				continue
+				if zenLastRetry(zenRetries) {
+					// exhausted: fall through to the forward with a
+					// synthesized body, never the closed empty one.
+					up = exhausted429(clientModel, st)
+				} else {
+					lane = laneFailover(lane)
+					sessionID = laneRotate(lane, zenModel)
+					rotating = true
+					zenBackoffCtx(r.Context(), zenRetries)
+					continue
+				}
 			}
 
 			if up.StatusCode != http.StatusOK {
@@ -2336,7 +2797,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenresp_%d.json", time.Now().UnixNano())
-			os.WriteFile(p, rb, 0o644)
+			os.WriteFile(p, rb, 0o600)
 			acclog.Printf("ZEN_DUMP response %d bytes -> %s", len(rb), p)
 		}
 		errMsg := extractErrMessage(string(rb))
@@ -2384,6 +2845,23 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				}
 				written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
 			} else {
+				// chat-model no-tools continue: same gates as spark, on
+				// raw chat SSE. the retry merges as a second segment.
+				post := func(nb []byte) []byte {
+					nresp := zenPost(nb, true, "nudge")
+					if nresp == nil {
+						return nil
+					}
+					defer nresp.Body.Close()
+					if nresp.StatusCode != http.StatusOK {
+						return nil
+					}
+					nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
+					return nb2
+				}
+				if retry := tryNudgeChat(sessionID, upstreamModel, "opencode", oaiBody, rb, post); retry != nil {
+					rb = mergeChatSSE([][]byte{rb, retry})
+				}
 				written, promptT, compT = streamAnthropic(w, rb, clientModel, tnames)
 			}
 		}
@@ -2402,13 +2880,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           true,
 			ContentBytes:     int64(len(origBody)),
 		})
-		laneTokensAdd(lane, zenModel, promptT, compT, promptT+compT)
+		laneTokensAdd(lane, zenModel, promptT, compT, promptT+compT, elapsed.Milliseconds())
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), written, clientModel, reqID)
 	} else {
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenraw_%d.bin", time.Now().UnixNano())
-			os.WriteFile(p, rb, 0o644)
+			os.WriteFile(p, rb, 0o600)
 			acclog.Printf("ZEN_DUMP nonstream raw %d bytes -> %s", len(rb), p)
 		}
 		if isResponses && resp.StatusCode == http.StatusOK {
@@ -2431,11 +2909,27 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			rb = responsesToChat(responsesSSEToJSON(rb))
 		} else {
+			// chat-model continue on raw SSE before folding.
+			post := func(nb []byte) []byte {
+				nresp := zenPost(nb, false, "nudge")
+				if nresp == nil {
+					return nil
+				}
+				defer nresp.Body.Close()
+				if nresp.StatusCode != http.StatusOK {
+					return nil
+				}
+				nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
+				return nb2
+			}
+			if retry := tryNudgeChat(sessionID, upstreamModel, "opencode", oaiBody, rb, post); retry != nil {
+				rb = mergeChatSSE([][]byte{rb, retry})
+			}
 			rb = sseToNonStream(rb, zenModel, tnames)
 		}
 		if os.Getenv("ZEN_DUMP") != "" {
 			p := fmt.Sprintf("/tmp/zenfold_%d.json", time.Now().UnixNano())
-			os.WriteFile(p, rb, 0o644)
+			os.WriteFile(p, rb, 0o600)
 			acclog.Printf("ZEN_DUMP nonstream folded %d bytes -> %s", len(rb), p)
 		}
 		out := rb
@@ -2466,7 +2960,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			Stream:           false,
 			ContentBytes:     int64(len(origBody)),
 		})
-		laneTokensAdd(lane, zenModel, prompT, compT, prompT+compT)
+		laneTokensAdd(lane, zenModel, prompT, compT, prompT+compT, elapsed.Milliseconds())
 		acclog.Printf("<- 200 POST /v1/messages %v %d bytes [opencode] model=%s %s", elapsed.Round(time.Millisecond), len(out), clientModel, reqID)
 	}
 }

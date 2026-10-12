@@ -1,11 +1,20 @@
 # nimroute config. copied to config.yml on first run, then hot-reloaded:
 # edit this file (or config.yml), changes apply in seconds, no restart.
-# env overrides: PORT=5419, CONFIG_FILE=/path/to/config.yml
+# env overrides: PORT=5419, CONFIG_FILE=/path/to/config.yml,
+# NIM_AUTH=<token> (nimstatus.py only: authenticates the status client
+# against /status; server auth is auth.tokens below), DEBUG=1 (verbose logs).
 
 # --- server ---
 server:
   # port to listen on. default 5419.
   port: 5419
+  # listen address. "" = 127.0.0.1 (loopback only). empty auth.tokens is
+  # only safe on loopback; set bind to 0.0.0.0 only with tokens configured.
+  bind: "127.0.0.1"
+  # browser origins allowed cross-origin access (exact match). empty =
+  # browsers get no CORS headers (curl and other non-browser clients are
+  # unaffected). env CORS_ORIGINS (comma-separated) overrides this.
+  cors_origins: []
 
 # --- auth: who may call the model endpoints ---
 auth:
@@ -36,6 +45,8 @@ guardrails:
   # master switch. false = pass system prompts through untouched.
   enabled: true
   # big list of known guardrail strings. keep the shipped file.
+  # this is the ONLY file the loader reads (system-prompts/guardrails.json
+  # is a stale research copy, not loaded).
   file: "guardrails.json"
   # extra strings of your own, matched the same fuzzy way:
   # extra:
@@ -116,10 +127,10 @@ anonymize:
     timeout_ms: 500
     min_score: 0.4
 
-# --- nudge: continue tool-less spark answers with one reprompt round ---
+# --- nudge: continue tool-less answers with one reprompt round ---
 nudge:
   # master switch. false = never reprompt, first answer stands.
-  # per-model nudge_no_tools in model_info.jsonc still applies.
+  # per-model nudge in models.nudge / nudge_no_tools still applies.
   enabled: true
 
 # --- rtk: tool_result compression (port of rtk-ai/rtk) ---
@@ -207,6 +218,12 @@ zen:
   # wait before the second lane starts when racing (ms). 0 = both at once,
   # which is what a race wants. negative = same as 0.
   race_hedge_after_ms: 0
+  # convo-hash lanes idle past this (minutes) are dropped on the sweep.
+  # one-shot requests never pin a lane past this. 0 disables. default 1.
+  convo_idle_minutes: 1
+  # fire a second request on another exit when no first byte arrives within
+  # this (ms); first response wins. -1 disables. default 0 (= 2s inside).
+  hedge_after_ms: 0
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
   # drop lanes idle past this (minutes) on the same sweep, clearing the
@@ -222,7 +239,12 @@ zen:
   lane_release_secs: 90
   # refresh the whole pool once this many lanes hit 429 since the last
   # refresh (distinct exits all limited = stale pool). 0 disables.
-  pool_refresh_429s: 2
+  pool_refresh_429s: 4
+  # minimum gap between 429-triggered refreshes (seconds). a trip inside
+  # the window skips the refresh and resets the counter, so one burst
+  # causes ~1 refresh instead of 2-3 back to back. 0 = 120, negative
+  # disables (every trip refreshes).
+  pool_refresh_cooldown_secs: 120
   # an exit that 403s FreeTierError for a model is skipped for that model
   # for this long (minutes). per (exit, model): the exit can still serve
   # other models. 0 disables (never burn, old behavior).
@@ -300,6 +322,9 @@ freepi:
   enabled: false
   client_version: "0.2.19"  # below server min = 426 on completions
   ad_inline_every: 5        # inline impression every Nth turn
+  # how long a request waits for a busy account to free up (one live
+  # stream per jwt). 0 = 60. default 60.
+  queue_wait_secs: 60
   # default reasoning effort for reasoning-capable models when the client
   # sends none ("max", "high", ...). clamped to the highest level the model
   # lists in model_info.jsonc; models without a level list are untouched.
@@ -319,8 +344,32 @@ antseed:
   refresh_secs: 300   # snapshot poll interval, 0 = 300
   trust_min: 0        # min effective reputation for an offer, 0 = no gate
   prefer_free: true   # +25 route score for zero-price offers
+  dht_secs: 0         # dht crawl cadence (subnet + wildcard topics, merged
+                      # with snapshot peers missing from it). 0 = off,
+                      # e.g. 3600 for hourly. hammering 6881 gets your ip
+                      # ignored by the bootstrap, so keep this slow.
+  dht_bootstrap: []   # dht crawl bootstrap nodes, e.g. ["host:6881"].
+                      # empty = dht1/dht2.antseed.com:6881.
   proxies: []         # force all peer tcp via these (http connect/socks5),
                       # e.g. ["socks5://127.0.0.1:1080"]. "" = direct.
+
+# --- route: one name across providers (route/<model>) ---
+# route/muse-spark-1.3-contributor tries opencode/muse-spark-1.3-contributor-free,
+# then antseed, freepi, nvidia sellers of the same model. keys match strictly:
+# lowercase, one trailing -free dropped from opencode ids. nvidia ids keep the
+# org prefix (route/moonshotai/kimi-k3). every shared model routes by default.
+route:
+  enabled: true          # false = route/* 503s, hidden from /v1/models
+  strategy: "priority"   # priority (opencode, antseed, freepi, nvidia) |
+                         # latency (fastest measured first) | race (all at
+                         # once, first 200 wins, losers cancelled) | random
+  include_freepi: false  # freepi joins routes. off: its gateway window is
+                         # smaller than the underlying models.
+  min_occurrences: 2     # backends that must serve a model for a route id.
+                         # 2 = a route only exists when fallback is real.
+                         # 1 = every shared model routes, even single-backend.
+  exclude_providers: []  # e.g. ["nvidia"] drops a backend from every route
+  exclude_models: []      # glob on the route key, e.g. ["*muse-spark*"]
 
 # --- status: what /status shows ---
 # when auth.tokens is set AND the /status request has no valid token,
@@ -334,6 +383,8 @@ status:
   show_usage: true            # request + token totals from usage tracking
   show_pool: true             # proxy pool: verified count, per-exit rows
   show_antseed: false         # antseed section: peers, free models, identity age
+  show_freepi: true           # freepi section: accounts, tiers, credit spend
+  show_route: true            # route section: strategy, latency, route ids
 
 # --- usage: per-request token tracker ---
 # every model request appends one json line (model, tokens, latency,
@@ -344,6 +395,15 @@ status:
 usage:
   enabled: true             # false = no file, no counters, zero overhead
   path: "nim-usage.jsonl"   # relative to the working dir
+
+# --- monitor: perf stage timings + resource sampling (item 12) ---
+# one jsonl line per request (total/proxy_in/upstream_ttfb/ttft/model_tps/
+# upstream_total/drain/proxy_overhead) plus operation + resource rows.
+# off = zero cost, writes nothing. interval 500-2000ms is the sane range.
+monitor:
+  enabled: false            # true = write rows to path below
+  path: "nim-perf.jsonl"    # relative to the working dir
+  interval_ms: 1000         # resource sample timer; rss also per request
 
 # --- models ---
 # model facts (context length, description, nudge flags) live in

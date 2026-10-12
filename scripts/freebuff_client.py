@@ -136,15 +136,21 @@ class FreebuffClient:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 retry = r.headers.get("retry-after")
                 ra = int(retry) * 1000 if retry and retry.isdigit() else None
+                raw = r.read() or b"null"
                 try:
-                    return r.status, json.loads(r.read() or b"null"), ra
+                    return r.status, json.loads(raw), ra
                 except Exception:
-                    return r.status, {}, ra
+                    # SSE streams are not json: keep the raw text so the
+                    # caller can fold data: lines (see fold_sse_body).
+                    return r.status, {"_raw": raw.decode(errors="replace")}, ra
         except urllib.error.HTTPError as e:
             try:
                 return e.code, json.loads(e.read() or b"null"), None
             except Exception:
                 return e.code, {}, None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            # network-level failures are retryable, not raw exceptions.
+            raise FreebuffError(0, {"message": f"net: {e}"})
 
     # --- session (poll cadence mirrors use-freebuff-session: GET heartbeat,
     # compact when active, jittered 30s) ---
@@ -192,12 +198,15 @@ class FreebuffClient:
         if s.get("status") == "active":
             self.release()  # one model per account; avoid model_locked
             time.sleep(3 + random.random() * 2)  # DELETE->POST race guard
-        # exp backoff on repeated admission failures
+        # exp backoff on repeated admission failures, bounded: an
+        # unbounded while True parks the caller forever on a dead pool.
+        # network errors surface as code 0 (retryable, see _req).
+        deadline = time.time() + 300
         while True:
             try:
                 return self.admit()
             except FreebuffError as e:
-                if e.code not in (408, 429, 503):
+                if e.code not in (0, 408, 429, 503) or time.time() >= deadline:
                     raise
                 self._failures += 1
                 time.sleep(_backoff(self._failures))
@@ -273,6 +282,11 @@ class FreebuffClient:
                 "messages": messages, "tools": self.tools,
                 "tool_choice": "auto", "stream": True}
         st, b, _ = self._req("POST", "/api/v1/chat/completions", body)
+        # the endpoint streams SSE even on 200: fold data: lines into one
+        # completion body (the old code json-loaded the raw stream and
+        # returned {} with ok=True on the inevitable parse failure).
+        if st == 200 and isinstance(b, dict) and not b.get("choices"):
+            b = fold_sse_body(b)
         ok = st == 200
         try:
             if not ok:
@@ -286,11 +300,21 @@ class FreebuffClient:
                     self.ensure_session()
                     body["codebuff_metadata"]["freebuff_instance_id"] = \
                         self.instance_id
-                    body["codebuff_metadata"]["run_id"] = self.start_run()
-                    st2, b2, _ = self._req("POST", "/api/v1/chat/completions",
-                                           body)
+                    run_id2 = self.start_run()
+                    body["codebuff_metadata"]["run_id"] = run_id2
+                    try:
+                        st2, b2, _ = self._req("POST", "/api/v1/chat/completions",
+                                               body)
+                    except Exception:
+                        self.finish_run(run_id2, "failed")
+                        raise
+                    # the retried run is its own run: finish it, and report
+                    # its failure (not the first response) when it fails.
+                    self.finish_run(run_id2, "completed" if st2 == 200 else "failed")
                     if st2 == 200:
                         b, ok = b2, True
+                    else:
+                        st, b = st2, b2
             if ok:
                 self._failures = 0
                 self._last_turn = time.time()
@@ -298,6 +322,36 @@ class FreebuffClient:
             raise FreebuffError(st, b)
         finally:
             self.finish_run(run_id, "completed" if ok else "failed")
+
+def fold_sse_body(b):
+    """Fold a half-parsed SSE body into a choices body. _req json-loads the
+    raw stream, which fails on SSE framing; callers pass the raw text via
+    the _raw key (see _req error shape) when that happens."""
+    raw = b.get("_raw", "")
+    if not raw:
+        return b
+    texts, tool_calls, finish = [], [], None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            ch = json.loads(data)["choices"][0]
+        except Exception:
+            continue
+        d = ch.get("delta") or ch.get("message") or {}
+        if d.get("content"):
+            texts.append(d["content"] if isinstance(d["content"], str) else "")
+        tool_calls += d.get("tool_calls") or []
+        if ch.get("finish_reason"):
+            finish = ch["finish_reason"]
+    return {"choices": [{"message": {"role": "assistant", "content": "".join(texts),
+                                     "tool_calls": tool_calls or None},
+                         "finish_reason": finish or "stop"}]}
+
 
     # --- ads (same UA pairing as cli: product header, browser body) ---
     def ad_policy(self):

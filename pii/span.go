@@ -68,27 +68,29 @@ func mergeSpans(spans []Span) []Span {
 			out = append(out, s)
 			continue
 		}
-		w := p
+		// overlap: the winner keeps its exact bounds (widening to the
+		// union destroys one value on restore), and the loser's
+		// non-overlapping tail survives as its own span so nothing
+		// unmasks by being dropped.
+		winner, loser := *p, s
 		if prefer(s, *p) {
-			*w = s
-			w = p
+			winner, loser = s, *p
 		}
-		prevContains := p.Start <= s.Start && p.End >= s.End
-		spanContains := s.Start <= p.Start && s.End >= p.End
-		if prevContains || spanContains {
-			// winner already set
-		} else {
-			st := p.Start
-			if s.Start < st {
-				st = s.Start
-			}
-			en := p.End
-			if s.End > en {
-				en = s.End
-			}
-			w.Start, w.End = st, en
+		*p = winner
+		if loser.Start < winner.Start {
+			out = append(out, Span{loser.Start, winner.Start, loser.Label, loser.Score, loser.Source, ""})
+		} else if loser.End > winner.End {
+			out = append(out, Span{winner.End, loser.End, loser.Label, loser.Score, loser.Source, ""})
 		}
 	}
+	// clipped tails append out of order: restore start ordering so
+	// right-to-left masking stays valid.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Start != out[j].Start {
+			return out[i].Start < out[j].Start
+		}
+		return out[i].End > out[j].End
+	})
 	return out
 }
 

@@ -18,11 +18,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"maps"
 	"math/big"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -108,7 +112,10 @@ func antRotateIdentity() *antseedIdentity {
 func antMintIdentity() *antseedIdentity {
 	priv := make([]byte, 32)
 	if _, err := rand.Read(priv); err != nil {
-		panic(err)
+		// crypto/rand failure means the host entropy is broken; without
+		// key material there is nothing safe to do. log and exit instead
+		// of panicking through the http handler.
+		log.Fatalf("antseed: crypto/rand failed: %v", err)
 	}
 	var scalar secp256k1.ModNScalar
 	scalar.SetByteSlice(priv)
@@ -289,22 +296,6 @@ func antDecodeFrame(plain []byte) (byte, uint32, []byte, error) {
 		plain[antFrameHeader : antFrameHeader+int(n)], nil
 }
 
-func antReadFrame(r io.Reader) (byte, uint32, []byte, error) {
-	var hdr [antFrameHeader]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, 0, nil, err
-	}
-	n := binary.BigEndian.Uint32(hdr[5:9])
-	if n > 64<<20 {
-		return 0, 0, nil, fmt.Errorf("antseed: frame too large %d", n)
-	}
-	p := make([]byte, n)
-	if _, err := io.ReadFull(r, p); err != nil {
-		return 0, 0, nil, err
-	}
-	return hdr[0], binary.BigEndian.Uint32(hdr[1:5]), p, nil
-}
-
 // --- http-over-p2p codec (packages/protocol/src/request-codec.ts) ---
 
 type antHTTPReq struct {
@@ -419,7 +410,12 @@ func antDecodeChunk(p []byte) (id string, done bool, data []byte, err error) {
 	return id, done, p[:dl], nil
 }
 
+// uint16be errors instead of silently truncating: lengths above 64k
+// are a caller bug, not something to wrap.
 func uint16be(n int) []byte {
+	if n < 0 || n > 0xffff {
+		panic(fmt.Sprintf("antseed: uint16be overflow %d", n))
+	}
 	var b [2]byte
 	binary.BigEndian.PutUint16(b[:], uint16(n))
 	return b[:]
@@ -444,15 +440,18 @@ func antDialProxy(network, addr, proxyURL string, timeout time.Duration) (net.Co
 }
 
 func antProxyAuth(pu string) (host string, auth string) {
-	rest := pu
-	if i := strings.Index(rest, "://"); i >= 0 {
-		rest = rest[i+3:]
+	u, err := url.Parse(pu)
+	if err != nil || u.Host == "" {
+		return pu, ""
 	}
-	if i := strings.Index(rest, "@"); i >= 0 {
-		auth = rest[:i]
-		rest = rest[i+1:]
+	if u.User != nil {
+		pw, _ := u.User.Password()
+		auth = u.User.Username()
+		if pw != "" {
+			auth += ":" + pw
+		}
 	}
-	return rest, auth
+	return u.Host, auth
 }
 
 // antDialConnect tunnels tcp through an http proxy via CONNECT.
@@ -521,11 +520,12 @@ func antDialSocks5(addr, proxyURL string, timeout time.Duration) (net.Conn, erro
 		c.Close()
 		return nil, err
 	}
-	hp := strings.Split(addr, ":")
-	if len(hp) != 2 {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("antseed: bad addr %q", addr)
+		return nil, fmt.Errorf("antseed: bad addr %q: %v", addr, err)
 	}
+	hp := []string{host, portStr}
 	methods := []byte{0x00}
 	if auth != "" {
 		methods = []byte{0x00, 0x02}
@@ -589,8 +589,11 @@ func antDialSocks5(addr, proxyURL string, timeout time.Duration) (net.Conn, erro
 		req.WriteByte(byte(len(hp[0])))
 		req.WriteString(hp[0])
 	}
-	var port uint64
-	fmt.Sscanf(hp[1], "%d", &port)
+	port, err := strconv.Atoi(hp[1])
+	if err != nil || port < 0 || port > 65535 {
+		c.Close()
+		return nil, fmt.Errorf("antseed: bad port %q", hp[1])
+	}
 	req.WriteByte(byte(port >> 8))
 	req.WriteByte(byte(port))
 	if _, err := c.Write(req.Bytes()); err != nil {
@@ -641,6 +644,9 @@ type antConn struct {
 	pend   map[string]chan antFrameMsg
 	free   *antFreeSession
 	closed chan struct{}
+	// lastUse is the last request served: conns idle past the reap
+	// window are closed instead of held until fd exhaustion.
+	lastUse atomic.Int64 // unix nanos
 }
 
 type antFreeSession struct {
@@ -656,12 +662,10 @@ type antFreeSession struct {
 	bySvc    map[string]*antServiceUsage
 }
 
-func mustHex(s string) []byte {
-	b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
-	if err != nil {
-		panic(err)
-	}
-	return b
+// decHex decodes peer-supplied hex without panicking: a hostile seller
+// signs non-hex pub values to crash the dial path.
+func decHex(s string) ([]byte, error) {
+	return hex.DecodeString(strings.TrimPrefix(s, "0x"))
 }
 
 func antIV(n uint64) []byte {
@@ -766,7 +770,23 @@ func antOpen(peerID, hostPort, proxyURL string, timeout time.Duration) (*antConn
 		raw.Close()
 		return nil, fmt.Errorf("antseed: enc-ack sig not from %s", peerID)
 	}
-	shared, err := curve25519.X25519(priv, mustHex(ack.Pub))
+	// docs require ±30s freshness on the ack timestamp; the signature
+	// covers a fresh per-dial nonce, so this is defense in depth.
+	if dt := time.Now().UnixMilli() - ack.Ts; dt < 0 {
+		if -dt > 30000 {
+			raw.Close()
+			return nil, fmt.Errorf("antseed: enc-ack from the future")
+		}
+	} else if dt > 30000 {
+		raw.Close()
+		return nil, fmt.Errorf("antseed: stale enc-ack")
+	}
+	peerPub, err := decHex(ack.Pub)
+	if err != nil || len(peerPub) != 32 {
+		raw.Close()
+		return nil, fmt.Errorf("antseed: bad enc-ack pub")
+	}
+	shared, err := curve25519.X25519(priv, peerPub)
 	if err != nil {
 		raw.Close()
 		return nil, err
@@ -873,7 +893,10 @@ func (c *antConn) readLoop() {
 		case antMsgHTTPResponse, antMsgHTTPChunk, antMsgHTTPEnd, antMsgHTTPError:
 			c.routeByRequestID(payload, typ)
 		case antMsgNeedFreeUsage:
-			go c.answerNeedAuth(payload)
+			// inline, not spawned: answerNeedAuth serializes on fs.mu
+			// anyway, and a goroutine per peer message is an
+			// attacker-controlled fork bomb.
+			c.answerNeedAuth(payload)
 		case antMsgPaymentRequired, antMsgNeedAuth:
 			c.routeByRequestID(payload, typ)
 		}
@@ -970,9 +993,10 @@ func (c *antConn) antDoRequest(q antHTTPReq, timeout time.Duration) (int, map[st
 	enc := antEncodeHTTPReq(q)
 	if len(q.body) > antUploadLimit {
 		// chunked upload: header frame + empty body, then 8k slices.
+		// clone the map: mutating the caller's headers is a latent bug.
 		hq := q
 		hq.body = nil
-		hdr := hq.headers
+		hdr := maps.Clone(hq.headers)
 		if hdr == nil {
 			hdr = map[string]string{}
 		}
@@ -1066,35 +1090,56 @@ func (c *antConn) answerNeedAuth(payload []byte) {
 	if !strings.EqualFold(fs.chHex, m.ChannelID) {
 		return
 	}
+	// sequence and counters are peer-supplied: reject garbage instead
+	// of saturating into MaxUint64 (which wedges the channel: every
+	// later legitimate sequence compares <= fs.seq and is dropped).
 	var seq uint64
-	fmt.Sscanf(m.Required, "%d", &seq)
-	if seq <= fs.seq {
+	if _, err := fmt.Sscanf(m.Required, "%d", &seq); err != nil {
+		return
+	}
+	if seq <= fs.seq || seq > fs.seq+1000000 {
 		return
 	}
 	var in, out uint64
-	fmt.Sscanf(m.In, "%d", &in)
-	fmt.Sscanf(m.Out, "%d", &out)
+	if _, err := fmt.Sscanf(m.In, "%d", &in); err != nil {
+		return
+	}
+	if _, err := fmt.Sscanf(m.Out, "%d", &out); err != nil {
+		return
+	}
+	// sanity ceiling per message: a single turn never carries more than
+	// 10M tokens each way. the peer reports what we consumed, but we
+	// sign it as settleable, so unbounded values are refused.
+	if in > 10000000 || out > 10000000 {
+		return
+	}
 	fs.in += in
 	fs.out += out
 	fs.reqs++
+	// bySvc is keyed on a raw peer string: cap it, or distinct service
+	// names grow the map (and the per-message sort below) forever.
 	svc := m.Service
 	if u, ok := fs.bySvc[svc]; ok {
 		u.in += in
 		u.out += out
 		u.reqs++
 	} else {
+		if len(fs.bySvc) >= 256 {
+			return
+		}
 		fs.bySvc[svc] = &antServiceUsage{service: svc, in: in, out: out, reqs: 1}
 	}
 	var svcs []antServiceUsage
 	for _, u := range fs.bySvc {
 		svcs = append(svcs, *u)
 	}
-	mh := antFreeMetadataHash(fs.in, fs.out, fs.reqs, svcs)
+	// encode once: the hash is over the same bytes we send.
+	meta := antEncodeFreeMetadata(fs.in, fs.out, fs.reqs, svcs)
+	mh := antKeccak(meta)
 	enc := append(antABIBytes32(fs.chID), antABIUint(new(big.Int).SetUint64(seq))...)
 	enc = append(enc, antABIBytes32(mh)...)
 	enc = append(enc, antABIUint(big.NewInt(fs.deadline))...)
 	sig := antSignTyped(id, antFreeAuthType, enc)
-	meta := antEncodeFreeMetadata(fs.in, fs.out, fs.reqs, svcs)
 	auth, _ := json.Marshal(map[string]any{
 		"channelId":              fs.chHex,
 		"cumulativeInputTokens":  fmt.Sprint(fs.in),

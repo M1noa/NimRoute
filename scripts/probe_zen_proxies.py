@@ -11,6 +11,7 @@ with a randomized session, and writes one tsv row per attempt plus a
 per-country block summary for hardcoding exclusions.
 """
 import csv
+import itertools
 import json
 import secrets
 import subprocess
@@ -27,16 +28,15 @@ B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 GATE_TOOLS = [{"type": "function", "function": {"name": n}} for n in ("bash", "read", "glob", "grep")]
 LIST_URL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0"
 
-_seq = {"ms": 0, "n": 0}
+_seq = itertools.count(1)
 
 
 def new_id(prefix):
+    # monotonic counter: thread-safe and collision-free across workers
+    # (the old ms-keyed dict raced in ThreadPoolExecutor).
     ms = int(time.time() * 1000)
-    if ms == _seq["ms"]:
-        _seq["n"] += 1
-    else:
-        _seq["ms"], _seq["n"] = ms, 1
-    hexpart = (((ms << 12) + _seq["n"]) & 0xFFFFFFFFFFFF).to_bytes(6, "big").hex()
+    n = next(_seq)
+    hexpart = (((ms << 12) + n) & 0xFFFFFFFFFFFF).to_bytes(6, "big").hex()
     return f"{prefix}_{hexpart}{''.join(B62[b % 62] for b in secrets.token_bytes(14))}"
 
 
@@ -131,7 +131,9 @@ def main():
     threads = 20
     limit = 0
     only_country = ""
-    out_path = "zen_probe.tsv"
+    # /tmp default: probe output is gitignored there by location, never
+    # committed by accident.
+    out_path = "/tmp/zen_probe.tsv"
     per_country = 0
     skip_path = ""
     retries = 0  # extra substitute probes per country when some fail
@@ -198,7 +200,7 @@ def main():
             pool = by_country[country][:]
             secrets.SystemRandom().shuffle(pool)
             for k, (proxy, c) in enumerate(pool[:per_country + retries]):
-                jobs.append((proxy, c, models[k % len(models)]))
+                jobs.append((proxy, c, models[k % len(models)] if models else "big-pickle"))
     else:
         for country in sorted(by_country):
             for proxy, c in by_country[country]:

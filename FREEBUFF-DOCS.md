@@ -100,6 +100,8 @@ full access (`SUPPORTED_FREEBUFF_MODELS`, all `availability:'always'` at rev):
 - cli admission always mints `claimId = newFreebuffCliInstanceId()` (prefix + uuid), sends as `x-freebuff-instance-id` on every session call, rotates on model switch/end. chat carries `codebuff_metadata.freebuff_instance_id`.
 
 ## 9c. chat gate recipe (VERIFIED live 2026-09-28, 1 account BANNED learning it)
+
+> HALT: acc2 is suspended and this doc bans live tests (§9c.7). phases B–D stay parked until a documented legitimacy design exists.
 full per-turn recipe, every field load-bearing:
 1. `POST /api/v1/agent-runs {action:'START', agentId:'base2-free-<slug>'}` → server `runId`. client-minted ids 404. agent MUST be the free root matching the model (`base2-free-solar-mini4`, `base2-free-mimo`, `base2-free-glm-5-3-flash`, full list in `free-agents.ts FREEBUFF_ROOT_AGENT_IDS`); paid `base2` → 402 out-of-credits.
 2. admission MUST be legacy single-session path (no `x-freebuff-multi-session`/`x-freebuff-desktop-attempt` headers). server replies with its own bare-UUID `instanceId` — use THAT in chat, not the client-minted `cli:` claim. sending the claim id → `session_superseded` (takeover message).

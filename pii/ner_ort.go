@@ -53,60 +53,67 @@ type nerEngine struct {
 }
 
 var (
-	nerOnce sync.Once
-	nerEng  *nerEngine
-	nerErr  error
+	nerMu  sync.Mutex
+	nerEng *nerEngine
+	nerKey string
+	nerErr error
 )
 
 func nerSingleton(modelPath, ortLib string, timeoutMs int, minScore float64) (*nerEngine, error) {
-	nerOnce.Do(func() {
-		e := &nerEngine{timeout: time.Duration(timeoutMs) * time.Millisecond, minScore: minScore}
-		if e.timeout <= 0 {
-			e.timeout = 500 * time.Millisecond
-		}
-		if e.minScore <= 0 {
-			e.minScore = 0.4
-		}
-		vocabPath := os.Getenv("RAMPART_VOCAB")
-		if vocabPath == "" {
-			vocabPath = modelDir(modelPath) + "/vocab.txt"
-		}
-		tok, err := LoadWordPiece(vocabPath)
-		if err != nil {
-			nerErr = err
-			return
-		}
-		e.tok = tok
-		e.clsID = tok.ID("[CLS]")
-		e.sepID = tok.ID("[SEP]")
-		lib := ortLib
-		if lib == "" {
-			lib = os.Getenv("ORT_LIB")
-		}
-		if lib == "" {
-			nerErr = fmt.Errorf("pii ner: no onnxruntime lib (set ort_lib or ORT_LIB)")
-			return
-		}
-		rt, err := ort.NewRuntime(lib, 23)
-		if err != nil {
-			nerErr = err
-			return
-		}
-		e.rt = rt
-		env, err := rt.NewEnv("rampart", ort.LoggingLevelWarning)
-		if err != nil {
-			nerErr = err
-			return
-		}
-		e.env = env
-		sess, err := rt.NewSession(env, modelPath, nil)
-		if err != nil {
-			nerErr = err
-			return
-		}
-		e.sess = sess
-		nerEng = e
-	})
+	// keyed on (model, lib): the old sync.Once pinned the first caller's
+	// config and silently ignored every later one.
+	key := modelPath + "\x00" + ortLib
+	nerMu.Lock()
+	defer nerMu.Unlock()
+	if nerEng != nil && nerKey == key {
+		return nerEng, nerErr
+	}
+	e := &nerEngine{timeout: time.Duration(timeoutMs) * time.Millisecond, minScore: minScore}
+	if e.timeout <= 0 {
+		e.timeout = 500 * time.Millisecond
+	}
+	if e.minScore <= 0 {
+		e.minScore = 0.4
+	}
+	vocabPath := os.Getenv("RAMPART_VOCAB")
+	if vocabPath == "" {
+		vocabPath = modelDir(modelPath) + "/vocab.txt"
+	}
+	tok, err := LoadWordPiece(vocabPath)
+	if err != nil {
+		nerErr = err
+		return nil, err
+	}
+	e.tok = tok
+	e.clsID = tok.ID("[CLS]")
+	e.sepID = tok.ID("[SEP]")
+	lib := ortLib
+	if lib == "" {
+		lib = os.Getenv("ORT_LIB")
+	}
+	if lib == "" {
+		nerErr = fmt.Errorf("pii ner: no onnxruntime lib (set ort_lib or ORT_LIB)")
+		return nil, nerErr
+	}
+	rt, err := ort.NewRuntime(lib, 23)
+	if err != nil {
+		nerErr = err
+		return nil, err
+	}
+	e.rt = rt
+	env, err := rt.NewEnv("rampart", ort.LoggingLevelWarning)
+	if err != nil {
+		nerErr = err
+		return nil, err
+	}
+	e.env = env
+	sess, err := rt.NewSession(env, modelPath, nil)
+	if err != nil {
+		nerErr = err
+		return nil, err
+	}
+	e.sess = sess
+	nerEng, nerKey, nerErr = e, key, nil
 	return nerEng, nerErr
 }
 
@@ -115,10 +122,6 @@ func modelDir(p string) string {
 		return p[:i]
 	}
 	return "."
-}
-
-func loadNer(modelPath string, timeoutMs int) Detector {
-	return nil // wired via scanner config; see NerDetector
 }
 
 func NerAvailable() bool { return true }
@@ -131,12 +134,24 @@ func NerDetector(modelPath, ortLib string, timeoutMs int, minScore float64) Dete
 	if err != nil || e == nil {
 		return nil
 	}
+	// one global mutex serializes all inference process-wide (ort
+	// sessions are not concurrent-safe): throughput ceiling ~1/timeout
+	// per NER call. documented, not fixed: sharding needs N sessions.
 	return func(text string) []Span {
 		ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 		defer cancel()
 		type res struct{ spans []Span }
 		ch := make(chan res, 1)
-		go func() { ch <- res{e.infer(text)} }()
+		// non-blocking send: on timeout the orphaned infer still runs to
+		// completion (it holds e.mu), but at least it never leaks the
+		// goroutine on a full channel too.
+		go func() {
+			spans := e.infer(text)
+			select {
+			case ch <- res{spans}:
+			default:
+			}
+		}()
 		select {
 		case r := <-ch:
 			return r.spans
@@ -149,10 +164,11 @@ func NerDetector(modelPath, ortLib string, timeoutMs int, minScore float64) Dete
 func (e *nerEngine) infer(text string) []Span {
 	lowered := strings.ToLower(text)
 	folded, starts, ends := foldWithMap(lowered)
-	toks := e.tok.Tokenize(folded)
-	// hyphen->space fold like rampart detectNerWindow (1:1 length).
+	// hyphen->space fold like rampart detectNerWindow: hyphens split
+	// entities in the vocab, spaces don't. length-preserving so the
+	// starts/ends map stays valid.
 	foldedHyph := strings.ReplaceAll(folded, "-", " ")
-	_ = foldedHyph
+	toks := e.tok.Tokenize(foldedHyph)
 	const budget = 500
 	var out []Span
 	for w0 := 0; w0 < len(toks); w0 += budget - 64 {
@@ -207,15 +223,23 @@ func (e *nerEngine) inferWindow(win []Tok, folded string, starts, ends []int, ra
 	if err != nil {
 		return nil
 	}
+	// pick the logits tensor by name + shape, not map order: go map
+	// iteration is random and a second output would misread silently.
 	var logits []float32
 	var shape []int64
-	for _, v := range res {
-		logits, shape, err = ort.GetTensorData[float32](v)
+	for name, v := range res {
+		l, sh, gerr := ort.GetTensorData[float32](v)
 		v.Close()
-		if err != nil {
-			return nil
+		if gerr != nil {
+			continue
 		}
-		break
+		if len(sh) == 3 && int(sh[1]) == n && strings.Contains(strings.ToLower(name), "logit") {
+			logits, shape = l, sh
+			break
+		}
+		if logits == nil && len(sh) == 3 && int(sh[1]) == n {
+			logits, shape = l, sh
+		}
 	}
 	if len(shape) != 3 {
 		return nil
@@ -262,9 +286,22 @@ func (e *nerEngine) inferWindow(win []Tok, folded string, starts, ends []int, ra
 			flush()
 			continue
 		}
+		// bounds-checked: folded offsets slice the raw body, and a
+		// length-changing fold (U+0130 lowercases to 2 runes) would
+		// otherwise misalign or panic.
+		if t.Start < 0 || t.End > len(starts) || t.End > len(ends) || t.Start >= t.End {
+			flush()
+			continue
+		}
 		rs, re := starts[t.Start], ends[t.End-1]
+		if rs < 0 || re > len(raw) || rs >= re {
+			flush()
+			continue
+		}
 		sub := strings.HasPrefix(t.Text, "##")
-		if cur != nil && cur.cat == cat && (bio == "I" || sub) {
+		// a B- tag always starts a new entity, even of the same
+		// category: extending merges two adjacent names into one.
+		if cur != nil && cur.cat == cat && (bio == "I" || (bio != "B" && sub)) {
 			cur.end = re
 			if prob < cur.score {
 				cur.score = prob

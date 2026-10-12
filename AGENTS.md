@@ -12,19 +12,30 @@ key/proxy/lane rotation to survive per-exit rate limits.
   `x-opencode-client: cli`, `x-opencode-session: ses_*`,
   `x-opencode-request: msg_*`, `x-opencode-project: global`,
   `User-Agent: opencode/<version>` (live tag from sst/opencode releases,
-  refreshed every 6h, default in zenproxy.go), plus
-  `anthropic-version: 2023-06-01`. muse-spark models use `/responses`,
-  everything else `/chat/completions`; shape follows the model, converted
-  both ways (`convertToResponses` / `chatFromResponses`).
+  refreshed every 6h, default in zenproxy.go). (`anthropic-version` is NOT
+  sent; an earlier doc revision claimed it.) muse-spark models use
+  `/responses`, everything else `/chat/completions`; shape follows the
+  model, converted both ways (`convertToResponses` / `chatFromResponses`).
+- **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
+  one live stream per account jwt (server 409s a second); accounts rotate
+  on failure, queue up to `freepi.queue_wait_secs` (default 60s). jwt only
+  ever rides as a request header, never logged, never in `/status`.
+  ads run silently per account (banner + inline impressions).
+- **antseed**: p2p `antseed/<model>` ids via dialed sellers (stats snapshot
+  discovery, DHT fallback). keyless: identity minted fresh in memory per
+  run. snapshot addresses are untrusted claims: `antEndpointOK` rejects
+  non-global-unicast/private/loopback before dial. only retryable statuses
+  cool a seller; 400s fail fast without parking it.
 - **NVIDIA NIM**: upstream `integrate.api.nvidia.com`, needs
   `nvidia_keys` in config.yml. `nvidia/` prefix is listing-only, stripped
   before forwarding. no keys (or `nvidia.enabled: false`) = NIM 503s,
   `opencode/*` keeps working.
 - `ServeHTTP` (main.go): `/status` + `/health` -> `StatusFor`;
   `/v1/models`; `/v1/messages`, `/v1/messages/count_tokens`,
-  `/v1/messages/classifier`; `opencode/` prefix -> zen; else NIM.
+  `/v1/messages/classifier`; `freeepi/` -> freepi, `antseed/` -> antseed,
+  `opencode/` -> zen, `nvidia/` stripped, else NIM.
   inbound bodies capped at 10MB (`bodyLimit`). service via
-  `./nim run|start|stop|restart|status|logs|tail|install|uninstall`.
+  `./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth`.
 
 ## 2. code quality rules
 
@@ -84,8 +95,9 @@ key/proxy/lane rotation to survive per-exit rate limits.
   pattern: `Status()` builds, `StatusFor()` gates.
 - auth redaction lives in `StatusFor`: when `auth.tokens` is set and the
   request is unauthenticated, hide keys, locks, zen session/proxy,
-  lanes, pool, and usage — no matter what the flags say. model ids stay
-  visible (always safe).
+  lanes, lanecap, pool, freepi, antseed, and usage — no matter what the
+  flags say. model ids stay visible (always safe). every section needs
+  its own `status.show_*` flag (`show_freepi` included).
 - never widen unauthenticated output without a flag defaulting off.
 
 ## 5. upstream error guidance
@@ -115,16 +127,24 @@ logic).
 - lanes key on `x-session-id` verbatim (`"hdr:" + headerSession` in
   `laneFor`). never normalize, hash, or trim it lane-side; pii session
   derivation (`piiSessionID`) is separate. lane identity modes
-  (`lane_hdr`/`lane_convo`/`lane_shared`) toggle independently, convo off
-  by default (buggy hash); shared pre-opens `lanes`-count lanes at startup.
+  (`lane_hdr`/`lane_convo`/`lane_shared`/`lane_cache_key`) toggle
+  independently, convo off by default (buggy hash); shared pre-opens
+  `lanes`-count lanes at startup. exception: `cacheKeyOf` trims whitespace
+  off `prompt_cache_key` (json padding is not identity). `/status` lane ids
+  derived from client headers are sha256-truncated, never echoed verbatim.
   limits rotate exit+session instantly (`laneRotate`), never a cooldown.
+  conversions allocate a fresh lane and drop the idlest shared one;
+  in-place lane renames are forbidden (in-flight pointer aliasing).
 - proxy urls may embed `user:pass`. run `redactProxyUserinfo` before any
   proxy value reaches `/status` AND logs.
 - never forward client credentials upstream: NIM path has a header
-  deny-list (`authorization`, `x-api-key`, `x-session-id`, `cookie`,
-  `host`, `origin`); zen has its own blocklist in `zenHeaderForwarded`
-  (also drops `content-type`, `user-agent`, all `x-opencode-*`, which the
-  proxy sets itself). new forwarded headers must pass both lists.
+  deny-list (`authorization`, `host`, `origin`, `cookie`, `x-api-key`,
+  `x-session-id`); zen has its own blocklist in `zenHeaderForwarded`
+  (also drops `content-type`, `accept`, `user-agent` and the four
+  `x-opencode-*` the proxy sets itself: client, session, request,
+  project; `x-opencode-session-id` is deliberately ALLOWED and set by the
+  proxy). `ZEN_PASSTHROUGH=1` still runs the deny-list over the clone.
+  new forwarded headers must pass both lists.
 - several upstream reads are uncapped (`io.ReadAll` on response bodies
   in NIM/zen paths). cap any new read with `io.LimitReader`.
 - `math/rand` is for sampling only (weighted picks, probes). secrets and

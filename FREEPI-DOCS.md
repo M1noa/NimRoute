@@ -2,14 +2,12 @@
 source: `/tmp/free-pi-cli` (`dennisonbertram/free-pi-cli`, cloned 2026-10-03, depth 1)
 proxy repo: `nimroute` repo (go, port 5419)
 
-> THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
-
 ## 1. what free-pi is
 - free ad-supported distro of the pi coding agent (`@earendil-works/pi-coding-agent` 0.84.4). inference paid by ads.
 - base url: `https://api.freepi.ai` (`FREEPI_BASE_URL` override). config + jwt under `~/.free-pi/agent`, creds file `credentials.json` mode 0600 shape `{token: <jwt>}`.
 - completions = openai-compatible `POST {base}/v1/chat/completions`. pi's openai-completions api appends `/chat/completions` to baseURL, so provider baseUrl must end in `/v1` (`completionsBaseUrl` in provider.ts). default model `deepseek/deepseek-v4-flash`.
 - every completion carries `Authorization: Bearer <jwt>` + static headers `x-session-id: <pi logical session id>` and `x-client-version: <cli semver>`. server enforces one live session per jwt (409) and min cli version (426).
-- model list/timing below is catalog-derived, not live-tested (sandbox dns blocked api.free-pi.dev during research; scripts now fixed to api.freepi.ai). run scripts/freepi_probe.py with a jwt to fill in live data.
+- catalog in §5 is the 2026-10-03 live bench; other model list/timing derives from `GET /client-version` until re-probed. run `scripts/freepi_probe.py --jwt file` (or `--config config.yml` after `--into-config` login) to refresh.
 
 ## 2. auth (github device flow, no client secret)
 - `POST /auth/github/device {}` -> `{session_id, user_code, verification_uri, interval}`. retry 4x on network fail only (1.5s * attempt), http errors returned as-is.
@@ -101,7 +99,8 @@ is the detector for skipping this.
 -version.
 - request pacing: tool-guard posts to `/telemetry/tool-guard` only on anomaly — a proxy never needs it. usage reads (`/m
 e`, `/me/stats`) are GETs; `/session/reset` is the only other POST and only on user request.
-- auth: bearer jwt only. per-request headers the official client sends: `authorization: Bearer <jwt>`, `content-type: application/json` (posts), `x-session-id`, `x-client-version`.
-- chat body: openai schema, `model` = catalog id verbatim. server resolves model itself.
 - ads fund the inference. the official client fetches ads and posts impressions as documented in §4. faking impressions or stripping ads to get completions without the ad support is not documented here — use `npx free-pi-cli` or get permission from the operator before building any third-party integration.
-- version gate: `GET /client-version` (no auth) at startup; below `min` = 426 on completions.
+
+## 8. privacy: what leaves this machine
+- freeepi (`https://api.freepi.ai`, account required): full prompt + tool traces per request, jwt identity, x-session-id stability links turns; ad/meter calls (`/ads/next`, `/ads/impression`, `/me` every turn) report usage + click tokens. jwt is a 90-day credential: 0600 on disk, never logged, never in `/status`.
+- compare FREEBUFF-DOCS.md §11 for the same treatment of the other ad-supported backend.

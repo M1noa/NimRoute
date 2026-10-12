@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,13 @@ import (
 
 type serverConfig struct {
 	Port int `yaml:"port"`
+	// Bind is the listen address. "" = 127.0.0.1 (loopback only):
+	// tokens: [] is only safe on loopback.
+	Bind string `yaml:"bind"`
+	// CORSOrigins allowlists browser cross-origin calls (exact Origin
+	// match). empty = browsers get no CORS headers. env CORS_ORIGINS
+	// (comma-separated) overrides.
+	CORSOrigins []string `yaml:"cors_origins"`
 }
 
 type authConfig struct {
@@ -166,12 +174,16 @@ type zenConfig struct {
 	// PoolRefresh429s triggers a full pool refresh once this many lanes
 	// have been rate-limited since the last one. 0 disables.
 	PoolRefresh429s int `yaml:"pool_refresh_429s"`
+	// PoolRefreshCooldownSecs is the minimum gap between 429-triggered
+	// refreshes: a trip inside the window skips (logged at debug) and the
+	// counter resets. 0 = 120, negative disables (every trip refreshes).
+	PoolRefreshCooldownSecs int `yaml:"pool_refresh_cooldown_secs"`
 	// ExitBurnMinutes keeps an exit that 403s FreeTierError for a model
 	// out of that model's rotation. per (exit, model): the exit can still
 	// serve other models. 0 disables (never burn).
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
-	// MaxRetries caps zen upstream attempts per request (first try +
-	// retries). 0 = single attempt, no retry.
+	// MaxRetries caps zen upstream attempts per request. 0 = default
+	// (first try + 4 retries), negative = single attempt, no retry.
 	MaxRetries int `yaml:"max_retries"`
 	// ProbeTimeoutMs verifies a lane's pinned exit before reuse. 0 = 1000.
 	ProbeTimeoutMs int `yaml:"probe_timeout_ms"`
@@ -210,6 +222,28 @@ type nvidiaConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// routeConfig gates cross-provider route/<model> ids: one name that fans
+// out across backends in strategy order.
+type routeConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Strategy picks the attempt order: priority (opencode, antseed,
+	// freepi, nvidia), latency (fastest measured first), race (all at
+	// once, first 200 wins), random (shuffled). unknown falls to priority.
+	Strategy string `yaml:"strategy"`
+	// IncludeFreepi admits freepi candidates. off by default: the free-pi
+	// gateway serves a smaller window than the underlying models.
+	IncludeFreepi bool `yaml:"include_freepi"`
+	// MinOccurrences is how many backends must serve a model for it to get
+	// a route/ id. default 2: a route only exists when there is actually a
+	// fallback. 1 = every shared model routes, even single-backend ones.
+	MinOccurrences int `yaml:"min_occurrences"`
+	// ExcludeProviders drops backends from every route (opencode,
+	// antseed, freepi, nvidia).
+	ExcludeProviders []string `yaml:"exclude_providers"`
+	// ExcludeModels drops route ids by glob ("*muse-spark*").
+	ExcludeModels []string `yaml:"exclude_models"`
+}
+
 // freepiAccount is one ad-supported account: jwt from github device flow
 // (`./nim freepi auth`), stable x-session-id minted once (server 409s a
 // second concurrent stream on the same jwt).
@@ -242,6 +276,12 @@ type antseedConfig struct {
 	StatsURL string `yaml:"stats_url"`
 	// RefreshSecs is the snapshot poll interval. 0 = 300.
 	RefreshSecs int `yaml:"refresh_secs"`
+	// DHTSecs is the dht crawl cadence (subnet + wildcard topics, merged
+	// with the snapshot). 0 = off. e.g. 3600 for an hourly crawl.
+	DHTSecs int `yaml:"dht_secs"`
+	// DHTBootstrap overrides the dht crawl bootstrap nodes.
+	// empty = dht1/dht2.antseed.com:6881.
+	DHTBootstrap []string `yaml:"dht_bootstrap"`
 	// TrustMin mirrors minTrustScore: offers below it are ineligible.
 	// 0 disables the gate.
 	TrustMin float64 `yaml:"trust_min"`
@@ -260,12 +300,22 @@ type statusConfig struct {
 	ShowUsage          bool `yaml:"show_usage"`
 	ShowPool           bool `yaml:"show_pool"`
 	ShowAntseed        bool `yaml:"show_antseed"`
+	ShowFreepi         bool `yaml:"show_freepi"`
+	ShowRoute          bool `yaml:"show_route"`
 }
 
 // usageConfig gates the per-request tracker. off = no file, no counters.
 type usageConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
+}
+
+// monitorConfig gates the perf monitor (item 12): stage timings +
+// resource sampling as jsonl. off = zero cost, writes nothing.
+type monitorConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	Path       string `yaml:"path"`
+	IntervalMs int    `yaml:"interval_ms"`
 }
 
 type claudeMapYAML struct {
@@ -297,8 +347,10 @@ type appConfig struct {
 	Zen        zenConfig         `yaml:"zen"`
 	Freepi     freepiConfig      `yaml:"freepi"`
 	Antseed    antseedConfig     `yaml:"antseed"`
+	Route      routeConfig       `yaml:"route"`
 	Status     statusConfig      `yaml:"status"`
 	Usage      usageConfig       `yaml:"usage"`
+	Monitor    monitorConfig     `yaml:"monitor"`
 	Models     modelsConfig      `yaml:"models"`
 }
 
@@ -315,7 +367,7 @@ func cfg() *appConfig {
 
 func defaultConfig() appConfig {
 	return appConfig{
-		Server: serverConfig{Port: 5419},
+		Server: serverConfig{Port: 5419, Bind: "127.0.0.1"},
 		Guardrails: guardrailsConfig{
 			Enabled:       true,
 			File:          "guardrails.json",
@@ -332,14 +384,14 @@ func defaultConfig() appConfig {
 			Mode:           "realistic",
 			FuzzyThreshold: 0.95,
 			Disclose:       true,
-			DiscloseText:   "Personal names and identifiers in this conversation were replaced with realistic placeholders for privacy. Use them verbatim: do not try to recover or reveal the originals.",
+			DiscloseText:   "",
 			DetectSecrets:  true,
 			DetectPII:      true,
 			IncludeSystem:  false,
 			OnTimeout:      "skip",
 			VaultTTLHours:  24,
 			VaultMaxSize:   4096,
-			Ner:            nerConfig{TimeoutMs: 500, MinScore: 0.4},
+			Ner:            nerConfig{ModelPath: "pii/model/model_q4.onnx", TimeoutMs: 500, MinScore: 0.4},
 		},
 		Nudge: nudgeConfig{
 			Enabled: true,
@@ -358,6 +410,11 @@ func defaultConfig() appConfig {
 		Antseed: antseedConfig{
 			RefreshSecs: 300,
 		},
+		Route: routeConfig{
+			Enabled:        true,
+			Strategy:       "priority",
+			MinOccurrences: 2,
+		},
 		Zen: zenConfig{
 			Enabled:                  true,
 			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
@@ -370,7 +427,8 @@ func defaultConfig() appConfig {
 			ConvoIdleMinutes:         1,
 			LaneMinGapMs:             1500,
 			LaneReleaseSecs:          90,
-			PoolRefresh429s:          2,
+			PoolRefresh429s:          4,
+			PoolRefreshCooldownSecs:  120,
 			ExitBurnMinutes:          30,
 			MaxRetries:               4,
 			ProbeTimeoutMs:           1000,
@@ -399,10 +457,25 @@ func defaultConfig() appConfig {
 			ShowLocks:          true,
 			ShowUsage:          true,
 			ShowPool:           true,
+			ShowRoute:          true,
+			ShowFreepi:         true,
 		},
 		Usage: usageConfig{
 			Enabled: true,
 			Path:    "nim-usage.jsonl",
+		},
+		Monitor: monitorConfig{
+			Enabled:    false,
+			Path:       "nim-perf.jsonl",
+			IntervalMs: 1000,
+		},
+		Models: modelsConfig{
+			ClaudeMap: []claudeMapYAML{
+				{Pattern: "claude-opus-*", Model: "opencode/muse-spark-1.3-contributor-free"},
+				{Pattern: "claude-sonnet-*", Model: "opencode/muse-spark-1.3-contributor-free"},
+				{Pattern: "claude-haiku-*", Model: "opencode/big-pickle"},
+				{Pattern: "claude-*", Model: "moonshotai/kimi-k3"},
+			},
 		},
 	}
 }
@@ -429,50 +502,65 @@ func loadConfigFile(path string) (*appConfig, error) {
 	var doc map[string]any
 	if yaml.Unmarshal(raw, &doc) == nil {
 		if n, ok := doc["nvidia"].(map[string]any); ok {
-			if _, has := n["enabled"]; !has {
+			if v, has := n["enabled"]; !has || v == nil {
 				c.Nvidia.Enabled = true
 			}
 		} else {
 			c.Nvidia.Enabled = true
 		}
 		if z, ok := doc["zen"].(map[string]any); ok {
-			if _, has := z["enabled"]; !has {
+			if v, has := z["enabled"]; !has || v == nil {
 				c.Zen.Enabled = true
 			}
 		} else {
 			c.Zen.Enabled = true
 		}
 		if u, ok := doc["usage"].(map[string]any); ok {
-			if _, has := u["enabled"]; !has {
+			if v, has := u["enabled"]; !has || v == nil {
 				c.Usage.Enabled = true
 			}
 		} else {
 			c.Usage.Enabled = true
 		}
+		if rt, ok := doc["route"].(map[string]any); ok {
+			if v, has := rt["enabled"]; !has || v == nil {
+				c.Route.Enabled = true
+			}
+		} else {
+			c.Route.Enabled = true
+		}
 		if _, ok := doc["status"].(map[string]any); ok {
 			if s, ok := doc["status"].(map[string]any); ok {
-				if _, has := s["show_usage"]; !has {
+				if v, has := s["show_usage"]; !has || v == nil {
 					c.Status.ShowUsage = true
 				}
-				if _, has := s["show_pool"]; !has {
+				if v, has := s["show_pool"]; !has || v == nil {
 					c.Status.ShowPool = true
+				}
+				if v, has := s["show_route"]; !has || v == nil {
+					c.Status.ShowRoute = true
+				}
+				if v, has := s["show_freepi"]; !has || v == nil {
+					c.Status.ShowFreepi = true
 				}
 			}
 		} else {
 			c.Status.ShowUsage = true
 			c.Status.ShowPool = true
+			c.Status.ShowRoute = true
+			c.Status.ShowFreepi = true
 		}
 		if c.Usage.Path == "" {
 			c.Usage.Path = "nim-usage.jsonl"
 		}
 		if g, ok := doc["guardrails"].(map[string]any); ok {
-			if _, has := g["threshold"]; !has {
+			if v, has := g["threshold"]; !has || v == nil {
 				c.Guardrails.Threshold = 0.6
 			}
-			if _, has := g["window_weight"]; !has {
+			if v, has := g["window_weight"]; !has || v == nil {
 				c.Guardrails.WindowWeight = 0.7
 			}
-			if _, has := g["density_weight"]; !has {
+			if v, has := g["density_weight"]; !has || v == nil {
 				c.Guardrails.DensityWeight = 0.3
 			}
 		} else {
@@ -506,6 +594,11 @@ func loadOrCreateConfig(path string) *appConfig {
 	if c, err := loadConfigFile(path); err == nil {
 		mergeMissingKeys(path)
 		return c
+	} else if !os.IsNotExist(err) {
+		// present but unparseable: never overwrite, it holds secrets.
+		log.Printf("WARN: %s unreadable, running on defaults (fix the yaml, it was NOT overwritten): %v", path, err)
+		d := defaultConfig()
+		return &d
 	}
 	// first run: seed from example so fresh users get commented defaults.
 	if seed, err := os.ReadFile("config.yml.example"); err == nil {
@@ -702,11 +795,20 @@ func mergeMissingKeys(path string) []string {
 }
 
 func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
+	sort.Strings(s)
+}
+
+// equalStrings is order-sensitive equality for reload change detection.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
 }
 
 // applyConfig swaps the snapshot and rebuilds every derived structure.
@@ -716,8 +818,11 @@ func applyConfig(c *appConfig) {
 	}
 	appCfg.Store(c)
 
-	// model catalog (hot-reloaded with the config)
-	setModelInfo(loadModelInfo(modelInfoPath()))
+	// model catalog (hot-reloaded with the config). a broken catalog
+	// keeps the previous one: nil means unparseable, not empty.
+	if m := loadModelInfoKeep(modelInfoPath()); m != nil {
+		setModelInfo(m)
+	}
 
 	// per-model nudge overrides: config beats the catalog
 	var no []nudgeOverride
@@ -740,13 +845,19 @@ func applyConfig(c *appConfig) {
 	}
 	claudeModelsMu.Unlock()
 
-	// guardrails: file list + inline extras
+	// guardrails: file list + inline extras. a missing or broken file
+	// fails open (empty list), so say so loudly instead of silently.
 	guardrailList = nil
-	if raw, err := os.ReadFile(c.Guardrails.File); err == nil {
+	raw, err := os.ReadFile(c.Guardrails.File)
+	if err != nil {
+		log.Printf("WARN: guardrails file %s unreadable, running with none: %v", c.Guardrails.File, err)
+	} else {
 		var entries []struct {
 			Guardrail string `json:"guardrail"`
 		}
-		if err := json.Unmarshal(raw, &entries); err == nil {
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			log.Printf("WARN: guardrails file %s unparseable, running with none: %v", c.Guardrails.File, err)
+		} else {
 			for _, e := range entries {
 				if g := strings.TrimSpace(e.Guardrail); g != "" {
 					guardrailList = append(guardrailList, g)
@@ -776,6 +887,9 @@ func applyConfig(c *appConfig) {
 	custom = append(custom, c.Zen.Proxies...)
 	custom = append(custom, readProxyFile(c.Zen.ProxyFile)...)
 	setCustomProxies(custom)
+
+	// usage sink follows usage.path/enabled on reload.
+	reinitUsageLog()
 }
 
 // watchConfig hot-reloads path; key changes propagate to the pool.
@@ -797,7 +911,20 @@ func watchConfig(p *Pool, path string) {
 				log.Printf("WARN: %s: %v (keeping old config)", path, err)
 				continue
 			}
+			old := cfg()
+			poolAffecting := old.Zen.PoolSize != c.Zen.PoolSize ||
+				old.Zen.MaxResponseMs != c.Zen.MaxResponseMs ||
+				old.Zen.AlwaysProxy != c.Zen.AlwaysProxy ||
+				!equalStrings(old.Zen.BlockedCountries, c.Zen.BlockedCountries) ||
+				!equalStrings(old.Zen.Proxies, c.Zen.Proxies) ||
+				old.Zen.ProxyFile != c.Zen.ProxyFile
 			applyConfig(c)
+			if poolAffecting && c.Zen.Enabled {
+				// pool size/filters only apply on refresh: kick one now
+				// instead of waiting for the hourly tick.
+				refreshOpencodeModels()
+				refreshZenProxiesAsync()
+			}
 			added, removed := p.Reload(c.NvidiaKeys)
 			// keyless cap follows zen lanes, so a lanes edit takes
 			// effect here without a restart.
@@ -903,6 +1030,12 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowAntseed {
 		sr.Antseed = nil
 	}
+	if !c.Status.ShowFreepi {
+		sr.Freepi = nil
+	}
+	if !c.Status.ShowRoute {
+		sr.Route = nil
+	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
 		sr.ZenSession, sr.ZenProxy, sr.ZenAgo = "", "", ""
@@ -912,6 +1045,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Pool = nil
+		sr.Route = nil
 	}
 	return sr
 }

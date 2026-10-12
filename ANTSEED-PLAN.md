@@ -1,7 +1,6 @@
 # ANTSEED-PLAN.md — AntSeed provider for nimroute
 
-status: plan only — nothing implemented yet. docs in `ANTSEED-DOCS.md` (protocol/API
-reverse engineering). source clone: `/var/folders/nk/qtcnhdz964sg80k2fnz8nnnh0000gp/T/opencode/antseed`.
+status: SHIPPED — implemented in `antseed.go` (config, routes, handlers) + `antseedp2p.go` (wire, handshake, frames), wired at `ServeHTTP` (`freeepi/`-style `antseed/` prefix). tracker: `ANTSEED-TODO.md` (all items done). docs in `ANTSEED-DOCS.md` (protocol/API reverse engineering).
 
 ## 0. goal
 
@@ -21,7 +20,7 @@ reverse engineering). source clone: `/var/folders/nk/qtcnhdz964sg80k2fnz8nnnh000
 
 | file | contents |
 |---|---|
-| `antseed.go` | config struct + defaults, `serveAntseed` entry from `ServeHTTP`, peer cache + metadata poller (`network.antseed.com/stats`, fallback relay `/sellers`), request dispatch |
+| `antseed.go` | config struct + defaults, `antseed/` route entry from `ServeHTTP`, peer cache + metadata poller (`network.antseed.com/stats`), request dispatch, model catalog (no separate `antseedcat.go`; catalog lives here) |
 | `antseedp2p.go` | identity (secp256k1 + EIP-191 `antseed-msg-v1:`), intro/enc-ack handshake, X25519→HKDF→AES-256-GCM records, 9-byte frame codec, HTTP-over-P2P codec, ping/keepalive, free-usage 0x52/0x55/0x53 exchange (EIP-712) |
 | `antseedcat.go` | canonical model key (ANTSEED-DOCS.md §6.1), offer ranking (§6.3), `/v1/models` builder (conservative caps §6.2), model table (§model curation) |
 | `*_test.go` | table-driven: canonical-key cases, ranking, free-vs-paid classification, frame/codec round-trips, models builder, proxy override |
@@ -35,9 +34,9 @@ what's already vendored before picking). x/crypto is likely present. no other ne
 ```yaml
 antseed:
   enabled: false            # default-off: no raw-doc presence check needed
-  discovery:
-    stats_url: https://network.antseed.com/stats   # snapshot; skips DHT entirely
-    refresh_secs: 300
+  stats_url: https://network.antseed.com/stats   # snapshot; skips DHT entirely
+  refresh_secs: 300
+  (plan showed a nested `discovery:` block; shipped flat — see `antseedConfig` in config.go.)
     metadata_timeout_ms: 1500
   trust_min: 0              # mirror of their minTrustScore gate; start at 0, tune live
   prefer_free: true         # zero-price offers only

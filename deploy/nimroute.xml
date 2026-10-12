@@ -8,7 +8,8 @@
   <description>OpenAI-compatible proxy: keyless opencode free models, optional NVIDIA NIM keys</description>
   <executable>REPLACE_WITH_PATH\nimroute.exe</executable>
   <workingdirectory>REPLACE_WITH_PATH</workingdirectory>
-  <env name="PORT" value="5419"/>
+  <!-- port comes from server.port in config.yml: no PORT env here, it
+       would silently override the config. -->
   <!-- optional: <env name="CONFIG_FILE" value="C:\nimroute\config.yml"/> -->
   <log mode="roll" />
   <onfailure action="restart" delay="3 sec"/>

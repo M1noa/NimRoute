@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -30,10 +33,19 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
+
+      - name: vet
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go vet -tags ner ./...
 
       - name: test
-        run: go test ./...
+        run: go test -race ./...
+
+      - name: test-ner
+        run: go test -tags ner ./pii/...
 
       - name: build
         env:
