@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=REPLACE_WITH_PATH
-ExecStart=REPLACE_WITH_PATH/nimroute
+ExecStart=REPLACE_WITH_PATH/nimrouteREPLACE_WITH_ARGS
 # port comes from server.port in config.yml (default 5419): no PORT env
 # here, it would silently override the config.
 Restart=on-failure

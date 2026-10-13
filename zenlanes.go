@@ -290,6 +290,13 @@ func sweepBurns() {
 			delete(longBurned, k)
 		}
 	}
+	tlsBurnMu.Lock()
+	defer tlsBurnMu.Unlock()
+	for k, until := range tlsBurned {
+		if now.After(until) {
+			delete(tlsBurned, k)
+		}
+	}
 }
 
 // bodyCancelCloser cancels a hedged side's request context when its
@@ -853,6 +860,33 @@ func poolRefreshDue() bool {
 	return true
 }
 
+// waitZenPool blocks until the pool holds an exit or maxWait elapses,
+// polling every 100ms. an empty pool means the verify sweep is still
+// running (cold start or refresh gap), not that exits are dead: callers
+// with an exit budget to spend wait instead of burning retries in ms.
+// false on client cancel or timeout.
+func waitZenPool(ctx context.Context, maxWait time.Duration) bool {
+	t := time.NewTimer(maxWait)
+	defer t.Stop()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		zenProxiesMu.RLock()
+		n := len(zenProxies)
+		zenProxiesMu.RUnlock()
+		if n > 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return false
+		case <-tick.C:
+		}
+	}
+}
+
 // poolRefreshCooldown is the minimum gap between 429-triggered refreshes.
 // 0 = 120s default, negative disables (every trip refreshes).
 func poolRefreshCooldown() time.Duration {
@@ -950,7 +984,7 @@ func pickLaneProxyFor(model string) string {
 	if cps := getCustomProxies(); len(cps) > 0 {
 		var free []string
 		for _, c := range cps {
-			if !taken[c] && !exitBurned(c, model) && !exitLongBurned(c) {
+			if !taken[c] && !exitBurned(c, model) && !exitLongBurned(c) && !exitTLSBanned(c) {
 				free = append(free, c)
 			}
 		}
@@ -970,15 +1004,24 @@ func pickLaneProxyFor(model string) string {
 	// untaken, unburned exits, fastest+most-reliable first. weighting
 	// (not strict quartiles) keeps the whole pool in play while fast
 	// exits win most draws. no hot-path race: pool entries are verified
-	// on refresh, and verified-on-success keeps the set fresh.
+	// on refresh, and verified-on-success keeps the set fresh. when the
+	// pool is thinner than the lane count, taken exits fall through to
+	// leastLoadedExit below instead of starving.
 	var cands []string
 	for _, p := range pool {
-		if taken[p] || exitBurned(p, model) || exitLongBurned(p) {
+		if taken[p] || exitBurned(p, model) || exitLongBurned(p) || exitTLSBanned(p) {
 			continue
 		}
 		cands = append(cands, p)
 	}
 	if len(cands) == 0 {
+		// pool thinner than the lane count (cold start): share the
+		// least-loaded unburned exit instead of starving lanes. one shared
+		// exit 429s faster, but a lane with "" never sends at all, and the
+		// retry loop rotates pins apart as more exits verify.
+		if shared := leastLoadedExit(model); shared != "" {
+			return shared
+		}
 		// dry pool: every exit is pinned or burned. on public proxies the
 		// 429s that arm long-burns come from every other user of the exit,
 		// so a full ban means the pool is starved, not saturated. give up
@@ -991,6 +1034,37 @@ func pickLaneProxyFor(model string) string {
 	}
 	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
 	return sampleWeighted(cands, 1)[0]
+}
+
+// leastLoadedExit returns the unburned pool exit held by the fewest lanes,
+// "" when every exit is burned or banned. the retry path keeps pins apart
+// once spares exist (laneReproxy prefers untaken), so sharing only binds
+// while the pool is thinner than the lane count.
+func leastLoadedExit(model string) string {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	if len(pool) == 0 {
+		return ""
+	}
+	counts := map[string]int{}
+	lanesMu.Lock()
+	for _, l := range lanes {
+		if l.proxy != "" {
+			counts[l.proxy]++
+		}
+	}
+	lanesMu.Unlock()
+	best, bestN := "", -1
+	for _, p := range pool {
+		if exitBurned(p, model) || exitLongBurned(p) || exitTLSBanned(p) {
+			continue
+		}
+		if n := counts[p]; bestN == -1 || n < bestN {
+			best, bestN = p, n
+		}
+	}
+	return best
 }
 
 // unbanOldestLongBurn lifts the soonest-lapsing 12h saturation ban that
@@ -1033,11 +1107,13 @@ func unbanOldestLongBurn(model string) string {
 	return bestP
 }
 
-// laneReproxy swaps a dead exit for a fresh verified one that no other lane
-// holds and that is not burned for model, keeping the lane session pinned
-// (affinity survives proxy churn). no spare exit keeps the old pin: a lane
-// with "" never sends, so the dead-but-working exit stays until a real
-// replacement exists.
+// laneReproxy swaps a dead exit for a fresh verified one that is not
+// burned for model, keeping the lane session pinned (affinity survives
+// proxy churn). untaken exits win, but a shared pick still beats no pin:
+// when the pool is thinner than the lane count leastLoadedExit returns a
+// taken exit and only the sharing path may double-pin it. no spare exit
+// keeps the old pin: a lane with "" never sends, so the dead-but-working
+// exit stays until a real replacement exists.
 func laneReproxy(l *zenLane, model string) string {
 	p := pickLaneProxyFor(model)
 	lanesMu.Lock()
@@ -1046,10 +1122,20 @@ func laneReproxy(l *zenLane, model string) string {
 		return l.proxy
 	}
 	// re-validate under the write lock: two concurrent rotations can
-	// otherwise pin the same exit picked from a stale snapshot.
-	for _, o := range lanes {
-		if o != l && o.proxy == p {
-			return l.proxy
+	// otherwise pin the same exit picked from a stale snapshot. the
+	// exception is a deliberate shared pick: rejecting it re-starves the
+	// lane while the pool is thinner than the lane count.
+	shared := true
+	zenProxiesMu.RLock()
+	if len(zenProxies) >= len(lanes) {
+		shared = false
+	}
+	zenProxiesMu.RUnlock()
+	if !shared {
+		for _, o := range lanes {
+			if o != l && o.proxy == p {
+				return l.proxy
+			}
 		}
 	}
 	l.proxy = p
@@ -1407,7 +1493,7 @@ func laneProxyFor(l *zenLane, model string) string {
 	p := l.proxy
 	escalated := l.escalated
 	lanesMu.Unlock()
-	if p != "" && !exitBurned(p, model) && !exitLongBurned(p) {
+	if p != "" && !exitBurned(p, model) && !exitLongBurned(p) && !exitTLSBanned(p) {
 		return p
 	}
 	if !cfg().Zen.AlwaysProxy && !escalated {

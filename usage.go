@@ -43,9 +43,12 @@ type UsageRecord struct {
 }
 
 type usageTotals struct {
-	Requests   int     `json:"requests"`
-	Prompt     int     `json:"prompt_tokens"`
-	Completion int     `json:"completion_tokens"`
+	Requests   int `json:"requests"`
+	Prompt     int `json:"prompt_tokens"`
+	Completion int `json:"completion_tokens"`
+	// DurationMs sums request wall time. with Completion it gives the
+	// per-model tok/s /status shows: completion / (duration_ms / 1000).
+	DurationMs int64   `json:"duration_ms"`
 	Errors     int     `json:"errors"`
 	Cost       float64 `json:"cost_usd,omitempty"`
 }
@@ -175,6 +178,7 @@ func logUsage(r UsageRecord) {
 	t.Requests++
 	t.Prompt += r.PromptTokens
 	t.Completion += r.CompletionTokens
+	t.DurationMs += r.DurationMs
 	if r.StatusCode >= 400 {
 		t.Errors++
 	}

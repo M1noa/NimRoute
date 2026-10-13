@@ -639,7 +639,7 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 			return nil, nil, "", err.Error(), false
 		}
 		freepiHeaders(req, fa)
-		resp, err := (&http.Client{Timeout: 300 * time.Second}).Do(req)
+		resp, err := dbgClient(&http.Client{Timeout: 300 * time.Second}, "freepi").Do(req)
 		if err != nil {
 			acclog.Printf("!! freepi net error acct=%s model=%s: %v", fa.name, model, err)
 			return nil, nil, "", err.Error(), false

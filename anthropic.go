@@ -2016,6 +2016,9 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	}
 
 	acclog.Printf("%s -> POST /v1/messages model=%s upstream=%s stream=%v bytes=%d", reqID, clientModel, upstreamModel, isStream, len(oaiBody))
+	if tr := traceFrom(r.Context()); tr != nil {
+		tr.setModel(clientModel, backendForModel(upstreamModel), isStream)
+	}
 
 	if strings.HasPrefix(upstreamModel, "route/") {
 		if !routeEnabled() {
@@ -2068,6 +2071,22 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		}
 		acclog.Printf("%s routed to antseed model=%s", reqID, upstreamModel)
 		p.handleAntseedAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
+		return
+	}
+
+	// nous/<model> is the listed form; the portal takes openai chat/completions.
+	if strings.HasPrefix(upstreamModel, "nous/") {
+		if !nousEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (nous disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "nous portal is disabled or has no keys; set nous.enabled: true and add nous_keys to config.yml")
+			return
+		}
+		upstreamModel = strings.TrimPrefix(upstreamModel, "nous/")
+		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {
+			oaiBody = b
+		}
+		acclog.Printf("%s routed to nous model=%s", reqID, upstreamModel)
+		p.handleNousAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID)
 		return
 	}
 
@@ -2582,9 +2601,14 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if zenRetries == 0 {
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && cfg().Zen.AlwaysProxy {
-					lane = laneFailover(lane)
-					sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane, zenModel)
+					// cold pool: the verify sweep publishes exits as they
+					// land, so wait for it instead of failing instantly.
+					// bounded by the retry budget below, not forever.
+					if waitZenPool(r.Context(), 8*time.Second) {
+						lane = laneFailover(lane)
+						sessionID = laneSession(lane)
+						proxy = laneProxyFor(lane, zenModel)
+					}
 					if proxy == "" {
 						return nil
 					}
@@ -2599,6 +2623,12 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					proxy = laneProxyFor(lane, zenModel)
 				}
 				if proxy == "" && cfg().Zen.AlwaysProxy {
+					// same cold-pool wait as retry 0: an empty pool means
+					// the sweep is still verifying, not that exits are
+					// dead. without the sleep all retries burn in ms.
+					if !waitZenPool(r.Context(), 8*time.Second) {
+						return nil
+					}
 					continue
 				}
 				cl = zenClient(proxy)
@@ -2666,15 +2696,24 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": up.StatusCode, "headers": up.Header, "attempt": zenRetries, "model": zenModel})
 			}
 			if err != nil {
-				dropProxy(proxy)
-				laneReproxy(lane, zenModel)
+				if isTLSFailure(err) {
+					// mitm exit: ban it pool-wide and evacuate every
+					// pinned lane, not just this one.
+					banTLSExit(proxy)
+				} else {
+					dropProxy(proxy)
+					// the dropped exit may still be pinned here when the
+					// rest of the pool is held by other lanes: re-dialing
+					// it burns every retry on a corpse, so move lanes the
+					// way the 429 path does.
+					if laneReproxy(lane, zenModel) == proxy {
+						lane = laneFailover(lane)
+						sessionID = laneRotate(lane, zenModel)
+					}
+				}
 				rotating = true
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
-				if noteZenNetworkError() {
-					acclog.Printf("  %d+ consecutive network errors, refreshing proxy pool", zenErrorThreshold())
-					refreshZenProxiesAsync()
-					resetZenNetworkErrors()
-				}
+				maybeRefreshNetErr()
 				if !zenLastRetry(zenRetries) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
@@ -2773,7 +2812,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, errSnippet(eb, 160))
 				up.Body = io.NopCloser(bytes.NewReader(eb))
 			}
-			resetZenNetworkErrors()
+			resetZenNetErrs()
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
 				noteExitOK(proxy)

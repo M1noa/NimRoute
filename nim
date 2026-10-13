@@ -1,6 +1,9 @@
 #!/bin/sh
 # nim: run nimroute in foreground, as a service, or show status.
-# usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth]
+# usage: nim [run|start|stop|restart|status [tail]|status-tail|models [N]|models sync|logs|log [N|tail]|tail|install|uninstall|freepi auth]
+# extra args on run/start/restart/install go straight to the binary:
+#   nim run -df                 foreground, dump failed requests to json
+#   nim restart --dbg-file=/tmp/d   as a service, dumps in /tmp/d
 PROXY_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOGFILE="$PROXY_DIR/nimroute.log"
 BINARY="$PROXY_DIR/nimroute"
@@ -38,18 +41,29 @@ port_alive() {
   command -v curl >/dev/null 2>&1 && curl -sf -m 2 "http://localhost:${PORT:-5419}/status" >/dev/null 2>&1
 }
 
+# svc_start passes any extra args through to the binary: launchd and
+# systemd templates carry REPLACE_WITH_ARGS, so `nim restart -df` starts a
+# recording service without editing the templates by hand.
 svc_start() {
+  # bsd sed wants \n for a replacement newline, and & is special there, so
+  # each arg is xml-escaped then sed-escaped (the &amp; back into \&amp;).
+  ARGS_XML=""; ARGS_SPC=""
+  for a in "$@"; do
+    esc=$(printf '%s' "$a" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/&/\\&/g')
+    ARGS_XML="$ARGS_XML\\n    <string>$esc</string>"
+    ARGS_SPC="$ARGS_SPC $a"
+  done
   case "$SVC_CMD" in
     launchd)
-      sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/$SVC.plist" > "$PLIST"
+      sed -e "s|REPLACE_WITH_PATH|$PROXY_DIR|g" -e "s|REPLACE_WITH_ARGS|$ARGS_XML|" "$PROXY_DIR/deploy/$SVC.plist" > "$PLIST"
       launchctl bootout "gui/$(id -u)/$SVC" 2>/dev/null
       launchctl bootstrap "gui/$(id -u)" "$PLIST" || launchctl load "$PLIST" ;;
     systemd)
       mkdir -p "$(dirname "$SYSTEMD")"
-      sed "s|REPLACE_WITH_PATH|$PROXY_DIR|g" "$PROXY_DIR/deploy/nimroute.service" > "$SYSTEMD"
+      sed -e "s|REPLACE_WITH_PATH|$PROXY_DIR|g" -e "s|REPLACE_WITH_ARGS$|$ARGS_SPC|" "$PROXY_DIR/deploy/nimroute.service" > "$SYSTEMD"
       systemctl --user daemon-reload && systemctl --user enable --now nimroute ;;
     nohup)
-      cd "$PROXY_DIR" && nohup "$BINARY" >>"$LOGFILE" 2>&1 &
+      cd "$PROXY_DIR" && nohup "$BINARY" "$@" >>"$LOGFILE" 2>&1 &
       (umask 077; echo $! > "$PIDFILE") ;;
   esac
 }
@@ -100,12 +114,10 @@ status_tail() {
 }
 
 case "${1:-status}" in
-  run)     exec "$BINARY" ;;
-  start)
-    if port_alive; then pretty_status; exit 0; fi
-    svc_start; sleep 2; pretty_status ;;
+  run)     shift; exec "$BINARY" "$@" ;;
+  start)   shift; if port_alive; then pretty_status; exit 0; fi; svc_start "$@"; sleep 2; pretty_status ;;
   stop)    svc_stop; echo "nimroute stopped" ;;
-  restart) svc_stop; sleep 1; svc_start; sleep 2; pretty_status ;;
+  restart) shift; svc_stop; sleep 1; svc_start "$@"; sleep 2; pretty_status ;;
   status)  pretty_status; st=$?; if [ "${2:-}" = "tail" ]; then status_tail; else exit $st; fi ;;
   status-tail) status_tail ;;
   logs)    pretty_status; PY="$(find_py)" || PY=""; [ -n "$PY" ] && "$PY" "$PROXY_DIR/nimstatus.py" logs 10 || { [ -f "$LOGFILE" ] && { echo ""; echo "  Access log (last 10):"; tail -10 "$LOGFILE" | sed 's/^/    /'; }; } ;;
@@ -121,10 +133,16 @@ case "${1:-status}" in
       auth) PY="$(find_py)" || { echo "no python3"; exit 1; }; exec "$PY" "$PROXY_DIR/scripts/freepi_login.py" --into-config "$PROXY_DIR/config.yml" ;;
       *) echo "Usage: nim freepi auth"; exit 1 ;;
     esac ;;
+  models)
+    case "$2" in
+      "")   PY="$(find_py)" || { echo "no python3"; exit 1; }; exec "$PY" "$PROXY_DIR/nimstatus.py" models ${3:-0} ;;
+      sync) exec "$BINARY" models sync --config "$PROXY_DIR/config.yml" ;;
+      *) echo "Usage: nim models [N] | nim models sync"; exit 1 ;;
+    esac ;;
   install)
     port_alive && { pretty_status; exit 0; }
     svc_start; sleep 2; pretty_status
     echo "installed ($SVC_CMD). see deploy/ for system-wide setup." ;;
   uninstall) svc_stop; rm -f "$PLIST" "$SYSTEMD"; echo "nimroute uninstalled" ;;
-  *) echo "Usage: nim [run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall]"; exit 1 ;;
+  *) echo "Usage: nim [run|start|stop|restart|status [tail]|status-tail|models [N]|models sync|logs|log [N|tail]|tail|install|uninstall]"; exit 1 ;;
 esac

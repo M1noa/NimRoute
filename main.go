@@ -457,7 +457,7 @@ func (p *Pool) Postpone(k *Key, d time.Duration) {
 // nvidia's end instead of burning tokens on output nobody reads.
 func (p *Pool) callUpstream(ctx context.Context, method, target string, body []byte, fwd http.Header, model, remoteAddr string) (*upstreamResult, error) {
 	exclude := make(map[string]bool)
-	cl := &http.Client{Timeout: 300 * time.Second}
+	cl := dbgClient(&http.Client{Timeout: 300 * time.Second}, "nvidia")
 	var retries int
 	var rateLimited bool
 	var used *Key
@@ -588,7 +588,9 @@ type StatusResponse struct {
 	Health        map[string]modelHealth `json:"health,omitempty"`
 	Freepi        *freepiSummary         `json:"freepi,omitempty"`
 	Antseed       *antseedSummary        `json:"antseed,omitempty"`
+	Nous          *nousSummary           `json:"nous,omitempty"`
 	Route         *routeSummary          `json:"route,omitempty"`
+	Benchmarks    *benchSummary          `json:"benchmarks,omitempty"`
 }
 
 // freepiAcctStatus is one account's /status row. jwt never leaves config.
@@ -709,8 +711,14 @@ func (p *Pool) Status() StatusResponse {
 	if antseedEnabled() && cfg().Status.ShowAntseed {
 		sr.Antseed = antseedSnapshot()
 	}
+	if nousEnabled() && cfg().Status.ShowNous {
+		sr.Nous = nousSnapshot()
+	}
 	if cfg().Status.ShowRoute {
 		sr.Route = routeSnapshot(p)
+	}
+	if cfg().Status.ShowBenchmarks {
+		sr.Benchmarks = buildBenchSummary()
 	}
 	return sr
 }
@@ -871,15 +879,35 @@ func short(s string) string {
 // model facts live in model_info.jsonc (modelinfo.go); the old
 // config.yml models.params glob table is gone.
 
+// openRouterModel is the openrouter /v1/models entry shape. clients that
+// already parse openrouter find every field they expect here; anything extra
+// we know lives under Benchmarks or Nim so it cannot collide.
 type openRouterModel struct {
 	ID               string            `json:"id"`
 	Name             string            `json:"name"`
 	Description      string            `json:"description,omitempty"`
+	Created          int64             `json:"created,omitempty"`
 	ContextLength    int               `json:"context_length"`
 	Pricing          map[string]string `json:"pricing"`
 	Architecture     map[string]any    `json:"architecture"`
 	TopProvider      map[string]any    `json:"top_provider"`
 	PerRequestLimits any               `json:"per_request_limits"`
+	CanonicalSlug    string            `json:"canonical_slug,omitempty"`
+	HuggingFaceID    string            `json:"hugging_face_id,omitempty"`
+	// SupportedParams is the openrouter request-parameter list. empty =
+	// no record, not "nothing supported".
+	SupportedParams []string       `json:"supported_parameters,omitempty"`
+	DefaultParams   map[string]any `json:"default_parameters,omitempty"`
+	KnowledgeCutoff string         `json:"knowledge_cutoff,omitempty"`
+	ExpirationDate  string         `json:"expiration_date,omitempty"`
+	Reasoning       map[string]any `json:"reasoning,omitempty"`
+	// Benchmarks is the artificial analysis score block, Benchmarks=nil when
+	// aa has no row for this model.
+	Benchmarks map[string]any `json:"benchmarks,omitempty"`
+	// Nim carries the served-contract facts only this proxy knows.
+	Nim map[string]any `json:"nim,omitempty"`
+	// OpenRouter is openrouter's own view, relayed verbatim.
+	OpenRouter map[string]any `json:"openrouter,omitempty"`
 }
 
 // extraFreeModels are free models that don't end in "-free" (just
@@ -1666,6 +1694,7 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames)
 	body = stripSentinelSSE(body)
 
 	var strip sentinelStripper
+	var sawToolCall bool
 	lines := strings.Split(string(body), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1719,6 +1748,7 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames)
 			}
 		case "response.output_item.added":
 			if evt.Item != nil && evt.Item.Type == "function_call" {
+				sawToolCall = true
 				tid := evt.Item.CallID
 				if tid == "" {
 					tid = "toolu_" + randHex(24)
@@ -1745,6 +1775,16 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames)
 				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
 				written += int64(n)
 			}
+			// openai chat clients (and every agent harness) require a terminal
+			// finish_reason before [DONE]; without it they error "stream ended
+			// without finish_reason". a tool-call turn terminates with
+			// "tool_calls", matching the non-streaming path.
+			finish := "stop"
+			if sawToolCall {
+				finish = "tool_calls"
+			}
+			n, _ := w.Write([]byte(fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":%q}],\"usage\":null}\n\n", finish)))
+			written += int64(n)
 			if evt.Response != nil && evt.Response.Usage != nil {
 				promptT = evt.Response.Usage.InputTokens
 				compT = evt.Response.Usage.OutputTokens
@@ -1753,7 +1793,7 @@ func streamResponsesToChat(w http.ResponseWriter, body []byte, tnames toolNames)
 				n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
 				written += int64(n)
 			}
-			n, _ := w.Write([]byte("data: [DONE]\n\n"))
+			n, _ = w.Write([]byte("data: [DONE]\n\n"))
 			written += int64(n)
 			if fl != nil {
 				fl.Flush()
@@ -1788,6 +1828,7 @@ func streamResponsesLive(ctx context.Context, w http.ResponseWriter, body io.Rea
 		}
 	}
 	var strip sentinelStripper
+	var sawToolCall bool
 	var carry []byte
 	buf := make([]byte, 4096)
 	// evt mirrors the subset streamResponsesToChat parses; kept local so
@@ -1840,6 +1881,7 @@ func streamResponsesLive(ctx context.Context, w http.ResponseWriter, body io.Rea
 				}
 			case "response.output_item.added":
 				if evt.Item != nil && evt.Item.Type == "function_call" {
+					sawToolCall = true
 					tid := evt.Item.CallID
 					if tid == "" {
 						tid = "toolu_" + randHex(24)
@@ -1862,6 +1904,16 @@ func streamResponsesLive(ctx context.Context, w http.ResponseWriter, body io.Rea
 					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
 					written += int64(n)
 				}
+				// terminal finish_reason before [DONE]; openai chat clients and
+				// every agent harness require it (else "stream ended without
+				// finish_reason"). a tool-call turn terminates with "tool_calls",
+				// matching the non-streaming path.
+				finish := "stop"
+				if sawToolCall {
+					finish = "tool_calls"
+				}
+				n, _ := w.Write([]byte(fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":%q}],\"usage\":null}\n\n", finish)))
+				written += int64(n)
 				if evt.Response != nil && evt.Response.Usage != nil {
 					promptT = evt.Response.Usage.InputTokens
 					compT = evt.Response.Usage.OutputTokens
@@ -1869,7 +1921,7 @@ func streamResponsesLive(ctx context.Context, w http.ResponseWriter, body io.Rea
 					n, _ := fmt.Fprintf(w, "data: %s\n\n", chunk)
 					written += int64(n)
 				}
-				n, _ := w.Write([]byte("data: [DONE]\n\n"))
+				n, _ = w.Write([]byte("data: [DONE]\n\n"))
 				written += int64(n)
 				flush()
 				return
@@ -2009,7 +2061,11 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		}
 		up, err := cl.Do(req)
 		if err != nil {
-			dropProxy(proxy)
+			if isTLSFailure(err) {
+				banTLSExit(proxy)
+			} else {
+				dropProxy(proxy)
+			}
 			rotating = true
 			acclog.Printf("!! opencode zen error (retry %d/%d) nudge country=%s proxy=%s %s: %v", zenRetries, zenRetryLabel(), proxyCountry(proxy), redactProxyUserinfo(proxy), target, err)
 			if !zenLastRetry(zenRetries) {
@@ -2209,10 +2265,39 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	appendFreepiModels(&out, seenIDs)
 	appendAntseedModels(&out, seenIDs)
+	appendNousModels(&out, seenIDs)
 	appendRouteModels(p, &out, seenIDs)
+	sortModelsByBench(out.Data)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// sortModelsByBench orders the listing best-score-first so a client that
+// just walks the array gets the strongest models first. models aa has no row
+// for keep their relative order at the tail, and the tiebreak on id makes the
+// whole listing deterministic.
+func sortModelsByBench(list []openRouterModel) {
+	if !benchmarksEnabled() {
+		return
+	}
+	score := func(m openRouterModel) float64 {
+		if m.Benchmarks == nil {
+			return 0
+		}
+		v, _ := m.Benchmarks["intelligence_index"].(float64)
+		return v
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := score(list[i]), score(list[j])
+		if (a > 0) != (b > 0) {
+			return a > 0
+		}
+		if a != b {
+			return a > b
+		}
+		return list[i].ID < list[j].ID
+	})
 }
 
 // appendFreepiModels lists freeepi/<id> for every catalog model across
@@ -2244,6 +2329,10 @@ func appendFreepiModels(out *struct {
 // description, served context, served max output, and modality all come from
 // model_info. freepi entries advertise the gateway's own limits, not the
 // upstream model's. unknown ids get the derived name and a default context.
+//
+// three layers stack on top: the openrouter overlay fills any gap the file
+// left, the artificial analysis block scores the model, and the nim block
+// states what the proxy itself serves.
 func infoModel(displayID, infoID string) openRouterModel {
 	cl := modelServedCtx(infoID)
 	if cl == 0 {
@@ -2254,7 +2343,7 @@ func infoModel(displayID, infoID string) openRouterModel {
 		maxOut = mo
 	}
 	mod := modelModality(infoID)
-	return openRouterModel{
+	m := openRouterModel{
 		ID:            displayID,
 		Name:          modelName(infoID),
 		Description:   modelDesc(infoID),
@@ -2271,7 +2360,79 @@ func infoModel(displayID, infoID string) openRouterModel {
 			"is_moderated":          false,
 		},
 		PerRequestLimits: nil,
+		Benchmarks:       benchBlock(benchFor(infoID)),
+		OpenRouter:       orExtras(infoID),
 	}
+	if e := lookupModelInfo(infoID); e != nil {
+		if len(e.Inputs) > 0 {
+			m.Architecture["input_modalities"] = e.Inputs
+		}
+		if len(e.OutMods) > 0 {
+			m.Architecture["output_modalities"] = e.OutMods
+		}
+		m.SupportedParams = e.SupportedParams
+		m.KnowledgeCutoff = e.Knowledge
+		if e.Released != "" {
+			m.Created = releaseUnix(e.Released)
+		}
+		if e.Reasoning != nil {
+			r := map[string]any{"mandatory": *e.Reasoning}
+			if len(e.EffortLevels) > 0 {
+				r["supported_efforts"] = e.EffortLevels
+			}
+			if d := modelDefaultEffort(infoID); d != "" {
+				r["default_effort"] = d
+			}
+			m.Reasoning = r
+		}
+		m.Nim = nimBlock(infoID, e)
+	}
+	return m
+}
+
+// nimBlock is the served contract: what this proxy will actually do with the
+// model, as opposed to what the upstream model is capable of.
+func nimBlock(infoID string, e *modelInfoEntry) map[string]any {
+	n := map[string]any{
+		"served_context":    modelServedCtx(infoID),
+		"served_max_output": modelServedMaxOut(infoID),
+		"source":            e.Source,
+	}
+	if e.Free {
+		n["free"] = true
+	}
+	if e.Family != "" {
+		n["family"] = e.Family
+	}
+	if e.Released != "" {
+		n["released"] = e.Released
+	}
+	if e.OpenWeights {
+		n["open_weights"] = true
+	}
+	if e.Nudge != nil {
+		n["nudge_no_tools"] = *e.Nudge
+	}
+	if e.Mult != "" {
+		n["freepi_usage_multiplier"] = e.Mult
+	}
+	if e.UpstreamStatus != "" {
+		n["upstream_status"] = e.UpstreamStatus
+	}
+	if e.Params != "" {
+		n["params"] = e.Params
+	}
+	return n
+}
+
+// releaseUnix turns a yyyy-mm-dd catalog date into the unix seconds
+// openrouter's "created" field carries. 0 when unparseable.
+func releaseUnix(date string) int64 {
+	t, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return 0
+	}
+	return t.Unix()
 }
 
 func modelDisplayName(id string) string {
@@ -2912,6 +3073,20 @@ func corsOrigins() []string {
 func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// capture the raw client bytes before any pii masking or body rewrite: a
+	// dump is only useful if it shows what the proxy actually received.
+	tr, tctx := startTrace(r)
+	if tr != nil {
+		r = r.WithContext(tctx)
+		r.Body = &traceBody{tr: tr, r: r.Body}
+		dw := &dbgWriter{w: w, tr: tr}
+		w = dw
+		defer func() {
+			tr.end(dw.status(), dw.buf.Bytes())
+			tr.dumpIfErr()
+		}()
+	}
+
 	origin := r.Header.Get("Origin")
 	allowed := false
 	for _, o := range corsOrigins() {
@@ -2932,6 +3107,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqID := fmt.Sprintf("req-%d", reqSeq.Add(1))
+	if tr != nil {
+		tr.setReqID(reqID)
+	}
 	// /status + /health poll every second from status tail: logging them
 	// buries real traffic. errors on those paths still log below.
 	if r.URL.Path != "/status" && r.URL.Path != "/health" {
@@ -3063,6 +3241,9 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		model = base
 	}
 	acclog.Printf("%s -> %s %s model=%s stream=%v bytes=%d", reqID, r.Method, r.URL.Path, model, isStream, len(body))
+	if tr := traceFrom(r.Context()); tr != nil {
+		tr.setModel(model, backendForModel(model), isStream)
+	}
 
 	if strings.HasPrefix(model, "route/") {
 		if !routeEnabled() {
@@ -3112,6 +3293,23 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		acclog.Printf("%s routed to antseed model=%s", reqID, model)
 		p.handleAntseed(w, r, body, model, isStream, start, reqID)
+		return
+	}
+
+	// nous/<model> is the listed form. the portal catalog is openai-shaped,
+	// so the rest of this path is the same as any other keyed backend.
+	if strings.HasPrefix(model, "nous/") {
+		if !nousEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (nous disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"nous portal is disabled or has no keys; set nous.enabled: true and add nous_keys to config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		model = strings.TrimPrefix(model, "nous/")
+		if b, err := setReqModel(body, model); err == nil {
+			body = b
+		}
+		acclog.Printf("%s routed to nous model=%s", reqID, model)
+		p.handleNous(w, r, body, model, isStream, start, reqID)
 		return
 	}
 
@@ -3178,7 +3376,7 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 	}
 
 	exclude := make(map[string]bool)
-	cl := &http.Client{Timeout: 300 * time.Second}
+	cl := dbgClient(&http.Client{Timeout: 300 * time.Second}, "nvidia")
 	var lastResp *http.Response
 	var used *Key
 	var retries int
@@ -3595,15 +3793,22 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": resp.StatusCode, "headers": resp.Header, "attempt": zenRetries, "model": realModel})
 		}
 		if err != nil {
-			dropProxy(proxy)
-			laneReproxy(lane, realModel)
+			if isTLSFailure(err) {
+				// mitm exit: ban it pool-wide and evacuate every pinned
+				// lane, not just this one.
+				banTLSExit(proxy)
+			} else {
+				dropProxy(proxy)
+				// same stale-pin trap as the anthropic path: a dropped
+				// exit still pinned here must not eat every retry.
+				if laneReproxy(lane, realModel) == proxy {
+					lane = laneFailover(lane)
+					sessionID = laneRotate(lane, realModel)
+				}
+			}
 			rotating = true
 			logZenNetErr(zenRetries, model, proxy, target, err)
-			if noteZenNetworkError() {
-				acclog.Printf("  %d+ consecutive network errors, refreshing proxy pool", zenErrorThreshold())
-				refreshZenProxiesAsync()
-				resetZenNetworkErrors()
-			}
+			maybeRefreshNetErr()
 			if !zenLastRetry(zenRetries) {
 				zenBackoffCtx(r.Context(), zenRetries)
 				continue
@@ -3715,7 +3920,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(eb))
 		}
-		resetZenNetworkErrors()
+		resetZenNetErrs()
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
 			noteExitOK(usedProxy)
@@ -4510,6 +4715,7 @@ type cliFlags struct {
 	lanes   int
 	debug   bool
 	monitor bool
+	dbgFile string
 	set     map[string]bool
 }
 
@@ -4539,6 +4745,26 @@ func parseFlags(args []string) (cliFlags, []string) {
 		if a == "--monitor" {
 			f.monitor = true
 			f.set["monitor"] = true
+			continue
+		}
+		// --dbg-file / -df: boolean with an optional value. `-df` bare keeps
+		// the default dir, `--dbg-file=/some/dir` (or `--dbg-file /some/dir`)
+		// moves the dumps. `-df` never eats a positional: it's the short bool.
+		if a == "-df" {
+			f.set["dbgfile"] = true
+			continue
+		}
+		if a == "--dbg-file" {
+			if v, ni := take(i, "--dbg-file"); ni >= 0 {
+				f.dbgFile, f.set["dbgfile"] = v, true
+				i = ni
+				continue
+			}
+			f.set["dbgfile"] = true
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--dbg-file="); ok {
+			f.dbgFile, f.set["dbgfile"] = v, true
 			continue
 		}
 		if v, ni := take(i, "--config"); ni >= 0 {
@@ -4599,6 +4825,12 @@ func serverMainFlags(f cliFlags) {
 	if f.set["debug"] && f.debug {
 		debugMode = true
 	}
+	if f.set["dbgfile"] {
+		// after initLogging so acclog is live: the first dump on a bad dir
+		// warns instead of vanishing.
+		setDebugFile(true, f.dbgFile)
+		log.Printf("  dbg-file: dumping failed requests to %s", debugFileDir())
+	}
 	if c.Antseed.Enabled {
 		go antRefresh()
 	}
@@ -4616,10 +4848,15 @@ func serverMainFlags(f cliFlags) {
 			refreshOpencodeModels()
 		}
 	}()
+	// openrouter + aa both fetch in the background: neither may hold the
+	// listener, and both keep their last good data on failure.
+	watchOpenRouter()
+	watchBenchmarks()
 	go watchOpenCodeVersion()
 	go watchZenProxies()
 
 	pool := newPool(c.NvidiaKeys)
+	nousSyncKeys(c.NousKeys)
 	go watchConfig(pool, cpath)
 
 	port := c.Server.Port
@@ -4891,14 +5128,36 @@ func runProbe() {
 func main() {
 	f, rest := parseFlags(os.Args[1:])
 	if f.set["help"] {
-		fmt.Println("nimroute: llm proxy (:5419). flags: --config PATH --port N --lanes N --debug --monitor. subcommand: probe")
+		fmt.Println("nimroute: llm proxy (:5419). flags: --config PATH --port N --lanes N --debug --monitor. subcommand: probe | models sync")
 		return
 	}
 	if len(rest) > 0 && rest[0] == "probe" {
 		runProbeFlags(f)
 		return
 	}
+	if len(rest) > 1 && rest[0] == "models" && rest[1] == "sync" {
+		runModelsSyncFlags(f)
+		return
+	}
 	serverMainFlags(f)
+}
+
+// runModelsSyncFlags is runModelsSync honoring --config and --models.
+func runModelsSyncFlags(f cliFlags) {
+	if f.set["config"] && f.config != "" {
+		os.Setenv("CONFIG_FILE", f.config)
+	}
+	cpath := configPath()
+	if f.set["config"] && f.config != "" {
+		cpath = f.config
+	}
+	c, err := loadConfigFile(cpath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot read %s: %v\n", cpath, err)
+		os.Exit(1)
+	}
+	applyConfig(c)
+	os.Exit(runModelsSync(cpath))
 }
 
 // runProbeFlags is runProbe honoring --config. --port/--lanes/--debug

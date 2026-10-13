@@ -26,6 +26,19 @@ key/proxy/lane rotation to survive per-exit rate limits.
   run. snapshot addresses are untrusted claims: `antEndpointOK` rejects
   non-global-unicast/private/loopback before dial. only retryable statuses
   cool a seller; 400s fail fast without parking it.
+- **Nous Portal**: free models from `https://inference-api.nousresearch.com/v1`
+  via `nous/<model>` ids. openai-compatible chat/completions, bearer api key,
+  keys in `nous_keys` (separate pool from `nvidia_keys`, same map shape).
+  own key pool in `nous.go`; a 429 cools one key and rotates, and when every
+  key is cooling the portal's own 429 reaches the client rather than a
+  synthesized 503. only the zero-priced catalog is served and listed: the
+  filter is `pricing.prompt == 0 && pricing.completion == 0`, NOT the
+  `:free` id suffix (`inclusionai/ling-3.1-flash`, `meituan/longcat-2.0`,
+  `stealth/missingno` are free with no suffix; no paid id carries one).
+  both directions must be zero or the embedding models (completion 0, prompt
+  > 0) leak in. catalog cached 6h, last good list kept on fetch failure.
+  x402 (solana usdc, keyless pay-per-request) is NOT implemented — api key
+  only.
 - **NVIDIA NIM**: upstream `integrate.api.nvidia.com`, needs
   `nvidia_keys` in config.yml. `nvidia/` prefix is listing-only, stripped
   before forwarding. no keys (or `nvidia.enabled: false`) = NIM 503s,
@@ -33,7 +46,10 @@ key/proxy/lane rotation to survive per-exit rate limits.
 - `ServeHTTP` (main.go): `/status` + `/health` -> `StatusFor`;
   `/v1/models`; `/v1/messages`, `/v1/messages/count_tokens`,
   `/v1/messages/classifier`; `freeepi/` -> freepi, `antseed/` -> antseed,
-  `opencode/` -> zen, `nvidia/` stripped, else NIM.
+  `opencode/` -> zen, `nous/` stripped, `nvidia/` stripped, else NIM.
+  both dispatch tables (ServeHTTP and `handleAnthropic`) carry the prefix;
+  a new backend needs a branch in each. `backendForModel` (debugtrace.go)
+  needs a case too or traces mislabel the backend.
   inbound bodies capped at 10MB (`bodyLimit`). service via
   `./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth`.
 
@@ -95,9 +111,9 @@ key/proxy/lane rotation to survive per-exit rate limits.
   pattern: `Status()` builds, `StatusFor()` gates.
 - auth redaction lives in `StatusFor`: when `auth.tokens` is set and the
   request is unauthenticated, hide keys, locks, zen session/proxy,
-  lanes, lanecap, pool, freepi, antseed, and usage — no matter what the
-  flags say. model ids stay visible (always safe). every section needs
-  its own `status.show_*` flag (`show_freepi` included).
+  lanes, lanecap, pool, freepi, antseed, nous, and usage — no matter what
+  the flags say. model ids stay visible (always safe). every section needs
+  its own `status.show_*` flag (`show_freepi`, `show_nous` included).
 - never widen unauthenticated output without a flag defaulting off.
 
 ## 5. upstream error guidance
@@ -139,7 +155,10 @@ logic).
   proxy value reaches `/status` AND logs.
 - never forward client credentials upstream: NIM path has a header
   deny-list (`authorization`, `host`, `origin`, `cookie`, `x-api-key`,
-  `x-session-id`); zen has its own blocklist in `zenHeaderForwarded`
+  `x-session-id`); the nous path repeats it in `nousFwdHeaders` (same six
+  headers, same reason: authorization is the proxy's own credential there and
+  x-session-id would link the client upstream). zen has its own blocklist in
+  `zenHeaderForwarded`
   (also drops `content-type`, `accept`, `user-agent` and the four
   `x-opencode-*` the proxy sets itself: client, session, request,
   project; `x-opencode-session-id` is deliberately ALLOWED and set by the

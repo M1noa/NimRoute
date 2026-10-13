@@ -4,12 +4,12 @@
 <dict>
   <key>Label</key>
   <string>com.user.nimroute</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>REPLACE_WITH_PATH/nimroute</string>
-  </array>
   <key>WorkingDirectory</key>
   <string>REPLACE_WITH_PATH</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_PATH/nimroute</string>REPLACE_WITH_ARGS
+  </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
@@ -1000,7 +1001,7 @@ func antFailover(peerID, service, why string) {
 
 // antTry sends one request to one offer: free-usage open (best effort),
 // then the chat completion. returns seller body on 200.
-func antTry(o antOffer, oaiBody []byte) ([]byte, int, bool) {
+func antTry(ctx context.Context, o antOffer, oaiBody []byte) ([]byte, int, bool) {
 	c, err := antConnFor(o)
 	if err != nil {
 		antFailover(o.peerID, "", err.Error())
@@ -1027,6 +1028,33 @@ func antTry(o antOffer, oaiBody []byte) ([]byte, int, bool) {
 		body: b,
 	}
 	status, _, rb, err := c.antDoRequest(q, 300*time.Second)
+	// antseed is raw p2p framing, not http.Client, so the transport hook
+	// can't see it: record the hop by hand for -df dumps.
+	if tr := traceFrom(ctx); tr != nil {
+		body, trunc := string(b), false
+		if len(b) > traceUpReqCap {
+			body, trunc = string(b[:traceUpReqCap]), true
+		}
+		rbody, rtrunc := string(rb), false
+		if len(rb) > traceUpRespCap {
+			rbody, rtrunc = string(rb[:traceUpRespCap]), true
+		}
+		h := &traceHop{
+			Backend:      "antseed",
+			Target:       o.hostPort + q.path,
+			Method:       q.method,
+			ReqHeaders:   q.headers,
+			ReqBody:      body,
+			ReqTruncated: trunc,
+			Status:       status,
+			RespBody:     rbody,
+			RespTrunc:    rtrunc,
+		}
+		if err != nil {
+			h.Error = err.Error()
+		}
+		tr.addHop(h)
+	}
 	if err != nil {
 		antFailover(o.peerID, "", err.Error())
 		return nil, 0, true
@@ -1068,7 +1096,7 @@ func (p *Pool) handleAntseedAnthropic(w http.ResponseWriter, r *http.Request, oa
 			writeAnthropicError(w, 499, "api_error", "client disconnected")
 			return
 		}
-		b, st, cont := antTry(o, oaiBody)
+		b, st, cont := antTry(r.Context(), o, oaiBody)
 		status = st
 		if b != nil {
 			rb, peer = b, o.peerID
@@ -1102,7 +1130,7 @@ func (p *Pool) handleAntseedAnthropic(w http.ResponseWriter, r *http.Request, oa
 			if r.Context().Err() != nil {
 				return nil
 			}
-			b, _, cont := antTry(o, nb)
+			b, _, cont := antTry(r.Context(), o, nb)
 			if b != nil {
 				return fold(b)
 			}
@@ -1167,7 +1195,7 @@ func (p *Pool) handleAntseed(w http.ResponseWriter, r *http.Request, body []byte
 			writeJSONError(w, 499, "client disconnected")
 			return
 		}
-		b, st, cont := antTry(o, body)
+		b, st, cont := antTry(r.Context(), o, body)
 		status = st
 		if b != nil {
 			rb, peer = b, o.peerID

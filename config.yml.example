@@ -40,6 +40,24 @@ nvidia_keys:
   # main: "nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   # backup-1: "nvapi-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
 
+# --- nous portal backend (https://portal.nousresearch.com/api-docs) ---
+# master switch. false = nous/* 503 and hidden from /v1/models.
+nous:
+  enabled: true
+# --- nous portal keys (optional) ---
+# api keys only. generate one at https://portal.nousresearch.com after
+# adding credits or activating the free subscription.
+# format: any name you like -> key. names show up in logs and /status.
+# requests use the nous/ prefixed form (nous/poolside/laguna-s-2.1:free);
+# the prefix names the backend and never reaches the portal.
+# only the zero-priced models are served and listed. the filter is the
+# portal's own pricing, NOT the ":free" id suffix: several free ids carry no
+# suffix (inclusionai/ling-3.1-flash, meituan/longcat-2.0) and no paid id
+# carries one. x402 (solana usdc, keyless pay-per-request) is not implemented.
+nous_keys:
+  # main: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  # backup-1: "sk-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+
 # --- guardrails: strip baked-in system-prompt refusals ---
 guardrails:
   # master switch. false = pass system prompts through untouched.
@@ -371,6 +389,30 @@ route:
   exclude_providers: []  # e.g. ["nvidia"] drops a backend from every route
   exclude_models: []      # glob on the route key, e.g. ["*muse-spark*"]
 
+# --- benchmarks: artificial analysis scores ---
+# the proxy does not scrape artificial analysis. it fetches aa_data.json,
+# which the which-llm project re-scrapes from AA daily and publishes. that
+# keeps us off AA's breaking-next.js-payload path and off their api, which
+# needs a key and already carries a sunset header.
+# the file is ~7MB, so the fetch runs in the background and is cached on
+# disk; a proxy with no scores still routes normally.
+# "match" on every row says how the model was found: exact, slug (variant
+# suffix stripped), or family (release.slug, highest scoring member).
+benchmarks:
+  enabled: true          # false = no aa fetch, no score on /v1/models or /status
+  url: ""                # override aa_data.json. "" = which-llm's daily branch
+  refresh_hours: 12      # refetch interval
+  cache_hours: 24        # a cached file younger than this skips the download
+
+# --- openrouter: fills gaps in model_info.jsonc ---
+# fetches the openrouter model list and fills only the fields the catalog
+# leaves empty. curated values always win, and the file is never written
+# unless you run `nim models sync` yourself.
+openrouter:
+  enabled: true          # false = no fetch, catalog gaps stay gaps
+  url: ""                # override the models endpoint. "" = openrouter.ai
+  refresh_hours: 6
+
 # --- status: what /status shows ---
 # when auth.tokens is set AND the /status request has no valid token,
 # keys, locks, zen session and proxy are hidden no matter what these say.
@@ -384,7 +426,9 @@ status:
   show_pool: true             # proxy pool: verified count, per-exit rows
   show_antseed: false         # antseed section: peers, free models, identity age
   show_freepi: true           # freepi section: accounts, tiers, credit spend
+  show_nous: true             # nous section: portal keys, free models served
   show_route: true            # route section: strategy, latency, route ids
+  show_benchmarks: true       # aa scores per model, best first
 
 # --- usage: per-request token tracker ---
 # every model request appends one json line (model, tokens, latency,

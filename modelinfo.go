@@ -128,23 +128,27 @@ func setModelInfo(m map[string]modelInfoEntry) {
 // with the nvidia/ prefix stripped (file keys nim ids bare), then with a
 // trailing [1m] stripped when the suffixed id is unknown (claude code 1m
 // context alias: the base model serves it).
+//
+// the openrouter overlay is applied last: it fills fields the catalog leaves
+// empty and synthesizes an entry for ids the file never listed, but never
+// overrides a curated value.
 func lookupModelInfo(id string) *modelInfoEntry {
 	modelInfoMu.RLock()
 	defer modelInfoMu.RUnlock()
 	if e, ok := modelInfo[id]; ok {
-		return &e
+		return withOROverlay(id, &e)
 	}
 	if s := strings.TrimPrefix(id, "nvidia/"); s != id {
 		if e, ok := modelInfo[s]; ok {
-			return &e
+			return withOROverlay(id, &e)
 		}
 	}
 	if s, ok := baseModelID(id); ok {
 		if e, ok := modelInfo[s]; ok {
-			return &e
+			return withOROverlay(id, &e)
 		}
 	}
-	return nil
+	return withOROverlay(id, nil)
 }
 
 // lookupModelInfoExact finds an entry without [1m] alias resolution:
@@ -153,14 +157,14 @@ func lookupModelInfoExact(id string) *modelInfoEntry {
 	modelInfoMu.RLock()
 	defer modelInfoMu.RUnlock()
 	if e, ok := modelInfo[id]; ok {
-		return &e
+		return withOROverlay(id, &e)
 	}
 	if s := strings.TrimPrefix(id, "nvidia/"); s != id {
 		if e, ok := modelInfo[s]; ok {
-			return &e
+			return withOROverlay(id, &e)
 		}
 	}
-	return nil
+	return withOROverlay(id, nil)
 }
 
 // baseModelID strips the trailing [1m] context alias: ("<id>[1m]", "<id>",

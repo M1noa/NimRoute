@@ -1,7 +1,7 @@
 # NimRoute
 > THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
 
-OpenAI/Anthropic-compatible proxy with four backends: **opencode zen free models** (`opencode/<model>`, keyless), **freepi ad-supported models** (`freeepi/<model>`, needs `./nim freepi auth`), **antseed p2p models** (`antseed/<model>`, keyless), and **NVIDIA NIM** (`nvidia/<model>` key pool, needs keys). `route/<model>` fans out across backends.
+OpenAI/Anthropic-compatible proxy with five backends: **opencode zen free models** (`opencode/<model>`, keyless), **freepi ad-supported models** (`freeepi/<model>`, needs `./nim freepi auth`), **antseed p2p models** (`antseed/<model>`, keyless), **Nous Portal free models** (`nous/<model>`, needs keys), and **NVIDIA NIM** (`nvidia/<model>` key pool, needs keys). `route/<model>` fans out across backends.
 
 ```sh
 go build -o nimroute .
@@ -15,7 +15,9 @@ curl -s -X POST http://localhost:5419/v1/chat/completions -H 'Content-Type: appl
 
 ## Setup
 
-`config.yml` (hot-reloaded) covers everything: `nvidia_keys`, `auth.tokens` (empty = open proxy), guardrails, anonymize, zen pool. Without keys, NIM models 503 and `opencode/*` keeps working.
+`config.yml` (hot-reloaded) covers everything: `nvidia_keys`, `nous_keys`, `auth.tokens` (empty = open proxy), guardrails, anonymize, zen pool. Without keys, NIM and Nous models 503 and `opencode/*` keeps working.
+
+Nous Portal serves only the zero-priced models from its catalog, picked by price rather than the `:free` id suffix — several free ids carry no suffix and no paid id carries one.
 
 ## Clients
 

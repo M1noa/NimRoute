@@ -222,6 +222,13 @@ type nvidiaConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+// nousConfig gates the Nous Portal backend
+// (https://inference-api.nousresearch.com/v1). keys live in the flat
+// nous_keys map, the same shape as nvidia_keys.
+type nousConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 // routeConfig gates cross-provider route/<model> ids: one name that fans
 // out across backends in strategy order.
 type routeConfig struct {
@@ -242,6 +249,31 @@ type routeConfig struct {
 	ExcludeProviders []string `yaml:"exclude_providers"`
 	// ExcludeModels drops route ids by glob ("*muse-spark*").
 	ExcludeModels []string `yaml:"exclude_models"`
+}
+
+// benchmarksConfig gates the Artificial Analysis benchmark scores shown in
+// /v1/models and /status. the data is which-llm's published aa_data.json
+// (refreshing daily), not a live scrape: AA's own API wants a key and
+// carries a sunset header.
+type benchmarksConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// URL is the aa_data.json fetch. "" = which-llm's daily branch.
+	URL string `yaml:"url"`
+	// RefreshHours is the refetch interval. 0 = 12.
+	RefreshHours int `yaml:"refresh_hours"`
+	// CacheHours is how long a fetched file counts as fresh at boot, so a
+	// restart with a warm network still skips the download. 0 = 24.
+	CacheHours int `yaml:"cache_hours"`
+}
+
+// openrouterConfig gates the openrouter model list used to fill gaps in
+// model_info.jsonc. fills only empty fields; never overwrites the file.
+type openrouterConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// URL is the models endpoint. "" = https://openrouter.ai/api/v1/models
+	URL string `yaml:"url"`
+	// RefreshHours is the refetch interval. 0 = 6.
+	RefreshHours int `yaml:"refresh_hours"`
 }
 
 // freepiAccount is one ad-supported account: jwt from github device flow
@@ -301,7 +333,9 @@ type statusConfig struct {
 	ShowPool           bool `yaml:"show_pool"`
 	ShowAntseed        bool `yaml:"show_antseed"`
 	ShowFreepi         bool `yaml:"show_freepi"`
+	ShowNous           bool `yaml:"show_nous"`
 	ShowRoute          bool `yaml:"show_route"`
+	ShowBenchmarks     bool `yaml:"show_benchmarks"`
 }
 
 // usageConfig gates the per-request tracker. off = no file, no counters.
@@ -338,6 +372,8 @@ type appConfig struct {
 	Auth       authConfig        `yaml:"auth"`
 	Nvidia     nvidiaConfig      `yaml:"nvidia"`
 	NvidiaKeys map[string]string `yaml:"nvidia_keys"`
+	Nous       nousConfig        `yaml:"nous"`
+	NousKeys   map[string]string `yaml:"nous_keys"`
 	Guardrails guardrailsConfig  `yaml:"guardrails"`
 	Inject     injectConfig      `yaml:"inject"`
 	Anonymize  anonymizeConfig   `yaml:"anonymize"`
@@ -348,6 +384,8 @@ type appConfig struct {
 	Freepi     freepiConfig      `yaml:"freepi"`
 	Antseed    antseedConfig     `yaml:"antseed"`
 	Route      routeConfig       `yaml:"route"`
+	Benchmarks benchmarksConfig  `yaml:"benchmarks"`
+	OpenRouter openrouterConfig  `yaml:"openrouter"`
 	Status     statusConfig      `yaml:"status"`
 	Usage      usageConfig       `yaml:"usage"`
 	Monitor    monitorConfig     `yaml:"monitor"`
@@ -415,6 +453,18 @@ func defaultConfig() appConfig {
 			Strategy:       "priority",
 			MinOccurrences: 2,
 		},
+		Benchmarks: benchmarksConfig{
+			Enabled:      true,
+			RefreshHours: 12,
+			CacheHours:   24,
+		},
+		OpenRouter: openrouterConfig{
+			Enabled:      true,
+			RefreshHours: 6,
+		},
+		Nous: nousConfig{
+			Enabled: true,
+		},
 		Zen: zenConfig{
 			Enabled:                  true,
 			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
@@ -459,6 +509,8 @@ func defaultConfig() appConfig {
 			ShowPool:           true,
 			ShowRoute:          true,
 			ShowFreepi:         true,
+			ShowNous:           true,
+			ShowBenchmarks:     true,
 		},
 		Usage: usageConfig{
 			Enabled: true,
@@ -508,6 +560,13 @@ func loadConfigFile(path string) (*appConfig, error) {
 		} else {
 			c.Nvidia.Enabled = true
 		}
+		if p, ok := doc["nous"].(map[string]any); ok {
+			if v, has := p["enabled"]; !has || v == nil {
+				c.Nous.Enabled = true
+			}
+		} else {
+			c.Nous.Enabled = true
+		}
 		if z, ok := doc["zen"].(map[string]any); ok {
 			if v, has := z["enabled"]; !has || v == nil {
 				c.Zen.Enabled = true
@@ -529,6 +588,20 @@ func loadConfigFile(path string) (*appConfig, error) {
 		} else {
 			c.Route.Enabled = true
 		}
+		if b, ok := doc["benchmarks"].(map[string]any); ok {
+			if v, has := b["enabled"]; !has || v == nil {
+				c.Benchmarks.Enabled = true
+			}
+		} else {
+			c.Benchmarks.Enabled = true
+		}
+		if o, ok := doc["openrouter"].(map[string]any); ok {
+			if v, has := o["enabled"]; !has || v == nil {
+				c.OpenRouter.Enabled = true
+			}
+		} else {
+			c.OpenRouter.Enabled = true
+		}
 		if _, ok := doc["status"].(map[string]any); ok {
 			if s, ok := doc["status"].(map[string]any); ok {
 				if v, has := s["show_usage"]; !has || v == nil {
@@ -543,12 +616,20 @@ func loadConfigFile(path string) (*appConfig, error) {
 				if v, has := s["show_freepi"]; !has || v == nil {
 					c.Status.ShowFreepi = true
 				}
+				if v, has := s["show_nous"]; !has || v == nil {
+					c.Status.ShowNous = true
+				}
+				if v, has := s["show_benchmarks"]; !has || v == nil {
+					c.Status.ShowBenchmarks = true
+				}
 			}
 		} else {
 			c.Status.ShowUsage = true
 			c.Status.ShowPool = true
 			c.Status.ShowRoute = true
 			c.Status.ShowFreepi = true
+			c.Status.ShowNous = true
+			c.Status.ShowBenchmarks = true
 		}
 		if c.Usage.Path == "" {
 			c.Usage.Path = "nim-usage.jsonl"
@@ -571,6 +652,9 @@ func loadConfigFile(path string) (*appConfig, error) {
 	}
 	if c.NvidiaKeys == nil {
 		c.NvidiaKeys = map[string]string{}
+	}
+	if c.NousKeys == nil {
+		c.NousKeys = map[string]string{}
 	}
 	return &c, nil
 }
@@ -816,6 +900,9 @@ func applyConfig(c *appConfig) {
 	if c.NvidiaKeys == nil {
 		c.NvidiaKeys = map[string]string{}
 	}
+	if c.NousKeys == nil {
+		c.NousKeys = map[string]string{}
+	}
 	appCfg.Store(c)
 
 	// model catalog (hot-reloaded with the config). a broken catalog
@@ -926,6 +1013,8 @@ func watchConfig(p *Pool, path string) {
 				refreshZenProxiesAsync()
 			}
 			added, removed := p.Reload(c.NvidiaKeys)
+			// portal keys are a separate pool: the reload rebuilds it too.
+			nousSyncKeys(c.NousKeys)
 			// keyless cap follows zen lanes, so a lanes edit takes
 			// effect here without a restart.
 			p.syncSemLimit(c.NvidiaKeys)
@@ -1033,8 +1122,14 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowFreepi {
 		sr.Freepi = nil
 	}
+	if !c.Status.ShowNous {
+		sr.Nous = nil
+	}
 	if !c.Status.ShowRoute {
 		sr.Route = nil
+	}
+	if !c.Status.ShowBenchmarks {
+		sr.Benchmarks = nil
 	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
@@ -1042,10 +1137,12 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.ZenLanes = nil
 		sr.Freepi = nil
 		sr.Antseed = nil
+		sr.Nous = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Pool = nil
 		sr.Route = nil
+		sr.Benchmarks = nil
 	}
 	return sr
 }

@@ -13,6 +13,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -209,6 +211,9 @@ func refreshZenProxies() {
 	relis := make(map[string]float64, len(fast))
 	for _, e := range fast {
 		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
+		if exitTLSBanned(u) {
+			continue // mitm exit: banned, never re-verify it
+		}
 		cands = append(cands, u)
 		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
 		lats[u] = e.ResponseTimeMs
@@ -221,6 +226,67 @@ func refreshZenProxies() {
 	if n := c.Zen.VerifyConcurrency; n > 0 {
 		verifyConc = n
 	}
+	// cold sweeps verify wide: the pool is empty and every lane waits, so
+	// fan out past the hourly-refresh cap. warm refreshes keep the cap.
+	zenProxiesMu.RLock()
+	coldSweep := len(zenProxies) == 0
+	zenProxiesMu.RUnlock()
+	if coldSweep && verifyConc < 200 {
+		verifyConc = 200
+	}
+	// cold-start publish: when the live pool is empty, exits become usable as
+	// soon as they verify instead of after the whole sweep, so the first
+	// request waits on the fastest single exit, not on all cands. a pool that
+	// is already serving is left alone: the final applyVerifiedPool below owns
+	// that swap, so an hourly refresh never churns exits mid-sweep.
+	cold := coldSweep
+	lastPub, warmed := time.Time{}, false
+	publish := func() {
+		if !cold {
+			return
+		}
+		mu.Lock()
+		if time.Since(lastPub) < 500*time.Millisecond {
+			mu.Unlock()
+			return
+		}
+		lastPub = time.Now()
+		snap := append([]string(nil), verified...)
+		mu.Unlock()
+		if len(snap) == 0 {
+			return
+		}
+		kc, kl, kr := map[string]string{}, map[string]int{}, map[string]float64{}
+		for _, v := range snap {
+			if co, ok := countries[v]; ok {
+				kc[v] = co
+			}
+			if l, ok := lats[v]; ok {
+				kl[v] = l
+			}
+			if r, ok := relis[v]; ok {
+				kr[v] = r
+			}
+		}
+		// setters replace wholesale, safe here only: publish runs while the
+		// live pool is still empty, so there is no serving set to clobber.
+		setProxyCountries(kc)
+		setProxyLatency(kl)
+		setProxyReliability(kr)
+		zenProxiesMu.Lock()
+		zenProxies = snap
+		zenPoolRefreshed = time.Now()
+		zenPoolCands = len(cands)
+		zenProxiesMu.Unlock()
+		if !warmed {
+			warmed = true
+			// lanes + transports on the first usable exits, so the
+			// earliest request skips lane creation and tls setup.
+			ensureSharedLanes()
+			warmZenTransports(snap)
+			log.Printf("  zen proxies: %d verified (pool warming, %d candidates left)", len(snap), len(cands)-len(snap))
+		}
+	}
 	sem := make(chan struct{}, verifyConc)
 	for _, u := range cands {
 		wg.Add(1)
@@ -232,6 +298,7 @@ func refreshZenProxies() {
 				mu.Lock()
 				verified = append(verified, u)
 				mu.Unlock()
+				publish()
 			}
 		}(u)
 	}
@@ -255,6 +322,7 @@ func refreshZenProxies() {
 		setProxyCountries(kc)
 		setProxyLatency(kl)
 		setProxyReliability(kr)
+		saveZenPool(verified, kc, kl, kr)
 	}
 	applyVerifiedPool(verified)
 	zenProxiesMu.Lock()
@@ -269,10 +337,84 @@ func refreshZenProxies() {
 	log.Printf("  zen proxies: %d verified of %d candidates", len(verified), len(cands))
 }
 
+// savedPool is the last verified pool, loaded at boot so requests serve
+// instantly while the fresh sweep re-verifies in the background.
+type savedPool struct {
+	Proxies []string           `json:"proxies"`
+	Country map[string]string  `json:"country"`
+	Latency map[string]int     `json:"latency"`
+	Reli    map[string]float64 `json:"reli"`
+}
+
+// poolCachePath sits next to the config file so test instances keep their
+// own cache (same rule as configPath: CONFIG_FILE overrides).
+func poolCachePath() string {
+	d := filepath.Dir(configPath())
+	if d == "" {
+		d = "."
+	}
+	return filepath.Join(d, ".zenpool.json")
+}
+
+// saveZenPool persists the verified set best-effort; a stale cache still
+// beats an empty pool at boot.
+func saveZenPool(verified []string, kc map[string]string, kl map[string]int, kr map[string]float64) {
+	out, err := json.Marshal(savedPool{Proxies: verified, Country: kc, Latency: kl, Reli: kr})
+	if err != nil {
+		return
+	}
+	os.WriteFile(poolCachePath(), out, 0o600)
+}
+
+// loadZenPool restores the last verified pool with its metadata. returns
+// false when there is no usable cache.
+func loadZenPool() bool {
+	raw, err := os.ReadFile(poolCachePath())
+	if err != nil {
+		return false
+	}
+	var sp savedPool
+	if err := json.Unmarshal(raw, &sp); err != nil || len(sp.Proxies) == 0 {
+		return false
+	}
+	kc := map[string]string{}
+	for _, p := range sp.Proxies {
+		if c, ok := sp.Country[p]; ok {
+			kc[p] = c
+		}
+	}
+	kl := map[string]int{}
+	for _, p := range sp.Proxies {
+		if l, ok := sp.Latency[p]; ok {
+			kl[p] = l
+		} else {
+			kl[p] = 350
+		}
+	}
+	kr := map[string]float64{}
+	for _, p := range sp.Proxies {
+		if r, ok := sp.Reli[p]; ok {
+			kr[p] = r
+		} else {
+			kr[p] = 0.5
+		}
+	}
+	setProxyCountries(kc)
+	setProxyLatency(kl)
+	setProxyReliability(kr)
+	zenProxiesMu.Lock()
+	zenProxies = append([]string(nil), sp.Proxies...)
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	return true
+}
+
 // verifyProxy confirms a proxy can reach the zen API via a lightweight GET.
+// 5s is plenty: working exits answer in under a second, dead ones either
+// refuse instantly or hang to the timeout and hold a verify worker.
 func verifyProxy(proxyURL string) bool {
 	cl := zenClient(proxyURL)
-	cl.Timeout = 15 * time.Second
+	cl.Timeout = 5 * time.Second
 	req, err := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
 	if err != nil {
 		return false
@@ -539,19 +681,143 @@ func dropProxy(proxyURL string) {
 	zenProxiesMu.Unlock()
 	if found {
 		closeZenTransport(proxyURL)
+		// a dropped exit is proven dead: evacuate every lane pinned to
+		// it onto spares, so no lane keeps sending where the pool won't.
+		evacuateProxyPins(proxyURL)
 	}
 }
 
-// noteZenNetworkError counts consecutive network failures and returns
-// true once the threshold is crossed, signaling a stale/dead pool.
-func noteZenNetworkError() bool {
-	zenNetErrMu.Lock()
-	defer zenNetErrMu.Unlock()
-	zenNetErrs++
-	return zenNetErrs >= zenErrorThreshold()
+// evacuateProxyPins moves every lane pinned to a dropped exit onto a spare.
+// a lane with no spare keeps the dead pin: "" never sends, so the exit
+// still attempts until a replacement exists (same rule as laneReproxy).
+func evacuateProxyPins(dead string) {
+	for {
+		lanesMu.Lock()
+		var victim *zenLane
+		for _, l := range lanes {
+			if l.proxy == dead {
+				victim = l
+				break
+			}
+		}
+		lanesMu.Unlock()
+		if victim == nil {
+			return
+		}
+		// "" model: evacuation outranks per-model burns; the next real
+		// send re-rotates if the spare is burned for its model.
+		if laneReproxy(victim, "") == dead {
+			return // dry pool: keep the pin, stop trying
+		}
+	}
 }
 
-func resetZenNetworkErrors() {
+// isTLSFailure reports whether a transport error means the exit is
+// intercepting tls with a bad cert (mitm), rather than merely down. those
+// exits pass verify intermittently and fail every real send, so they earn
+// a ban instead of a plain drop.
+func isTLSFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "x509") ||
+		strings.Contains(s, "certificate") ||
+		strings.Contains(s, "tls:") ||
+		strings.Contains(s, "handshake")
+}
+
+// tls burns: a mitm exit is out for every model for an hour. a plain drop
+// is not enough: the next refresh re-admits it (it passes verify
+// intermittently) and other lanes' pins keep using it.
+var (
+	tlsBurnMu sync.Mutex
+	tlsBurned = map[string]time.Time{}
+)
+
+// tlsBurnTTL is the mitm ban length. an hour outlasts a refresh cycle and
+// still forgives a transient.
+func tlsBurnTTL() time.Duration { return time.Hour }
+
+// banTLSExit bans a mitm exit, drops it from the pool, and evacuates every
+// lane pinned to it onto spares.
+func banTLSExit(proxy string) {
+	if proxy == "" {
+		return
+	}
+	tlsBurnMu.Lock()
+	tlsBurned[proxy] = time.Now().Add(tlsBurnTTL())
+	tlsBurnMu.Unlock()
+	acclog.Printf("  zen exit %s tls-banned 1h (mitm cert)", redactProxyUserinfo(proxy))
+	dropProxy(proxy)
+	evacuateProxyPins(proxy)
+}
+
+// exitTLSBanned reports whether an exit is under a mitm ban.
+func exitTLSBanned(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	tlsBurnMu.Lock()
+	defer tlsBurnMu.Unlock()
+	until, ok := tlsBurned[proxy]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(tlsBurned, proxy)
+		return false
+	}
+	return true
+}
+
+// skipTLSBanned filters banned exits out of refresh candidates: a mitm
+// exit passes verify intermittently, so the candidate filter is the gate.
+func skipTLSBanned(cands []string) []string {
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		if !exitTLSBanned(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// maybeRefreshNetErr counts a network failure and fires a pool refresh once
+// the threshold is crossed, at most once per cooldown window (same gate as
+// the 429 path: without it every lane burst fires a full verify sweep).
+// returns true when it fired.
+func maybeRefreshNetErr() bool {
+	zenNetErrMu.Lock()
+	zenNetErrs++
+	hit := zenNetErrs >= zenErrorThreshold()
+	if hit {
+		zenNetErrs = 0
+	}
+	zenNetErrMu.Unlock()
+	if !hit {
+		return false
+	}
+	if !poolRefreshDue() {
+		zenProxiesMu.RLock()
+		ago := time.Since(zenPoolRefreshed)
+		zenProxiesMu.RUnlock()
+		dbglog.Printf("  zen: %d net errors, refresh skipped (last %v ago, cooldown %v)", zenErrorThreshold(), ago.Round(time.Second), poolRefreshCooldown())
+		return false
+	}
+	acclog.Printf("  %d+ consecutive network errors, refreshing proxy pool", zenErrorThreshold())
+	// stamp at fire time (same as the 429 path): the completion stamp lands
+	// after verify, so a trip during an in-flight refresh would double-fire.
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	refreshZenProxiesAsync()
+	return true
+}
+
+// resetZenNetErrs clears the net-error run: any http response (even a 429)
+// proves the pool dials, only transport failures count.
+func resetZenNetErrs() {
 	zenNetErrMu.Lock()
 	defer zenNetErrMu.Unlock()
 	zenNetErrs = 0
@@ -840,6 +1106,17 @@ func errSnippet(b []byte, n int) string {
 
 func watchZenProxies() {
 	if zenEnabled() {
+		// cached pool serves from boot while the fresh sweep verifies in the
+		// background: sub-second first requests instead of a ~30s cold pool.
+		// pre-open lanes + transports so the first send has zero setup.
+		if loadZenPool() {
+			zenProxiesMu.RLock()
+			cached := append([]string(nil), zenProxies...)
+			zenProxiesMu.RUnlock()
+			ensureSharedLanes()
+			warmZenTransports(cached)
+			log.Printf("  zen proxies: %d from cache (%s)", len(cached), poolCachePath())
+		}
 		refreshZenProxies()
 	}
 	for {
@@ -961,17 +1238,19 @@ func zenClient(proxyURL string) *http.Client {
 		direct = time.Duration(s) * time.Second
 	}
 	if proxyURL == "" {
-		return &http.Client{Timeout: direct}
+		return dbgClient(&http.Client{Timeout: direct}, "opencode")
 	}
 	pu, err := url.Parse(proxyURL)
 	if err != nil {
-		return &http.Client{Timeout: direct}
+		return dbgClient(&http.Client{Timeout: direct}, "opencode")
 	}
 	proxied := 120 * time.Second
 	if s := cfg().Zen.ZenTimeoutSecs; s > 0 {
 		proxied = time.Duration(s) * time.Second
 	}
-	return &http.Client{Timeout: proxied, Transport: zenTransport(proxyURL, pu)}
+	// dbgRT wraps whatever transport the pool gave us: the proxy/socks
+	// handshake stays exactly as it was, only the recording sits on top.
+	return dbgClient(&http.Client{Timeout: proxied, Transport: dbgRT{base: zenTransport(proxyURL, pu), backend: "opencode"}}, "opencode")
 }
 
 // socks4Dial connects to proxyAddr and requests a SOCKS4/SOCKS4a CONNECT to addr.
