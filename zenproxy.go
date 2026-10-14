@@ -732,6 +732,26 @@ func isTLSFailure(err error) bool {
 		strings.Contains(s, "handshake")
 }
 
+// zenDialDead reports whether a transport error happened while dialing
+// (to the exit itself, or upstream when direct): connection
+// refused/unreachable/no route/dial timeout. a re-dial of the very same
+// exit inside one request cannot succeed, so the retry ladders stop
+// instead of walking every remaining hop over a corpse when rotation has
+// nothing new to hand out. response-stage faults (read/write frame,
+// http2 header wait) can recover on a re-send and are deliberately not
+// dial-dead.
+func zenDialDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "read tcp") || strings.Contains(s, "write tcp") ||
+		strings.Contains(s, "http2:") {
+		return false
+	}
+	return strings.Contains(s, "dial tcp") || strings.Contains(s, "proxyconnect")
+}
+
 // tls burns: a mitm exit is out for every model for an hour. a plain drop
 // is not enough: the next refresh re-admits it (it passes verify
 // intermittently) and other lanes' pins keep using it.

@@ -2035,6 +2035,8 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 	}
 	var cl *http.Client
 	lastProxy := ""
+	var dialDeadErr error
+	dialDeadProxy := ""
 	rotating := true
 	// hoisted: the body never changes across retries.
 	nbModel := reqModel(nb)
@@ -2054,6 +2056,13 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
+				return nil
+			}
+			// rotation handed back the exit whose dial just failed: a
+			// second dial of the same corpse cannot succeed, so end the
+			// ladder here instead of spending every remaining hop on it.
+			if dialDeadErr != nil && proxy == dialDeadProxy {
+				acclog.Printf("  opencode dial-dead %s re-picked by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
 				return nil
 			}
 			cl = zenClient(proxy)
@@ -2079,6 +2088,11 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 				banTLSExit(proxy)
 			} else {
 				dropProxy(proxy)
+			}
+			if zenDialDead(err) {
+				dialDeadErr, dialDeadProxy = err, proxy
+			} else {
+				dialDeadErr = nil
 			}
 			rotating = true
 			acclog.Printf("!! opencode zen error (retry %d/%d) nudge country=%s proxy=%s %s: %v", zenRetries, zenRetryLabel(), proxyCountry(proxy), redactProxyUserinfo(proxy), target, err)
@@ -3676,6 +3690,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var prompT, compT, totalT int
 	var recErr string
 	var usedProxy string
+	var dialDeadErr error
+	dialDeadProxy := ""
 	rotating := true
 	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
 		// pace only: lanes never cool, a limit rotates the exit instead.
@@ -3720,6 +3736,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				continue
+			}
+			// rotation handed back the exit whose dial just failed: a
+			// second dial of the same corpse cannot succeed, so end the
+			// ladder here with the same honest 502 the exhausted ladder
+			// hands back.
+			if dialDeadErr != nil && proxy == dialDeadProxy {
+				acclog.Printf("  opencode dial-dead %s re-picked by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
+				http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, dialDeadErr), http.StatusBadGateway)
+				return
 			}
 			cl = zenClient(proxy)
 			usedProxy = proxy
@@ -3831,6 +3856,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, realModel)
 				}
+			}
+			if zenDialDead(err) {
+				dialDeadErr, dialDeadProxy = err, proxy
+			} else {
+				dialDeadErr = nil
 			}
 			rotating = true
 			logZenNetErr(zenRetries, model, proxy, target, err)

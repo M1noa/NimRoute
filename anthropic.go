@@ -2607,6 +2607,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	zenPost := func(body []byte, stream bool, tag string) *http.Response {
 		var cl *http.Client
 		lastProxy := ""
+		var dialDeadErr error
+		dialDeadProxy := ""
 		rotating := true
 		for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
 			// pace only: lanes never cool, a limit rotates the exit instead.
@@ -2656,6 +2658,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						return nil
 					}
 					continue
+				}
+				// rotation handed back the exit whose dial just failed: a
+				// second dial of the same corpse cannot succeed, so end the
+				// ladder here instead of spending every remaining hop on it.
+				if dialDeadErr != nil && proxy == dialDeadProxy {
+					acclog.Printf("  opencode dial-dead %s re-picked by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
+					return nil
 				}
 				cl = zenClient(proxy)
 				lastProxy = proxy
@@ -2743,6 +2752,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						lane = laneHandoff(lane, laneFailover(lane))
 						sessionID = laneRotate(lane, zenModel)
 					}
+				}
+				if zenDialDead(err) {
+					dialDeadErr, dialDeadProxy = err, proxy
+				} else {
+					dialDeadErr = nil
 				}
 				rotating = true
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)

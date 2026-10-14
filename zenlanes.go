@@ -428,8 +428,17 @@ func hedgedDo(ctx context.Context, primary, hedge func(context.Context) (*http.R
 			failedHedge = wonHedge
 			continue
 		}
-		// both failed: preserve an http error rather than a transport error.
+		// both failed: preserve an http error rather than a transport
+		// error. when both sides died on transport, prefer the dial-stage
+		// one: the retry ladders stop on a dial-dead re-pick, and a hedge
+		// artifact ("no distinct zen hedge exit") must not mask a
+		// refused/unreachable dial or they re-dial the corpse for every
+		// remaining hop.
 		if failed.resp != nil {
+			closeResult(result)
+			return failed.resp, failed.err, failedHedge
+		}
+		if !zenDialDead(result.err) && zenDialDead(failed.err) {
 			closeResult(result)
 			return failed.resp, failed.err, failedHedge
 		}

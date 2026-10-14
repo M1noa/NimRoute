@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1266,5 +1268,87 @@ func TestRefreshFireStamps(t *testing.T) {
 	}
 	if noteRateLimit() {
 		t.Fatal("second trip during in-flight refresh must skip")
+	}
+}
+
+// owner boundary: the retry ladders own the rule "a re-dial of the exit
+// that just refused us cannot succeed". dial-stage faults are dial-dead;
+// response-stage faults (frames, http2 waits) can recover on a re-send.
+func TestZenDialDeadClassifies(t *testing.T) {
+	yes := []string{
+		`Post "https://opencode.ai/x": dial tcp 10.0.0.1:1: connect: connection refused`,
+		`Post "https://opencode.ai/x": dial tcp: lookup api.freepi.ai: no such host`,
+		`Post "https://opencode.ai/x": dial tcp 10.0.0.1:1080: i/o timeout`,
+		`proxyconnect tcp: dial tcp 10.0.0.2:443: connect: network is unreachable`,
+	}
+	for _, msg := range yes {
+		if !zenDialDead(errors.New(msg)) {
+			t.Errorf("zenDialDead(%q) = false, want true", msg)
+		}
+	}
+	no := []string{
+		`read tcp 1.2.3.4:5->10.0.0.1:1080: read: can't assign requested address`,
+		`write tcp 1.2.3.4:5->10.0.0.1:1080: write: broken pipe`,
+		`http2: timeout awaiting response headers`,
+		`unexpected EOF`,
+		`Post "https://opencode.ai/x": context deadline exceeded`,
+	}
+	for _, msg := range no {
+		if zenDialDead(errors.New(msg)) {
+			t.Errorf("zenDialDead(%q) = true, want false", msg)
+		}
+	}
+	if zenDialDead(nil) {
+		t.Error("zenDialDead(nil) = true, want false")
+	}
+}
+
+// a dry pool keeps the dead exit alive as last resort, but a request must
+// not walk the whole ladder over it: first dial-dead fire ends the request
+// with the honest 502 instead of re-dialing the corpse maxRetries times.
+func TestDialDeadLadderStopsImmediately(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	const dead = "http://10.0.0.1:9"
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.MaxRetries = 4
+	c.Zen.RetryBackoffMs = 0
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+	// planted counting transport for the dead exit: every dial fails at
+	// dial stage. dropProxy keeps the last exit (pool would drain), so
+	// the transport survives the loop and the counter is exact.
+	var dials atomic.Int32
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused (counting)")}
+	}
+	zenTransportMu.Lock()
+	zenTransports[dead] = tr
+	zenTransportMu.Unlock()
+	defer closeZenTransport(dead)
+	zenProxiesMu.Lock()
+	zenProxies = []string{dead}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	p := newPool(nil)
+	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-dead")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "connection refused") {
+		t.Fatalf("body must carry the dial error, got %s", rec.Body.String())
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dead exit dialed %d times, want 1 (ladder must stop after the first dial-dead)", n)
 	}
 }
