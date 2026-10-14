@@ -242,6 +242,14 @@ func refreshOpenRouter() {
 	}
 	models, err := fetchOpenRouter(cfg().OpenRouter.URL)
 	if err != nil {
+		// stale cache beats no index: at boot "keep the previous" has
+		// nothing to keep, and a slow openrouter must not empty the
+		// models listing.
+		if ix := readORCache(path, 0); ix != nil {
+			setORIndex(ix, err)
+			log.Printf("WARN: openrouter fetch failed, using stale cache: %v", err)
+			return
+		}
 		setORIndex(nil, err)
 		log.Printf("WARN: openrouter fetch failed, keeping previous: %v", err)
 		return

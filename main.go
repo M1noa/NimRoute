@@ -46,7 +46,7 @@ const (
 var versionStr = "2.6.0"
 
 // OpencodeBase is a var so tests can point the zen path at a fake upstream.
-var OpencodeBase = "https://opencode.ai/zen/v1"
+var OpencodeBase = "https://opencode.ai/inference/v1"
 
 type Key struct {
 	Name           string
@@ -1006,6 +1006,20 @@ func normalizeResponsesContent(role string, content any) any {
 // convertToResponses rewrites a chat.completions body into the /responses shape.
 func convertToResponses(m map[string]any) {
 	if msgs, ok := m["messages"].([]any); ok {
+		// match the real client: the leading system prompt rides as the
+		// top-level instructions string, not as an input item.
+		var sysText string
+		if len(msgs) > 0 {
+			if sm, ok := msgs[0].(map[string]any); ok && sm["role"] == "system" {
+				if c, ok2 := sm["content"].(string); ok2 && c != "" {
+					sysText = c
+					msgs = msgs[1:]
+				}
+			}
+		}
+		if _, exists := m["instructions"]; !exists && sysText != "" {
+			m["instructions"] = sysText
+		}
 		input := make([]any, 0, len(msgs))
 		var pending []any
 		openCalls := 0
@@ -3614,6 +3628,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	sessionID := laneSession(lane)
 	noteLaneUse(true) // capacity tracking for the low-load lane race
 	defer noteLaneUse(false)
+	// track the final lane, including failover handoffs.
+	laneClaim(lane)
+	defer func() { laneDone(lane) }()
 	var m map[string]any
 	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
@@ -3667,7 +3684,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if zenRetries > 0 && maybeRefreshStalePool(lane) {
 			sessionID = laneSession(lane)
 		}
-		laneGate(r.Context(), lane)
+		// retries land on a fresh lane, so re-pacing only stacks the
+		// first send's gap onto the retry. first attempt still paces.
+		if zenRetries == 0 {
+			laneGate(r.Context(), lane)
+		}
 		// client gone while pacing: stop before burning an exit.
 		if r.Context().Err() != nil {
 			acclog.Printf("!! opencode client disconnected model=%s (paced)", model)
@@ -3680,7 +3701,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// pool dry: fail over once instead of burning a retry
 				// on direct, which always_proxy already ruled out.
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneSession(lane)
 				proxy = laneProxyFor(lane, realModel)
 				if proxy == "" {
@@ -3693,7 +3714,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			proxy = laneProxyFor(lane, realModel)
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// pool dry and proxied mode: try another lane's exit.
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneSession(lane)
 				proxy = laneProxyFor(lane, realModel)
 			}
@@ -3705,6 +3726,12 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		} else {
 			// service overloaded: retry on the same lane proxy + session.
 			proxy = usedProxy
+			// killswitch, same as the anthropic path: never direct.
+			if proxy == "" && cfg().Zen.AlwaysProxy {
+				acclog.Printf("!! opencode no proxy under always_proxy model=%s, failing instead of direct", model)
+				http.Error(w, `{"error":"no proxy available (always_proxy killswitch)"}`, http.StatusBadGateway)
+				return
+			}
 			cl = zenClient(proxy)
 		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
@@ -3738,8 +3765,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			hl := laneFailover(lane)
 			hp := laneProxyFor(hl, realModel)
 			if hp == "" || hp == proxy {
-				<-hctx.Done() // no distinct exit: wait to be cancelled
-				return nil, hctx.Err()
+				return nil, fmt.Errorf("no distinct zen hedge exit")
 			}
 			hcl := zenClient(hp)
 			hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
@@ -3802,7 +3828,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				// same stale-pin trap as the anthropic path: a dropped
 				// exit still pinned here must not eat every retry.
 				if laneReproxy(lane, realModel) == proxy {
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, realModel)
 				}
 			}
@@ -3834,7 +3860,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				// synthesized body, never the closed empty one.
 				resp = exhausted429(model, st)
 			} else {
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				zenBackoffCtx(r.Context(), zenRetries)
@@ -3846,9 +3872,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
 			if zenServiceOverloaded(eb) {
-				acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s retrying same proxy+session err=%q",
+				acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s rotating exit+session err=%q",
 					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
-				rotating = false
+				lane = laneHandoff(lane, laneFailover(lane))
+				sessionID = laneRotate(lane, realModel)
+				rotating = true
 				if !zenLastRetry(zenRetries) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
@@ -3857,7 +3885,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenGeoBlocked(eb) {
 				logZenBlocked("geo", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenGeoErr() {
@@ -3873,7 +3901,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenUserBlocked(eb) {
 				logZenBlocked("user", zenRetries, resp.StatusCode, model, proxy, "", eb)
 				dropProxy(proxy)
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenBlockErr() {
@@ -3894,7 +3922,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				if proxy == "" {
 					laneEscalate(lane, realModel) // direct is flagged: give the lane an exit
 				}
-				lane = laneFailover(lane)
+				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
 				if noteZenFreeTierErr() {
@@ -4139,7 +4167,8 @@ func zenHeaderForwarded(k string) bool {
 	case "authorization", "host", "content-type", "accept", "accept-encoding",
 		"connection", "content-length", "user-agent", "cookie", "x-api-key",
 		"x-session-id", "x-forwarded-host",
-		"x-opencode-client", "x-opencode-session", "x-opencode-request", "x-opencode-project":
+		"x-opencode-client", "x-opencode-session", "x-opencode-session-id",
+		"x-opencode-request", "x-opencode-project", "x-session-affinity":
 		return false
 	}
 	return true
@@ -4168,28 +4197,26 @@ func stripCacheFields(v any) any {
 	return v
 }
 
-// zenGateNames are the four tool stubs the zen free tier demands. the console
-// answers 403 FreeTierError ("free tier can only be used from within OpenCode")
-// unless the body carries tools named bash, read, glob and grep.
-var zenGateNames = []string{"bash", "read", "glob", "grep"}
-
-func zenGateTool(name string) any {
-	// parameters is required: space-bunny 400s on tools without it.
-	return map[string]any{"type": "function", "function": map[string]any{
-		"name":       name,
-		"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
-	}}
-}
-
-// ensureZenTools appends any missing gate tools. the gate matches exact
-// lowercase names, so a client Bash does not satisfy a gate bash: the
-// lowercase stub is added beside the client's own spelling and response
-// translators map the call back via tnames.resolve.
+// ensureZenTools appends the ballast toolset the zen free tier demands. the
+// gate at opencode.ai/inference fingerprints the tools array (a minimum of six
+// exact opencode CLI definitions must be present verbatim); fabricated stubs
+// 403 FreeTierError. client tools ride along unrestricted, so the client's own
+// spelling stays authoritative and response translators map upstream tool
+// call names back via tnames.resolve.
 // bodies with no tools at all (plain chat clients, title gen, summaries)
-// still need the gate or zen 403s FreeTierError, but a callable stub makes
-// a summarizer emit calls opencode rejects ("tool call not allowed while
-// generating summary"). so they get the stubs with tool_choice "none":
+// still get the ballast or zen 403s FreeTierError, but a callable toolset
+// makes a summarizer emit calls opencode rejects ("tool call not allowed while
+// generating summary"). so they get the defs with tool_choice "none":
 // the gate passes and the model cannot call them.
+
+// zenBallastDefs returns the embedded opencode toolset as a fresh slice; the
+// caller may mutate elements (schema sanitize), so storage is copied.
+func zenBallastDefs() []any {
+	src := zenOpenCodeDefs()
+	out := make([]any, len(src))
+	copy(out, src)
+	return out
+}
 func ensureZenTools(m map[string]any) {
 	t, _ := m["tools"].([]any)
 	// a client that posts a single anthropic-shaped tool object rather than an
@@ -4199,9 +4226,7 @@ func ensureZenTools(m map[string]any) {
 		m["tools"] = t
 	}
 	if len(t) == 0 {
-		for _, n := range zenGateNames {
-			t = append(t, zenGateTool(n))
-		}
+		t = append(t, zenBallastDefs()...)
 		m["tools"] = t
 		m["tool_choice"] = "none"
 		return
@@ -4243,10 +4268,18 @@ func ensureZenTools(m map[string]any) {
 			have[name] = true
 		}
 	}
-	for _, n := range zenGateNames {
-		if !have[n] {
-			t = append(t, zenGateTool(n))
+	for _, d := range zenBallastDefs() {
+		dm, _ := d.(map[string]any)
+		fn, _ := dm["function"].(map[string]any)
+		if fn == nil {
+			continue
 		}
+		n, _ := fn["name"].(string)
+		if n == "" || have[n] {
+			continue
+		}
+		t = append(t, d)
+		have[n] = true
 	}
 	// sanitize every schema, not just ours: zen 400s the whole request with
 	// "Recursive JSON schemas are not currently supported" when a client tool
@@ -4290,10 +4323,6 @@ type zenOmitType struct{}
 var zenOmit zenOmitType
 
 func isZenOmit(v any) bool { _, ok := v.(zenOmitType); return ok }
-
-func sanitizeZenSchemaDepth(v any, depth int) any {
-	return sanitizeZenSchemaSegs(v, depth+1)
-}
 
 // sanitizeZenSchemaSegs bounds map-nesting from the parameters root at 1:
 // every object map nests one level deeper, arrays cost nothing (their

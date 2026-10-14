@@ -150,16 +150,6 @@ func (t *traceRec) note(s string) {
 	t.Notes = append(t.Notes, s)
 }
 
-// recordInbound stores the client's raw body, pre-mask: the point of the dump
-// is what the proxy actually received.
-func (t *traceRec) recordInbound(body []byte) {
-	if t == nil {
-		return
-	}
-	t.InBody = string(bytesOf(body, traceInboundCap))
-	t.InTrunc = len(body) > traceInboundCap
-}
-
 func (t *traceRec) setReqID(id string) {
 	if t == nil {
 		return
@@ -213,7 +203,11 @@ type traceBody struct {
 func (b *traceBody) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
 	if n > 0 {
-		b.tr.recordInbound(p[:n])
+		remaining := traceInboundCap - len(b.tr.InBody)
+		b.tr.InBody += string(bytesOf(p[:n], remaining))
+		if n > remaining {
+			b.tr.InTrunc = true
+		}
 	}
 	return n, err
 }
@@ -248,7 +242,7 @@ func (d *dbgWriter) Write(b []byte) (int, error) {
 	// cap the capture: a 300s stream would otherwise pin the whole turn in
 	// ram for a dump that never happens.
 	if n > 0 && d.buf.Len() < traceOutCap {
-		d.buf.Write(b[:n])
+		d.buf.Write(bytesOf(b[:n], traceOutCap-d.buf.Len()))
 	}
 	return n, err
 }
@@ -379,18 +373,18 @@ func (t dbgRT) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	start := time.Now()
 	if req.Body != nil {
-		// body is a reader we must hand back: snapshot it, then re-serve
-		// the snapshot so the real call still works.
-		snap, err := io.ReadAll(io.LimitReader(req.Body, traceUpReqCap))
-		req.Body.Close()
-		hop.ReqTruncated = len(snap) >= traceUpReqCap
-		hop.ReqBody = string(snap)
-		req.Body = io.NopCloser(bytes.NewReader(snap))
-		req.ContentLength = int64(len(snap))
-		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(snap)), nil
-		}
+		// capture a bounded prefix, then send it plus the unread remainder.
+		// content length and replay must still describe the original body.
+		body := req.Body
+		snap, err := io.ReadAll(io.LimitReader(body, traceUpReqCap+1))
+		hop.ReqTruncated = len(snap) > traceUpReqCap
+		hop.ReqBody = string(bytesOf(snap, traceUpReqCap))
+		req.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(snap), body), body}
 		if err != nil {
+			body.Close()
 			hop.Error = "read req body: " + err.Error()
 			hop.ElapsedMs = time.Since(start).Milliseconds()
 			tr.addHop(hop)
@@ -410,7 +404,7 @@ func (t dbgRT) RoundTrip(req *http.Request) (*http.Response, error) {
 		// the caller drains the body after RoundTrip returns, so the hop
 		// can only be finalized here: snapBody records it on EOF or Close,
 		// whichever the handler reaches.
-		resp.Body = &snapBody{tr: tr, hop: hop, r: io.LimitReader(resp.Body, traceUpRespCap), c: resp.Body}
+		resp.Body = &snapBody{tr: tr, hop: hop, r: resp.Body, c: resp.Body}
 	}
 	return resp, nil
 }
@@ -422,16 +416,21 @@ type snapBody struct {
 	r   io.Reader
 	c   io.Closer
 
-	mu   sync.Mutex
-	buf  bytes.Buffer
-	done bool
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	done      bool
+	truncated bool
 }
 
 func (s *snapBody) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
 	if n > 0 {
 		s.mu.Lock()
-		s.buf.Write(p[:n])
+		remaining := traceUpRespCap - s.buf.Len()
+		s.buf.Write(bytesOf(p[:n], remaining))
+		if n > remaining {
+			s.truncated = true
+		}
 		s.mu.Unlock()
 	}
 	if err != nil {
@@ -456,7 +455,7 @@ func (s *snapBody) finish() {
 	body := s.buf.String()
 	s.mu.Unlock()
 	s.hop.RespBody = body
-	s.hop.RespTrunc = len(body) >= traceUpRespCap
+	s.hop.RespTrunc = s.truncated
 	s.tr.addHop(s.hop)
 }
 

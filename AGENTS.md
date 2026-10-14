@@ -4,18 +4,46 @@ Module `nimroute`. NimRoute is an OpenAI/Anthropic-compatible LLM
 proxy/router in Go. Primary purpose: pool free-model access with
 key/proxy/lane rotation to survive per-exit rate limits.
 
+## 0. purpose
+
+The point of this project is one thing: proxy requests fast,
+transparently, and seamlessly — get around rate limits, keep every free
+model working, hand errors straight through to the caller, make the user
+feel like it just works so they can go about their day. That is the goal;
+nothing else is structural.
+
+Everything else in the tree is incidental: leftover scaffolding, awkward
+flows, historical workarounds. None of it is mandatory, deliberate, or
+"the shape of the project" — it is just how things landed. When touching
+anything, fix the handling rather than perpetuating its pattern, improve
+bad code as you meet it, and never assume pre-existing behavior was
+chosen on purpose. The quality bar is measured on the request path
+(speed, honesty of errors, model availability), not on preservation of
+incidental machinery.
+
 ## 1. backends and routing
 
 - **opencode zen**: free `opencode/<model>` ids, keyless. upstream
-  `https://opencode.ai/zen/v1`. every request mimics the real opencode
-  client (`setZenHeaders` in anthropic.go): `Authorization: Bearer public`,
-  `x-opencode-client: cli`, `x-opencode-session: ses_*`,
-  `x-opencode-request: msg_*`, `x-opencode-project: global`,
-  `User-Agent: opencode/<version>` (live tag from sst/opencode releases,
-  refreshed every 6h, default in zenproxy.go). (`anthropic-version` is NOT
+  `https://opencode.ai/inference/v1` (the old `/zen/v1` path now answers
+  403 FreeTierError for everyone, real client included). every request
+  mimics the real opencode client (`setZenHeaders` in anthropic.go):
+  `Authorization: Bearer public`, `x-opencode-client: cli`,
+  `x-opencode-session: ses_*` + `x-opencode-session-id` (same descending
+  id) + `x-session-affinity`, `x-opencode-project: global`,
+  `User-Agent: opencode/<version> ai-sdk/provider-utils/4.0.23
+  runtime/bun/1.3.14` (live tag from sst/opencode releases, refreshed every
+  6h, default in zenproxy.go). `x-opencode-request` is NOT
+  sent: the current client dropped it. (`anthropic-version` is NOT
   sent; an earlier doc revision claimed it.) muse-spark models use
   `/responses`, everything else `/chat/completions`; shape follows the
   model, converted both ways (`convertToResponses` / `chatFromResponses`).
+  the free-tier gate fingerprints the body's tools array (verified live:
+  the system prompt is unconstrained once `ensureZenTools`' embedded
+  opencode toolset — `zenOCDefsJSON` in zentools.go, 12 real CLI tools —
+  is present; fewer than six of the exact definitions 403s FreeTierError,
+  and client tool name spoofing/extra client tools pass). upstream tool
+  call names pointing at the ballast (`shell`, `subagent`, ...) map back
+  via `zenToolAliases` in `toolNames.resolve`.
 - **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
   one live stream per account jwt (server 409s a second); accounts rotate
   on failure, queue up to `freepi.queue_wait_secs` (default 60s). jwt only

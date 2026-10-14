@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // aaFixture builds a bundle in the exact on-disk layout which-llm publishes:
@@ -560,5 +561,57 @@ func TestInfoModelLayers(t *testing.T) {
 	}
 	if m.Nim["source"] != "free-pi-cli" {
 		t.Errorf("nim.source = %v, want the catalog provenance", m.Nim["source"])
+	}
+}
+
+// TestRefreshFallsBackToStaleCache pins the boot-time contract: when the
+// network is dead and the cache is past its freshness window, the index
+// still loads from disk (with the error recorded) instead of staying empty.
+// owner boundary: refreshOpenRouter/refreshBenchmarks own "stale beats nil".
+func TestRefreshFallsBackToStaleCache(t *testing.T) {
+	dir := t.TempDir()
+	stale := time.Now().Add(-48 * time.Hour)
+
+	orFile := filepath.Join(dir, "or.json")
+	writeORCache(orFile, []*orModel{{ID: "z-ai/glm-5.3-flash", ContextLength: 200000}})
+	if err := os.Chtimes(orFile, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENROUTER_FILE", orFile)
+
+	aaFile := filepath.Join(dir, "aa.json")
+	writeAACache(aaFile, []aaRow{{Slug: "glm-5-3-flash", IntelligenceIndex: ptr(41.8)}}, "2026-10-11T00:00:00Z")
+	if err := os.Chtimes(aaFile, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AA_BENCH_FILE", aaFile)
+
+	// dead upstream: port 9 refuses instantly.
+	c := defaultConfig()
+	c.OpenRouter.URL = "http://127.0.0.1:9/or.json"
+	c.Benchmarks.URL = "http://127.0.0.1:9/aa.json"
+	applyConfig(&c)
+	defer func() {
+		setORIndex(nil, nil)
+		setBenchIndex(nil, nil)
+		reset := defaultConfig()
+		applyConfig(&reset)
+	}()
+
+	refreshOpenRouter()
+	refreshBenchmarks()
+
+	if ix := openRouterIndex(); ix == nil || ix.count != 1 {
+		t.Fatalf("openrouter index = %+v, want the stale cache", ix)
+	}
+	if openRouterError() == "" {
+		t.Error("openrouter error must be recorded alongside the stale index")
+	}
+	_, _, n, ok := benchSnapshot()
+	if !ok || n != 1 {
+		t.Fatalf("benchmarks index from stale cache: ok=%v n=%d, want ok with 1", ok, n)
+	}
+	if benchLastError() == "" {
+		t.Error("benchmarks error must be recorded alongside the stale index")
 	}
 }

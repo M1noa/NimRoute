@@ -20,23 +20,32 @@ import time
 import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-ZEN = "https://opencode.ai/zen/v1"
+ZEN = "https://opencode.ai/inference/v1"
 VERSION = "1.18.31"
 UA = f"opencode/{VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-GATE_TOOLS = [{"type": "function", "function": {"name": n}} for n in ("bash", "read", "glob", "grep")]
+# the gate fingerprints the real opencode CLI tool definitions verbatim
+# (see zentools.go / scripts/opencode_ballast.json); name-only stubs 403.
+with open(Path(__file__).parent / "opencode_ballast.json") as _f:
+    GATE_TOOLS = json.load(_f)
 LIST_URL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0"
 
 _seq = itertools.count(1)
 
 
-def new_id(prefix):
+def new_id(prefix, descending=False):
     # monotonic counter: thread-safe and collision-free across workers
-    # (the old ms-keyed dict raced in ThreadPoolExecutor).
+    # (the old ms-keyed dict raced in ThreadPoolExecutor). session ids use
+    # identifier.ts's descending form (~value), which is the shape the
+    # free-tier gate accepts.
     ms = int(time.time() * 1000)
     n = next(_seq)
-    hexpart = (((ms << 12) + n) & 0xFFFFFFFFFFFF).to_bytes(6, "big").hex()
+    value = (ms << 12) + n
+    if descending:
+        value = ~value
+    hexpart = (value & 0xFFFFFFFFFFFF).to_bytes(6, "big").hex()
     return f"{prefix}_{hexpart}{''.join(B62[b % 62] for b in secrets.token_bytes(14))}"
 
 
@@ -93,6 +102,7 @@ def build_body(model):
 def probe_one(proxy, country, model):
     url = ZEN + endpoint(model)
     body = build_body(model)
+    sess = new_id("ses", descending=True)
     cmd = [
         "curl", "-sS", "--max-time", "25", "-o", "-", "-w", "\n%{http_code}",
         "-X", "POST", url, "--proxy", proxy,
@@ -102,8 +112,9 @@ def probe_one(proxy, country, model):
         "-H", f"User-Agent: {UA}",
         "-H", "x-opencode-client: cli",
         "-H", "x-opencode-project: global",
-        "-H", f"x-opencode-session: {new_id('ses')}",
-        "-H", f"x-opencode-request: {new_id('msg')}",
+        "-H", f"x-opencode-session: {sess}",
+        "-H", f"x-opencode-session-id: {sess}",
+        "-H", f"x-session-affinity: {sess}",
         "--data-binary", "@-",
     ]
     try:

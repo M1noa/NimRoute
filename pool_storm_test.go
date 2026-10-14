@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -206,6 +208,56 @@ func TestFatPoolSpreadsExits(t *testing.T) {
 	}
 	if pa == pb {
 		t.Fatalf("fat pool double-pinned %q, want distinct exits", pa)
+	}
+}
+
+// concurrent rotations must not converge on one exit: two lanes reproxying
+// at the same time both come from a stale taken snapshot, so the pin must
+// re-validate under the write lock and re-pick. owner: lane pinning
+// (pinUniqueProxy). regression for the /status report of several lanes
+// showing the same proxy after a burst.
+func TestConcurrentReproxyStaysUnique(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	resetTLSBurns()
+	defer resetTLSBurns()
+	setPool("http://10.0.0.1:1", "http://10.0.0.2:2", "http://10.0.0.3:3", "http://10.0.0.4:4")
+	defer setPool()
+
+	body := []byte(`{"messages":[{"role":"user","content":"a"}]}`)
+	const n = 4
+	lanes := make([]*zenLane, n)
+	for i := range lanes {
+		lanes[i] = laneFor(fmt.Sprintf("unique-%d", i), body)
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := map[string]int{}
+	for i, l := range lanes {
+		wg.Add(1)
+		go func(i int, l *zenLane) {
+			defer wg.Done()
+			// stagger slightly so some rotations truly interleave
+			time.Sleep(time.Duration(i%2) * time.Millisecond)
+			p := laneReproxy(l, "m")
+			mu.Lock()
+			seen[p]++
+			mu.Unlock()
+		}(i, l)
+	}
+	wg.Wait()
+	for p, c := range seen {
+		if c > 1 {
+			t.Fatalf("exit %q pinned by %d lanes, want unique pins: %v", p, c, seen)
+		}
+		if p == "" {
+			t.Fatalf("a lane pinned nothing while spares existed: %v", seen)
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("want %d distinct exits, got %v", n, seen)
 	}
 }
 

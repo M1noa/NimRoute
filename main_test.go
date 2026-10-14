@@ -1383,10 +1383,11 @@ func TestEnsureZenToolsHaveParameters(t *testing.T) {
 	}}
 	ensureZenTools(m)
 	tools, _ := m["tools"].([]any)
-	// the gate matches exact lowercase names, so capitalized client tools do
-	// not satisfy it: 3 client tools + 4 lowercase gate stubs = 7.
-	if len(tools) != 7 {
-		t.Fatalf("want 3 client tools + 4 gate stubs, got %d", len(tools))
+	// the gate fingerprints the embedded opencode definitions verbatim, so
+	// capitalized client tools do not satisfy it: 3 client tools + the
+	// ballast toolset appended beside them.
+	if len(tools) != 3+len(zenOpenCodeDefs()) {
+		t.Fatalf("want 3 client tools + %d ballast defs, got %d", len(zenOpenCodeDefs()), len(tools))
 	}
 	for _, x := range tools {
 		fn, _ := x.(map[string]any)["function"].(map[string]any)
@@ -1400,10 +1401,9 @@ func TestEnsureZenToolsHaveParameters(t *testing.T) {
 	}
 }
 
-// a client-declared tool must not get a second, differently-cased gate stub
-// the gate matches exact lowercase names, so a client Bash does not satisfy
-// it: the lowercase bash stub sits beside the client's spelling and response
-// translators map the call back via tnames.resolve.
+// the ballast definitions ride beside the client's own tools (the gate
+// fingerprints the exact opencode toolset, not the client's spelling), and
+// response translators map upstream ballast names back via tnames.resolve.
 func TestEnsureZenToolsNoDuplicateCasing(t *testing.T) {
 	m := map[string]any{"tools": []any{
 		map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}},
@@ -1420,12 +1420,13 @@ func TestEnsureZenToolsNoDuplicateCasing(t *testing.T) {
 		}
 		seen[name] = true
 	}
-	// both spellings present: client's Bash plus the gate's bash
-	if !seen["Bash"] || !seen["bash"] {
-		t.Errorf("want Bash + bash, got: %v", tools)
+	// client's Bash kept, ballast toolset appended (opencode spells its shell
+	// tool "shell", so no name collision with Bash).
+	if !seen["Bash"] || !seen["shell"] {
+		t.Errorf("want Bash + ballast shell, got: %v", tools)
 	}
-	if len(tools) != 5 {
-		t.Errorf("want Bash + bash/read/glob/grep = 5 tools, got %d: %v", len(tools), tools)
+	if len(tools) != len(seen) || len(tools) != 1+len(zenOpenCodeDefs()) {
+		t.Errorf("want Bash + %d ballast defs, got %d: %v", len(zenOpenCodeDefs()), len(tools), tools)
 	}
 }
 
@@ -2209,8 +2210,8 @@ func TestLaneRaceGate(t *testing.T) {
 	if got := laneUtilization(); got < 0.99 {
 		t.Fatalf("4 of 4 lanes busy must read ~100%%, got %.2f", got)
 	}
-	if d := hedgeDelay(); d != 2*time.Second {
-		t.Fatalf("busy pool must use the 2s hedge, got %v", d)
+	if d := hedgeDelay(); d != 800*time.Millisecond {
+		t.Fatalf("busy pool must use the 800ms hedge, got %v", d)
 	}
 
 	// one of four busy: 25%, under threshold, race again.
@@ -2227,7 +2228,7 @@ func TestLaneRaceGate(t *testing.T) {
 	resetLaneUse()
 	c.Zen.LaneRaceEnabled = false
 	useConfig(t, c)
-	if d := hedgeDelay(); d != 2*time.Second {
+	if d := hedgeDelay(); d != 800*time.Millisecond {
 		t.Fatalf("race disabled must hedge, got %v", d)
 	}
 }
@@ -3770,5 +3771,31 @@ func TestWriteResponsesSSEPassesThroughUnparseable(t *testing.T) {
 	}
 	if rec.Body.String() != "not json" {
 		t.Fatalf("body = %q, want raw passthrough", rec.Body.String())
+	}
+}
+
+// TestZenBallastMatchesScript keeps the Go-embedded ballast and the probe
+// scripts' copy in lockstep: a silent drift would 403 every opencode request
+// with no diagnostic.
+func TestZenBallastMatchesScript(t *testing.T) {
+	raw, err := os.ReadFile("scripts/opencode_ballast.json")
+	if err != nil {
+		t.Skipf("ballast script copy missing: %v", err)
+	}
+	var scriptDefs []any
+	if err := json.Unmarshal(raw, &scriptDefs); err != nil {
+		t.Fatalf("scripts/opencode_ballast.json: %v", err)
+	}
+	goNames := zenOCNames()
+	if len(goNames) != len(scriptDefs) {
+		t.Fatalf("embedded %d defs vs script %d", len(goNames), len(scriptDefs))
+	}
+	for i, d := range scriptDefs {
+		dm, _ := d.(map[string]any)
+		fn, _ := dm["function"].(map[string]any)
+		n, _ := fn["name"].(string)
+		if n != goNames[i] {
+			t.Fatalf("def %d drifted: script %q vs embedded %q", i, n, goNames[i])
+		}
 	}
 }

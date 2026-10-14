@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -196,6 +200,333 @@ func TestZenProxyE2EStreams(t *testing.T) {
 			t.Errorf("anthropic stream missing %q, got: %s", want, aSSE)
 		}
 	}
+}
+
+// owner boundary: zen /v1/messages must deliver content before generation
+// finishes, including a streamed nudge, with exactly one terminal message.
+func TestZenAnthropicStreamsBeforeCompletion(t *testing.T) {
+	for _, responses := range []bool{false, true} {
+		for _, nudge := range []bool{false, true} {
+			t.Run(fmt.Sprintf("responses=%v/nudge=%v", responses, nudge), func(t *testing.T) {
+				resetLanes()
+				defer resetLanes()
+				firstRelease, retryRelease := make(chan struct{}), make(chan struct{})
+				var firstOnce, retryOnce sync.Once
+				releaseFirst := func() { firstOnce.Do(func() { close(firstRelease) }) }
+				releaseRetry := func() { retryOnce.Do(func() { close(retryRelease) }) }
+				defer releaseFirst()
+				defer releaseRetry()
+				var hits atomic.Int32
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					io.Copy(io.Discard, r.Body)
+					retry := hits.Add(1) > 1
+					w.Header().Set("Content-Type", "text/event-stream")
+					if responses {
+						if retry {
+							io.WriteString(w, "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"i1\",\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"i1\",\"delta\":\"{}\"}\n\n")
+						} else {
+							io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"working\"}\n\n")
+						}
+					} else if retry {
+						io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n")
+					} else {
+						io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"working\"}}]}\n\n")
+					}
+					w.(http.Flusher).Flush()
+					gate := firstRelease
+					if retry {
+						gate = retryRelease
+					}
+					select {
+					case <-gate:
+					case <-r.Context().Done():
+						return
+					}
+					if responses {
+						io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
+					} else {
+						finish := "stop"
+						if retry {
+							finish = "tool_calls"
+						}
+						fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":%q}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n", finish)
+					}
+					io.WriteString(w, "data: [DONE]\n\n")
+				}))
+				defer func() { releaseFirst(); releaseRetry(); up.Close() }()
+				old := OpencodeBase
+				OpencodeBase = up.URL
+				defer func() { OpencodeBase = old }()
+				c := testConfig()
+				c.Zen.AlwaysProxy = false
+				c.Zen.HedgeAfterMs = -1
+				c.Zen.LaneMinGapMs = 0
+				c.Nudge.Enabled = nudge
+				c.Models.Nudge = []nudgeYAML{{Pattern: "*", Nudge: true}}
+				useConfig(t, c)
+				p := newPool(nil)
+				proxy := httptest.NewServer(p)
+				defer func() { releaseFirst(); releaseRetry(); proxy.Close() }()
+				model := "opencode/step-5-preview-free"
+				if responses {
+					model = "opencode/muse-spark-1.3-contributor-free"
+				}
+				body := fmt.Sprintf(`{"model":%q,"max_tokens":128,"stream":true,"messages":[{"role":"user","content":"read files"}],"tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}}]}`, model)
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				req, _ := http.NewRequestWithContext(ctx, "POST", proxy.URL+"/v1/messages", strings.NewReader(body))
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				reader := bufio.NewReader(resp.Body)
+				var out strings.Builder
+				readUntil := func(marker string) {
+					t.Helper()
+					for {
+						line, err := reader.ReadString('\n')
+						out.WriteString(line)
+						if strings.Contains(line, marker) {
+							return
+						}
+						if err != nil {
+							t.Fatalf("content was buffered until completion: %v", err)
+						}
+					}
+				}
+				readUntil(`"text":"working"`)
+				releaseFirst()
+				if nudge {
+					readUntil(`"partial_json":"{}"`)
+					releaseRetry()
+				}
+				rest, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out.Write(rest)
+				if strings.Count(out.String(), "event: message_stop") != 1 || strings.Count(out.String(), "event: message_start") != 1 {
+					t.Fatalf("turn boundaries malformed: %s", out.String())
+				}
+				wantHits := int32(1)
+				if nudge {
+					wantHits = 2
+				}
+				if hits.Load() != wantHits {
+					t.Fatalf("upstream hits %d, want %d", hits.Load(), wantHits)
+				}
+				if !strings.Contains(out.String(), fmt.Sprintf(`"output_tokens":%d`, 3*wantHits)) {
+					t.Fatalf("trailing usage lost: %s", out.String())
+				}
+				if !equalCounts(sseIndexCounts(out.String(), "content_block_start"), sseIndexCounts(out.String(), "content_block_stop")) {
+					t.Fatalf("block boundaries malformed: %s", out.String())
+				}
+			})
+		}
+	}
+}
+
+// owner boundary: the streamed continuation hides only the internal marker,
+// not ordinary text, and usage includes both upstream generations.
+func TestStreamedNudgeSentinelAndText(t *testing.T) {
+	for _, responseShape := range []bool{false, true} {
+		for _, retryText := range []string{waitSentinel, "extra text"} {
+			t.Run(fmt.Sprintf("responses=%v/retry=%s", responseShape, retryText), func(t *testing.T) {
+				makeBody := func(text string) string {
+					var out strings.Builder
+					for _, char := range text {
+						if responseShape {
+							fmt.Fprintf(&out, "data: {\"type\":\"response.output_text.delta\",\"delta\":%q}\n\n", string(char))
+						} else {
+							fmt.Fprintf(&out, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", string(char))
+						}
+					}
+					if responseShape {
+						out.WriteString("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n\n")
+					} else {
+						out.WriteString("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n")
+					}
+					out.WriteString("data: [DONE]\n\n")
+					return out.String()
+				}
+				next := func(text string, calls bool) io.ReadCloser {
+					if text != "first" || calls {
+						t.Errorf("wrong continuation context: %q %v", text, calls)
+					}
+					return io.NopCloser(strings.NewReader(makeBody(retryText)))
+				}
+				rec := httptest.NewRecorder()
+				var p, c int
+				if responseShape {
+					_, p, c = streamResponsesAnthropicReader(context.Background(), rec, strings.NewReader(makeBody("first")), "m", nil, next)
+				} else {
+					_, p, c = streamAnthropicReader(context.Background(), rec, strings.NewReader(makeBody("first")), "m", nil, next)
+				}
+				if p != 14 || c != 6 {
+					t.Errorf("usage %d/%d, want 14/6", p, c)
+				}
+				out := rec.Body.String()
+				if strings.Contains(out, waitSentinel) {
+					t.Fatal("internal sentinel leaked")
+				}
+				if retryText == "extra text" && strings.Count(out, `"type":"text_delta"`) != len("firstextra text") {
+					t.Fatal("ordinary continuation text hidden")
+				}
+				if !equalCounts(sseIndexCounts(out, "content_block_start"), sseIndexCounts(out, "content_block_stop")) {
+					t.Fatalf("mismatched block boundaries: %s", out)
+				}
+			})
+		}
+	}
+}
+
+// owner boundary: a reasoning continuation opens a fresh block, never emits
+// a delta into the first generation's already-closed thinking block.
+func TestStreamedNudgeThinkingBlocks(t *testing.T) {
+	first := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first thought\",\"content\":\"first answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	retry := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"second thought\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	streamAnthropicReader(context.Background(), rec, strings.NewReader(first), "m", nil, func(string, bool) io.ReadCloser { return io.NopCloser(strings.NewReader(retry)) })
+	open := map[int]bool{}
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var e struct {
+			Type  string `json:"type"`
+			Index int    `json:"index"`
+		}
+		if err := json.Unmarshal([]byte(line[6:]), &e); err != nil {
+			t.Fatal(err)
+		}
+		switch e.Type {
+		case "content_block_start":
+			if open[e.Index] {
+				t.Fatal("block reopened before closing")
+			}
+			open[e.Index] = true
+		case "content_block_delta":
+			if !open[e.Index] {
+				t.Fatalf("delta sent into closed block %d: %s", e.Index, line)
+			}
+		case "content_block_stop":
+			if !open[e.Index] {
+				t.Fatal("closed block stopped twice")
+			}
+			open[e.Index] = false
+		}
+	}
+}
+
+// owner boundary: thirty independent clients must stream and drain without
+// losing tool calls, usage, or responsiveness of status polling.
+func TestZenThirtySessions(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(20 * time.Millisecond)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	old := OpencodeBase
+	OpencodeBase = up.URL
+	defer func() { OpencodeBase = old; resetLanes() }()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.Lanes = 30
+	c.Zen.LaneMinGapMs = 0
+	c.Zen.HedgeAfterMs = -1
+	c.Nudge.Enabled = true
+	useConfig(t, c)
+	resetDbgFile(t, t.TempDir())
+	p := newPool(nil)
+	proxy := httptest.NewServer(p)
+	defer proxy.Close()
+	client := &http.Client{Timeout: 10 * time.Second}
+	var wg sync.WaitGroup
+	for session := 0; session < 30; session++ {
+		wg.Add(1)
+		go func(session int) {
+			defer wg.Done()
+			for turn := 0; turn < 10; turn++ {
+				body := `{"model":"opencode/step-5-preview-free","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"read"}],"tools":[{"name":"Read","input_schema":{"type":"object","properties":{}}}]}`
+				req, _ := http.NewRequest("POST", proxy.URL+"/v1/messages", strings.NewReader(body))
+				req.Header.Set("x-session-id", fmt.Sprintf("session-%d", session))
+				res, err := client.Do(req)
+				if err != nil {
+					t.Errorf("session %d turn %d: %v", session, turn, err)
+					return
+				}
+				out, err := io.ReadAll(res.Body)
+				res.Body.Close()
+				if err != nil || res.StatusCode != 200 || !strings.Contains(string(out), `"name":"Read"`) || !strings.Contains(string(out), `"output_tokens":3`) || strings.Count(string(out), "event: message_stop") != 1 {
+					t.Errorf("session %d turn %d malformed: %d %v %s", session, turn, res.StatusCode, err, out)
+					return
+				}
+			}
+		}(session)
+	}
+	wg.Wait()
+	if used, _ := p.semStats(); used != 0 {
+		t.Fatalf("slots leaked: %d", used)
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	for _, l := range lanes {
+		if l.inflight != 0 {
+			t.Errorf("lane claim leaked: %d", l.inflight)
+		}
+	}
+}
+
+// benchmark the user interface with a fixed upstream delay, not live exit noise.
+func BenchmarkZenAnthropicTTFT(b *testing.B) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"PONG\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(100 * time.Millisecond)
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	oldBase, oldConfig := OpencodeBase, cfg()
+	OpencodeBase = up.URL
+	defer func() { OpencodeBase = oldBase; applyConfig(oldConfig); resetLanes() }()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.HedgeAfterMs = -1
+	c.Zen.LaneMinGapMs = 0
+	c.Nudge.Enabled = false
+	applyConfig(c)
+	proxy := httptest.NewServer(newPool(nil))
+	defer proxy.Close()
+	body := `{"model":"opencode/step-5-preview-free","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"PONG"}]}`
+	var ttft time.Duration
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", strings.NewReader(body))
+		if err != nil {
+			b.Fatal(err)
+		}
+		scanner := bufio.NewScanner(resp.Body)
+		seen := false
+		for scanner.Scan() {
+			if !seen && strings.Contains(scanner.Text(), `"text":"PONG"`) {
+				ttft += time.Since(start)
+				seen = true
+			}
+		}
+		resp.Body.Close()
+		if !seen || scanner.Err() != nil {
+			b.Fatal("incomplete stream", scanner.Err())
+		}
+	}
+	b.ReportMetric(float64(ttft.Microseconds())/float64(b.N), "ttft-us/op")
 }
 
 // real HTTP round trip through callUpstream, the nvidia branch of

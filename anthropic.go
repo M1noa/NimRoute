@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -133,8 +134,19 @@ func mapClaudeModel(model string) string {
 // upstream name back through resolve so tool_use carries the declared spelling.
 type toolNames []string
 
+// zen aliases: the ballast toolset ensureZenTools embeds uses the opencode
+// CLI's naming. when the model fires one of those whose client had a
+// different spelling (shell vs Bash, subagent vs Task), translate the call
+// back only when the client actually declares the target name.
+var zenToolAliases = map[string]string{
+	"shell":    "bash",
+	"subagent": "task",
+	"question": "askuserquestion",
+}
+
 // resolve maps an upstream tool call name back to the client's spelling: exact
-// match first, then case-insensitive. Unknown names pass through unchanged.
+// match first, then case-insensitive zen-ballast alias, then case-insensitive.
+// Unknown names pass through unchanged.
 func (tn toolNames) resolve(name string) string {
 	if !cfg().Translate.restoreToolNames() {
 		return name
@@ -142,6 +154,13 @@ func (tn toolNames) resolve(name string) string {
 	for _, c := range tn {
 		if c == name {
 			return c
+		}
+	}
+	if alias, ok := zenToolAliases[strings.ToLower(name)]; ok {
+		for _, c := range tn {
+			if strings.EqualFold(c, alias) {
+				return c
+			}
 		}
 	}
 	for _, c := range tn {
@@ -736,22 +755,12 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 }
 
 func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
+	return streamAnthropicReader(context.Background(), w, bytes.NewReader(sseNormalize(stripSentinelSSE(body))), clientModel, tnames, nil)
+}
+
+// streamAnthropicReader keeps one message open across an optional streamed nudge.
+func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames, next func(string, bool) io.ReadCloser) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
-
-	// usage arrives in a trailing chunk AFTER finish_reason, so the whole
-	// body is scanned for it before streaming: returning on finish_reason
-	// would report zero tokens for every streamed turn. chunk.Usage below
-	// can only refine these, never lower them.
-	if p, c := sseUsageTee(body); p > 0 || c > 0 {
-		promptT, compT = p, c
-	}
-
-	// proxy-internal marker must never reach the client.
-	body = stripSentinelSSE(body)
-	// some backends answer a streamed request with one plain json object
-	// (the freepi path asks upstream for stream=false and converts here).
-	// with no data: lines the loop below would parse as an empty stream.
-	body = sseNormalize(body)
 
 	msgID := "msg_" + randHex(24)
 	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":%s,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, jsonStr(clientModel))
@@ -768,13 +777,13 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 	thinkIdx := -1
 	textIdx := 0
 	textOpen := false
-	textCount := 0
+	blockIdx := 0
 	lastToolIdx := 0
 	toolBase := 0
 	thinkClosed := false
 	closeThinking := func() {
 		if thinkIdx >= 0 && !thinkClosed {
-			written += writeSSE(w, "content_block_stop", `{"type":"content_block_stop","index":0}`)
+			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, thinkIdx))
 			thinkClosed = true
 		}
 	}
@@ -788,8 +797,8 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		if textOpen {
 			return
 		}
-		textIdx = boolInt(thinkIdx >= 0) + textCount + lastToolIdx
-		textCount++
+		textIdx = blockIdx
+		blockIdx++
 		written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
 		textOpen = true
 	}
@@ -804,185 +813,190 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 		}
 	}
 
-	lines := strings.Split(string(body), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-
-		var chunk struct {
-			Choices []struct {
-				// non-stream bodies carry the answer in message, not delta.
-				Message *struct {
-					Content          string `json:"content"`
-					Reasoning        string `json:"reasoning"`
-					ReasoningContent string `json:"reasoning_content"`
-					ToolCalls        []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Type     string `json:"type"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"message"`
-				Delta struct {
-					Content string `json:"content"`
-					// Reasoning is the reasoning spelling, ReasoningContent the
-					// reasoning_content one; both carry the same trace.
-					Reasoning        string `json:"reasoning"`
-					ReasoningContent string `json:"reasoning_content"`
-					ToolCalls        []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Type     string `json:"type"`
-						Function struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-			} `json:"usage"`
-		}
-
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue
-		}
-
-		// a buffered body reports the whole turn in message; fold it into the
-		// delta shape so one code path emits it.
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Message != nil {
-			m := chunk.Choices[0].Message
-			chunk.Choices[0].Delta.Content += m.Content
-			chunk.Choices[0].Delta.Reasoning += m.Reasoning
-			chunk.Choices[0].Delta.ReasoningContent += m.ReasoningContent
-			chunk.Choices[0].Delta.ToolCalls = append(chunk.Choices[0].Delta.ToolCalls, m.ToolCalls...)
-			if chunk.Choices[0].FinishReason == nil {
-				chunk.Choices[0].FinishReason = strPtr("stop")
+	var text strings.Builder
+	finishReason := "stop"
+	for segment := 0; ; segment++ {
+		segmentPrompt, segmentComp := 0, 0
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 4096), upstreamBodyLimit)
+		for scanner.Scan() {
+			if ctx.Err() != nil {
+				return
 			}
-		}
-
-		if chunk.Usage != nil {
-			if chunk.Usage.PromptTokens > 0 {
-				promptT = chunk.Usage.PromptTokens
+			line := strings.TrimSpace(scanner.Text())
+			if !strings.HasPrefix(line, "data: ") {
+				continue
 			}
-			if chunk.Usage.CompletionTokens > 0 {
-				compT = chunk.Usage.CompletionTokens
-			}
-		}
-
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-		choice := chunk.Choices[0]
-
-		// text delta
-		// thinking delta, ahead of the text block
-		think := choice.Delta.Reasoning
-		if think == "" {
-			think = choice.Delta.ReasoningContent
-		}
-		if think != "" {
-			if thinkIdx < 0 {
-				closeText()
-				thinkIdx = 0
-				textIdx = 1
-				written += writeSSE(w, "content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
-			}
-			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%s}}`, jsonStr(think)))
-		}
-
-		// text delta. post-tool text opens a fresh block after the
-		// tools instead of being dropped (interleaved models emit text
-		// after tool calls; the old gate truncated the turn).
-		if choice.Delta.Content != "" {
-			openText()
-			if clean := strip.push(choice.Delta.Content); clean != "" {
-				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(clean)))
-			}
-		}
-
-		// tool call deltas
-		if len(choice.Delta.ToolCalls) > 0 {
-			if !hasToolCalls {
-				hasToolCalls = true
-				closeThinking()
-				closeText()
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
 			}
 
-			// tools follow whatever blocks already opened (thinking, text).
-			// each upstream tool index gets its own block index: deltas for a
-			// second call in the same chunk must not reuse the first's index.
-			// textCount (not textOpen) so a closed text block keeps its index.
-			// the first base wins for the stop loop below: later text blocks
-			// open after the tools and must not shift their stops.
-			base := boolInt(thinkIdx >= 0) + textCount
-			if lastToolIdx == 0 {
-				toolBase = base
+			var chunk struct {
+				Choices []struct {
+					// non-stream bodies carry the answer in message, not delta.
+					Message *struct {
+						Content          string `json:"content"`
+						Reasoning        string `json:"reasoning"`
+						ReasoningContent string `json:"reasoning_content"`
+						ToolCalls        []struct {
+							Index    int    `json:"index"`
+							ID       string `json:"id"`
+							Type     string `json:"type"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"message"`
+					Delta struct {
+						Content string `json:"content"`
+						// Reasoning is the reasoning spelling, ReasoningContent the
+						// reasoning_content one; both carry the same trace.
+						Reasoning        string `json:"reasoning"`
+						ReasoningContent string `json:"reasoning_content"`
+						ToolCalls        []struct {
+							Index    int    `json:"index"`
+							ID       string `json:"id"`
+							Type     string `json:"type"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"delta"`
+					FinishReason *string `json:"finish_reason"`
+				} `json:"choices"`
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+				} `json:"usage"`
 			}
-			for _, tc := range choice.Delta.ToolCalls {
-				idx, open := toolIdxMap[tc.Index]
-				if !open {
-					idx = base + lastToolIdx
-					lastToolIdx++
-					toolIdxMap[tc.Index] = idx
-					toolID := tc.ID
-					if toolID == "" {
-						toolID = "toolu_" + randHex(24)
+
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+
+			// a buffered body reports the whole turn in message; fold it into the
+			// delta shape so one code path emits it.
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Message != nil {
+				m := chunk.Choices[0].Message
+				chunk.Choices[0].Delta.Content += m.Content
+				chunk.Choices[0].Delta.Reasoning += m.Reasoning
+				chunk.Choices[0].Delta.ReasoningContent += m.ReasoningContent
+				chunk.Choices[0].Delta.ToolCalls = append(chunk.Choices[0].Delta.ToolCalls, m.ToolCalls...)
+				if chunk.Choices[0].FinishReason == nil {
+					chunk.Choices[0].FinishReason = strPtr("stop")
+				}
+			}
+
+			if chunk.Usage != nil {
+				if chunk.Usage.PromptTokens > 0 {
+					segmentPrompt = chunk.Usage.PromptTokens
+				}
+				if chunk.Usage.CompletionTokens > 0 {
+					segmentComp = chunk.Usage.CompletionTokens
+				}
+			}
+
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			choice := chunk.Choices[0]
+
+			// text delta
+			// thinking delta, ahead of the text block
+			think := choice.Delta.Reasoning
+			if think == "" {
+				think = choice.Delta.ReasoningContent
+			}
+			if think != "" {
+				if thinkIdx < 0 || thinkClosed {
+					closeText()
+					thinkIdx = blockIdx
+					blockIdx++
+					thinkClosed = false
+					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, thinkIdx))
+				}
+				written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":%s}}`, thinkIdx, jsonStr(think)))
+			}
+
+			// text delta. post-tool text opens a fresh block after the
+			// tools instead of being dropped (interleaved models emit text
+			// after tool calls; the old gate truncated the turn).
+			if choice.Delta.Content != "" {
+				text.WriteString(choice.Delta.Content)
+				openText()
+				if clean := strip.push(choice.Delta.Content); clean != "" {
+					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(clean)))
+				}
+			}
+
+			// tool call deltas
+			if len(choice.Delta.ToolCalls) > 0 {
+				if !hasToolCalls {
+					hasToolCalls = true
+					closeThinking()
+					closeText()
+				}
+
+				// tools follow whatever blocks already opened (thinking, text).
+				// each upstream tool index gets its own block index: deltas for a
+				// second call in the same chunk must not reuse the first's index.
+				// textCount (not textOpen) so a closed text block keeps its index.
+				// the first base wins for the stop loop below: later text blocks
+				// open after the tools and must not shift their stops.
+				base := blockIdx
+				if lastToolIdx == 0 {
+					toolBase = base
+				}
+				for _, tc := range choice.Delta.ToolCalls {
+					idx, open := toolIdxMap[tc.Index]
+					if !open {
+						idx = blockIdx
+						blockIdx++
+						lastToolIdx++
+						toolIdxMap[tc.Index] = idx
+						toolID := tc.ID
+						if toolID == "" {
+							toolID = "toolu_" + randHex(24)
+						}
+						written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, idx, jsonStr(toolID), jsonStr(tnames.resolve(tc.Function.Name))))
 					}
-					written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"tool_use","id":%s,"name":%s,"input":{}}}`, idx, jsonStr(toolID), jsonStr(tnames.resolve(tc.Function.Name))))
+					if tc.Function.Arguments != "" {
+						written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, idx, jsonStr(tc.Function.Arguments)))
+					}
 				}
-				if tc.Function.Arguments != "" {
-					written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":%s}}`, idx, jsonStr(tc.Function.Arguments)))
-				}
-			}
-		}
-
-		// finish reason
-		if choice.FinishReason != nil && !hasSentStopReason {
-			hasSentStopReason = true
-			flushStrip()
-			closeText()
-
-			closeThinking()
-
-			// toolBase captured at first tool open above
-			for i := 0; i < lastToolIdx; i++ {
-				written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 			}
 
-			stopReason := "end_turn"
-			switch *choice.FinishReason {
-			case "length":
-				stopReason = "max_tokens"
-			case "tool_calls":
-				stopReason = "tool_use"
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
 			}
-
-			written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
-			written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
-			n, _ := w.Write([]byte("data: [DONE]\n\n"))
-			written += int64(n)
 			if fl != nil {
 				fl.Flush()
 			}
+		}
+		promptT += segmentPrompt
+		compT += segmentComp
+		if scanner.Err() != nil || ctx.Err() != nil {
 			return
 		}
+		if segment == 0 && next != nil {
+			if continuation := next(text.String(), hasToolCalls); continuation != nil {
+				defer continuation.Close()
+				flushStrip()
+				closeText()
+				closeThinking()
+				body = continuation
+				continue
+			}
+		}
+		break
 	}
 
-	// stream ended without finish_reason
+	// finish reason follows trailing usage and any continuation.
 	if !hasSentStopReason {
+		hasSentStopReason = true
 		flushStrip()
 		closeText()
 
@@ -993,13 +1007,22 @@ func streamAnthropic(w http.ResponseWriter, body []byte, clientModel string, tna
 			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
 		}
 
-		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":%d}}`, compT))
+		stopReason := "end_turn"
+		switch finishReason {
+		case "length":
+			stopReason = "max_tokens"
+		case "tool_calls":
+			stopReason = "tool_use"
+		}
+
+		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
 		written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
 		n, _ := w.Write([]byte("data: [DONE]\n\n"))
 		written += int64(n)
 		if fl != nil {
 			fl.Flush()
 		}
+		return
 	}
 
 	return
@@ -1189,7 +1212,7 @@ func (s *respStreamer) feed(body []byte, last bool) {
 		case "response.completed":
 			if evt.Response != nil && evt.Response.Usage != nil {
 				s.compT += evt.Response.Usage.OutputTokens
-				s.promptT = evt.Response.Usage.InputTokens
+				s.promptT += evt.Response.Usage.InputTokens
 			}
 			if last {
 				s.finish()
@@ -1205,6 +1228,10 @@ func (s *respStreamer) feed(body []byte, last bool) {
 // first byte, so client TTFT is upstream TTFT. ctx aborts the read and the
 // upstream body close cancels the in-flight request.
 func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
+	return streamResponsesAnthropicReader(ctx, w, body, clientModel, tnames, nil)
+}
+
+func streamResponsesAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames, next func(string, bool) io.ReadCloser) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
 	s := &respStreamer{w: w, clientModel: clientModel, tnames: tnames, toolIdx: map[string]int{}, textIdx: -1}
 	if fl != nil {
@@ -1218,50 +1245,44 @@ func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, bo
 	s.written += writeSSE(w, "ping", `{"type":"ping"}`)
 	s.flush()
 
-	var carry []byte
-	buf := make([]byte, 4096)
-	done := false
-	for !done {
-		if ctx.Err() != nil {
+	var text strings.Builder
+	for segment := 0; ; segment++ {
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 4096), upstreamBodyLimit)
+		for scanner.Scan() {
+			if ctx.Err() != nil {
+				return s.written, s.promptT, s.compT
+			}
+			line := scanner.Text()
+			if strings.TrimSpace(line) == "data: [DONE]" {
+				break
+			}
+			if strings.HasPrefix(line, "data: ") {
+				var evt struct {
+					Type  string `json:"type"`
+					Delta string `json:"delta"`
+				}
+				if json.Unmarshal([]byte(line[6:]), &evt) == nil && evt.Type == "response.output_text.delta" {
+					text.WriteString(evt.Delta)
+				}
+			}
+			s.feed([]byte(line+"\n"), false)
+			s.flush()
+		}
+		if scanner.Err() != nil || ctx.Err() != nil {
 			return s.written, s.promptT, s.compT
 		}
-		n, err := body.Read(buf)
-		if n > 0 {
-			blk := buf[:n]
-			if len(carry) > 0 {
-				blk = append(carry, buf[:n]...)
-				carry = nil
-			}
-			if i := bytes.LastIndexByte(blk, '\n'); i >= 0 {
-				s.feed(blk[:i+1], false)
-				if s.sentStop {
-					done = true
-				} else if i+1 < len(blk) {
-					carry = append(carry[:0], blk[i+1:]...)
-				}
-			} else {
-				carry = append(carry[:0], blk...)
-				if len(carry) > 65536 {
-					s.feed(carry, false)
-					carry = nil
-					if s.sentStop {
-						done = true
-					}
-				}
+		if segment == 0 && next != nil {
+			if continuation := next(text.String(), s.hasToolUse); continuation != nil {
+				defer continuation.Close()
+				s.closeBlocks()
+				body = continuation
+				continue
 			}
 		}
-		if err != nil {
-			break
-		}
+		break
 	}
-	if !done {
-		// a truncated stream may never send response.completed: the
-		// client must still get message_stop, not a hanging turn.
-		if len(carry) > 0 {
-			s.feed(append(carry, '\n'), true)
-		}
-		s.finish()
-	}
+	s.finish()
 	return s.written, s.promptT, s.compT
 }
 
@@ -2404,26 +2425,23 @@ func zenSession() string {
 	return "ses_" + zenID(true)
 }
 
-// zenMsgID mirrors opencode's per-request message id: msg_ + ascending().
-// (packages/schema/src/session-message.ts, sent as x-opencode-request)
-func zenMsgID() string {
-	return "msg_" + zenID(false)
-}
-
-// setZenHeaders applies the exact header set the real opencode client sends to
-// zen. source of truth is packages/opencode/src/session/llm/request.ts in the
-// upstream clone: for a provider whose id starts with "opencode" it sends
-// x-opencode-session-id (on every request, not just opencode providers),
-// x-opencode-project, x-opencode-session, x-opencode-request and
-// x-opencode-client, plus a bare `opencode/${InstallationVersion}` User-Agent
-// with no ai-sdk/bun suffix.
+// setZenHeaders applies the header set the real opencode client sends to zen.
+// source of truth is the live client capture (packages/core/src/session/
+// model-request.ts): authorization Bearer public, x-opencode-client: cli,
+// the session identity in both x-opencode-session and x-opencode-session-id
+// plus x-session-affinity, x-opencode-project, and the bare
+// `opencode/<channel>/<version>/<name>` User-Agent. the free-tier gate on
+// /inference/v1 needs the two session ids and drops a request whose session
+// value is not a descending opencode id (ses_ + 12 hex time + 14 base62), so
+// every session here comes from zenSession(). x-opencode-request is
+// deliberately absent: the current client does not send it.
 func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session-id", sessionID)
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sessionID)
-	req.Header.Set("x-opencode-request", zenMsgID())
+	req.Header.Set("x-session-affinity", sessionID)
 	req.Header.Set("x-opencode-project", "global")
 	req.Header.Set("User-Agent", zenUserAgent())
 	req.Header.Set("Accept", "*/*")
@@ -2581,6 +2599,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	sessionID := laneSession(lane)
 	noteLaneUse(true) // capacity tracking for the low-load lane race
 	defer noteLaneUse(false)
+	// track the final lane, including failover handoffs.
+	laneClaim(lane)
+	defer func() { laneDone(lane) }()
 
 	// zenPost sends body to zen with proxy failover and returns the response.
 	zenPost := func(body []byte, stream bool, tag string) *http.Response {
@@ -2592,7 +2613,12 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if zenRetries > 0 && maybeRefreshStalePool(lane) {
 				sessionID = laneSession(lane)
 			}
-			laneGate(r.Context(), lane)
+			// retries always land on a fresh lane (failover/rotate above),
+			// so re-pacing against it only stacks the first send's gap
+			// onto the retry. the first attempt still paces.
+			if zenRetries == 0 {
+				laneGate(r.Context(), lane)
+			}
 			// client gone while pacing: stop before burning an exit.
 			if r.Context().Err() != nil {
 				return nil
@@ -2605,7 +2631,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					// land, so wait for it instead of failing instantly.
 					// bounded by the retry budget below, not forever.
 					if waitZenPool(r.Context(), 8*time.Second) {
-						lane = laneFailover(lane)
+						lane = laneHandoff(lane, laneFailover(lane))
 						sessionID = laneSession(lane)
 						proxy = laneProxyFor(lane, zenModel)
 					}
@@ -2618,7 +2644,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			} else if rotating {
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && cfg().Zen.AlwaysProxy {
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneSession(lane)
 					proxy = laneProxyFor(lane, zenModel)
 				}
@@ -2636,6 +2662,14 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			} else {
 				// service overloaded: retry on the same lane proxy + session.
 				proxy = lastProxy
+				// killswitch: always_proxy must never send direct, even on
+				// the pinned path. lastProxy is "" only when the first
+				// attempt went direct, which cannot happen under the flag
+				// (see the retry-0 branch above), so this is belt and
+				// braces, not a live path.
+				if proxy == "" && cfg().Zen.AlwaysProxy {
+					return nil
+				}
 				cl = zenClient(proxy)
 			}
 			req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
@@ -2659,8 +2693,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					hl := laneFailover(lane)
 					hp := laneProxyFor(hl, zenModel)
 					if hp == "" || hp == proxy {
-						<-hctx.Done() // no distinct exit: wait to be cancelled
-						return nil, hctx.Err()
+						return nil, fmt.Errorf("no distinct zen hedge exit")
 					}
 					hcl := zenClient(hp)
 					hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
@@ -2707,7 +2740,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					// it burns every retry on a corpse, so move lanes the
 					// way the 429 path does.
 					if laneReproxy(lane, zenModel) == proxy {
-						lane = laneFailover(lane)
+						lane = laneHandoff(lane, laneFailover(lane))
 						sessionID = laneRotate(lane, zenModel)
 					}
 				}
@@ -2735,7 +2768,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					// synthesized body, never the closed empty one.
 					up = exhausted429(clientModel, st)
 				} else {
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					zenBackoffCtx(r.Context(), zenRetries)
@@ -2747,9 +2780,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 				up.Body.Close()
 				if zenServiceOverloaded(eb) {
-					acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s %s retrying same proxy+session err=%q",
+					acclog.Printf("  opencode overloaded %d (retry %d/%d) model=%s country=%s proxy=%s %s rotating exit+session err=%q",
 						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, errSnippet(eb, 160))
-					rotating = false
+					lane = laneHandoff(lane, laneFailover(lane))
+					sessionID = laneRotate(lane, zenModel)
+					rotating = true
 					if !zenLastRetry(zenRetries) {
 						zenBackoffCtx(r.Context(), zenRetries)
 						continue
@@ -2758,7 +2793,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenGeoBlocked(eb) {
 					logZenBlocked("geo", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenGeoErr() {
@@ -2774,7 +2809,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenUserBlocked(eb) {
 					logZenBlocked("user", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
 					dropProxy(proxy)
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenBlockErr() {
@@ -2795,7 +2830,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					if proxy == "" {
 						laneEscalate(lane, zenModel) // direct is flagged: give the lane an exit
 					}
-					lane = laneFailover(lane)
+					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
 					if noteZenFreeTierErr() {
@@ -2852,58 +2887,33 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		w.WriteHeader(http.StatusOK)
 		var written int64
 		var promptT, compT int
-		if isResponses && (!nudgeEnabled(upstreamModel) || !toolsOffered(oaiBody)) {
-			// live: stream each upstream chunk as it arrives, full-turn
-			// TTFT instead of buffered. nudge needs the whole turn, so it
-			// keeps the buffered path below.
-			written, promptT, compT = streamResponsesLiveAnthropic(r.Context(), w, resp.Body, clientModel, tnames)
-			resp.Body.Close()
-		} else {
-			rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
-			resp.Body.Close()
-			if isResponses {
-				// nudge_no_tools (models.params in config.yml): when the
-				// client offered tools but the model ended with none, refetch
-				// once on the same session with a nudge and stream both bodies
-				// as one turn. If the retry also calls nothing, the turn ends.
-				bodies := [][]byte{rb}
-				post := func(nb []byte) []byte {
-					nresp := zenPost(nb, true, "nudge")
-					if nresp == nil {
-						return nil
-					}
-					defer nresp.Body.Close()
-					if nresp.StatusCode != http.StatusOK {
-						return nil
-					}
-					nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
-					return nb2
-				}
-				if retry := tryNudgeResponses(sessionID, upstreamModel, oaiBody, rb, post); retry != nil {
-					bodies = append(bodies, retry)
-				}
-				written, promptT, compT = streamResponsesMerged(w, bodies, clientModel, tnames)
-			} else {
-				// chat-model no-tools continue: same gates as spark, on
-				// raw chat SSE. the retry merges as a second segment.
-				post := func(nb []byte) []byte {
-					nresp := zenPost(nb, true, "nudge")
-					if nresp == nil {
-						return nil
-					}
-					defer nresp.Body.Close()
-					if nresp.StatusCode != http.StatusOK {
-						return nil
-					}
-					nb2, _ := io.ReadAll(io.LimitReader(nresp.Body, upstreamBodyLimit))
-					return nb2
-				}
-				if retry := tryNudgeChat(sessionID, upstreamModel, "opencode", oaiBody, rb, post); retry != nil {
-					rb = mergeChatSSE([][]byte{rb, retry})
-				}
-				written, promptT, compT = streamAnthropic(w, rb, clientModel, tnames)
+		next := func(text string, hasCalls bool) io.ReadCloser {
+			if r.Context().Err() != nil || nudgeChatGates(sessionID, upstreamModel, oaiBody, text, hasCalls) == "" {
+				return nil
 			}
+			nb := nudgeContinuationChat(oaiBody, text)
+			if isResponses {
+				nb = nudgeContinuation(oaiBody, text)
+			}
+			resp.Body.Close()
+			nresp := zenPost(nb, true, "nudge")
+			if nresp == nil {
+				return nil
+			}
+			if nresp.StatusCode != http.StatusOK {
+				nresp.Body.Close()
+				return nil
+			}
+			nudgeStreaks.note(sessionID, false)
+			return nresp.Body
 		}
+		if isResponses {
+			written, promptT, compT = streamResponsesAnthropicReader(r.Context(), w, resp.Body, clientModel, tnames, next)
+		} else {
+			written, promptT, compT = streamAnthropicReader(r.Context(), w, resp.Body, clientModel, tnames, next)
+		}
+		resp.Body.Close()
+		elapsed = time.Since(start)
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
@@ -2971,6 +2981,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			os.WriteFile(p, rb, 0o600)
 			acclog.Printf("ZEN_DUMP nonstream folded %d bytes -> %s", len(rb), p)
 		}
+		elapsed = time.Since(start)
 		out := rb
 		prompT, compT := 0, 0
 		var errMsg string

@@ -240,7 +240,7 @@ zen:
   # one-shot requests never pin a lane past this. 0 disables. default 1.
   convo_idle_minutes: 1
   # fire a second request on another exit when no first byte arrives within
-  # this (ms); first response wins. -1 disables. default 0 (= 2s inside).
+  # this (ms); first response wins. -1 disables. default 0 (= 800ms inside).
   hedge_after_ms: 0
   # idle lanes expire after this (minutes), swept on the pool refresh tick.
   lane_ttl_minutes: 30
@@ -267,9 +267,9 @@ zen:
   # for this long (minutes). per (exit, model): the exit can still serve
   # other models. 0 disables (never burn, old behavior).
   exit_burn_minutes: 30
-  # upstream attempts per request (first try + retries). default 4 retries.
+  # upstream attempts per request (first try + retries). default 6 retries.
   # 0 = same default, negative = single attempt, no retry.
-  max_retries: 4
+  max_retries: 6
   # unused: exits are verified on pool refresh and by real sends, never
   # probed on the request hot path.
   probe_timeout_ms: 1000

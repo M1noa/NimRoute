@@ -468,8 +468,8 @@ func TestEnsureZenToolsSingleObject(t *testing.T) {
 	}
 	ensureZenTools(m)
 	ts, ok := m["tools"].([]any)
-	// gate stubs (bash/read/glob/grep) are appended by design, so expect at
-	// least the original tool, normalized to an array, first in the list.
+	// gate ballast (the embedded opencode defs) is appended by design, so expect
+	// at least the original tool, normalized to an array, first in the list.
 	if !ok || len(ts) < 1 {
 		t.Fatalf("single tool object not normalized to array: %v", m["tools"])
 	}
@@ -480,16 +480,16 @@ func TestEnsureZenToolsSingleObject(t *testing.T) {
 	}
 }
 
-// zen 403s FreeTierError on any body without the gate tools, so a tool-less
-// body (plain openai client, title gen) gets the stubs but tool_choice
-// "none": the gate passes and the model cannot call them. a body with
-// client tools keeps its own tool_choice.
+// zen 403s FreeTierError on any body missing the ballast toolset, so a
+// tool-less body (plain openai client, title gen) gets the embedded opencode
+// defs but tool_choice "none": the gate passes and the model cannot call
+// them. a body with client tools keeps its own tool_choice.
 func TestEnsureZenToolsToolless(t *testing.T) {
 	m := map[string]any{"messages": []any{}}
 	ensureZenTools(m)
 	ts, _ := m["tools"].([]any)
-	if len(ts) != len(zenGateNames) {
-		t.Fatalf("tool-less body must get %d gate stubs, got %v", len(zenGateNames), m["tools"])
+	if len(ts) != len(zenOpenCodeDefs()) {
+		t.Fatalf("tool-less body must get %d ballast defs, got %v", len(zenOpenCodeDefs()), m["tools"])
 	}
 	if m["tool_choice"] != "none" {
 		t.Fatalf("gate stubs on a tool-less body must be uncallable, tool_choice=%v", m["tool_choice"])

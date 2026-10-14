@@ -41,8 +41,8 @@ _jsonl_cache = {"mtime": 0, "size": 0, "out": None}
 def jsonl_stats():
     """All-time + today totals from nim-usage.jsonl. Returns dict.
 
-    cached on (mtime, size): the tail loop calls this every second and a
-    20MB re-parse per tick pegs a core on a busy proxy.
+    append-only reads keep polling cheap while traffic grows the log.
+    rotation, truncation, and midnight reset the cached totals.
     """
     path = os.path.join(ROOT, "nim-usage.jsonl")
     try:
@@ -50,21 +50,34 @@ def jsonl_stats():
     except OSError:
         return {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0},
                 "since": ""}
-    if (st.st_mtime, st.st_size) == (_jsonl_cache["mtime"], _jsonl_cache["size"]) \
-            and _jsonl_cache["out"] is not None:
-        return _jsonl_cache["out"]
-    out = {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0},
-           "since": ""}
     today = today_str()
+    identity = (path, st.st_dev, st.st_ino)
+    cached = _jsonl_cache.get("out")
+    same = (cached is not None and _jsonl_cache.get("identity") == identity
+            and _jsonl_cache.get("day") == today
+            and st.st_size >= _jsonl_cache.get("size", 0))
+    if same and st.st_size == _jsonl_cache["size"] and st.st_mtime_ns == _jsonl_cache.get("mtime"):
+        return cached
+    if same and st.st_size == _jsonl_cache["size"]:
+        same = False
+    out = ({"all": dict(cached["all"]), "today": dict(cached["today"]), "since": cached["since"]}
+           if same else {"all": {"req": 0, "tok": 0}, "today": {"req": 0, "tok": 0}, "since": ""})
+    offset = _jsonl_cache.get("offset", 0) if same else 0
     try:
-        with open(path) as f:
-            for line in f:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                line = f.readline()
+                if not line or not line.endswith(b"\n"):
+                    break
+                offset = f.tell()
                 try:
                     r = json.loads(line)
-                except ValueError:
+                except (ValueError, UnicodeError):
                     continue
-                tok = r.get("total_tokens") or (
-                    r.get("prompt_tokens", 0) + r.get("completion_tokens", 0))
+                if not isinstance(r, dict):
+                    continue
+                tok = r.get("total_tokens") or (r.get("prompt_tokens", 0) + r.get("completion_tokens", 0))
                 out["all"]["req"] += 1
                 out["all"]["tok"] += tok
                 ts = str(r.get("ts", ""))
@@ -74,9 +87,9 @@ def jsonl_stats():
                     out["today"]["req"] += 1
                     out["today"]["tok"] += tok
     except OSError:
-        pass
-    _jsonl_cache["mtime"], _jsonl_cache["size"], _jsonl_cache["out"] = \
-        st.st_mtime, st.st_size, out
+        return out
+    _jsonl_cache.update(mtime=st.st_mtime_ns, size=st.st_size, out=out,
+                        identity=identity, day=today, offset=offset)
     return out
 
 
@@ -153,7 +166,9 @@ def plain_status(d):
         d.get("concurrent", 0), d.get("sem_limit", 0)))
     lanes = d.get("zen_lanes") or []
     served = sum(l.get("total_tokens", 0) for l in lanes)
-    c.append("lanes %d live · %s tok served" % (len(lanes), fmt_tok(served)))
+    c.append("opencode %d active · nvidia %d active · nim lanes %d/%d · %s tok served" % (
+        d.get("concurrent_opencode", 0), d.get("concurrent_nvidia", 0),
+        len(lanes), d.get("lane_cap", len(lanes)), fmt_tok(served)))
     p = d.get("pool") or {}
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
@@ -200,7 +215,7 @@ def fmt_ms(ms):
     return "%dms" % ms
 
 
-def merged_table(d):
+def merged_table(d, limit=8):
     """One table: lane + its exit (host, cc) + api latency + req."""
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
@@ -210,9 +225,14 @@ def merged_table(d):
     t.add_column("lane", style="slate_blue1")
     t.add_column("exit")
     t.add_column("cc")
-    t.add_column("lat", justify="right")
+    t.add_column("ttfb", justify="right")
     t.add_column("req", justify="right")
-    for l in lanes:
+    t.add_column("429", justify="right", style="yellow")
+    t.add_column("avg turn", justify="right")
+    t.add_column("tokens", justify="right")
+    lanes = sorted(lanes, key=lambda l: (-l.get("requests", 0), l.get("id", "")))
+    shown = lanes[:limit] if limit else lanes
+    for l in shown:
         proxy = l.get("proxy") or ""
         e = exits.get(proxy, {})
         if proxy:
@@ -222,8 +242,11 @@ def merged_table(d):
             exit_t = Text("—", style="dim")
         t.add_row((l.get("id") or "?")[:14], exit_t,
                   str(e.get("country", "·")),
-                  fmt_ms(e.get("latency_ms")),
-                  str(l.get("requests", 0)))
+                  fmt_ms(e.get("avg_ms")),
+                  str(l.get("requests", 0)), str(l.get("rate_limited", 0)),
+                  fmt_ms(l.get("avg_ms")), fmt_tok(l.get("total_tokens", 0)))
+    if len(shown) < len(lanes):
+        t.caption = "%d more lanes · nim status shows the busiest 8" % (len(lanes) - len(shown))
     return t
 
 
@@ -249,13 +272,11 @@ def usage_bar(pct, width=10):
     return bar
 
 
-# muted slate palette: provider names carry the color, values stay dim.
+# muted slate palette: the model id carries the color of its backend,
+# the rest of its row stays dim.
 PROVIDER_STYLES = {"opencode": "slate_blue1", "freepi": "medium_purple3",
                    "antseed": "steel_blue", "nvidia": "dark_sea_green",
                    "nous": "medium_spring_green"}
-
-# usage multipliers come from /status per-account "mults" (parsed live from
-# the freepi catalog display names, e.g. "GLM 5.3 Flash · ~0.7x usage").
 
 
 def health_cell(health, model):
@@ -319,18 +340,19 @@ def build_renderable(d, stats):
                                      d.get("total", 0)),
                    style="dark_sea_green" if ok else "red")
     parts.append(hdr)
-    parts.append(merged_table(d))
-    parts.append(Text("convo = sticky conversation · shared = overflow pool · hdr = pinned header",
-                       style="dim"))
+    parts.append(Text("opencode %d active · nvidia %d active · nim lanes %d/%d" % (
+        d.get("concurrent_opencode", 0), d.get("concurrent_nvidia", 0),
+        len(d.get("zen_lanes") or []), d.get("lane_cap", 0)), style="dim"))
+    if d.get("zen_lanes"):
+        parts.append(merged_table(d))
     oc = d.get("opencode") or {}
     oc_models = list(oc.get("models") or [])
     health = d.get("health") or {}
     fp = d.get("freepi") or {}
-    fp_models, fp_rows, fp_mults = [], [], {}
+    fp_models, fp_rows = [], []
     for acct in fp.get("accounts") or []:
         ms = acct.get("models") or []
         fp_models.extend(ms)
-        fp_mults.update(acct.get("mults") or {})
         req = acct.get("requests", 0)
         tok = acct.get("prompt_tokens", 0) + acct.get("completion_tokens", 0)
         mark = "◆" if acct.get("inflight") else "◇"
@@ -352,10 +374,12 @@ def build_renderable(d, stats):
     antseed = d.get("antseed")
     if antseed:
         antseed_models = antseed.get("models") or []
-        cols.append(("antseed", ["antseed/" + m for m in antseed_models]
-                     or ["discovering…" if not antseed.get("stale_for") else "no free models"]))
+        if not antseed_models:  # a placeholder row, still backend-prefixed
+            antseed_models = ["discovering…" if not antseed.get("stale_for")
+                              else "no free models"]
+        cols.append(("antseed", ["antseed/" + m for m in antseed_models]))
     if nv_keys:
-        cols.append(("nvidia", ["keys: " + ", ".join(nv_keys)]))
+        cols.append(("nvidia", ["nvidia/" + "keys: " + ", ".join(nv_keys)]))
     nous = d.get("nous") or {}
     nous_models = list(nous.get("models") or [])
     if nous_models:
@@ -365,36 +389,21 @@ def build_renderable(d, stats):
         cols.append(("nous", ["nous/" + m for m in nous_models]))
     if cols:
         by_model = (d.get("usage") or {}).get("by_model") or {}
-        t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
-                  pad_edge=False)
-        for name, _ in cols:
-            t.add_column(name, style=PROVIDER_STYLES.get(name, "dim"))
-            t.add_column("status", justify="right", style="dim")
-            if name == "freepi":
-                t.add_column("mult", justify="right", style="dim")
-            t.add_column("tok", justify="right", style="dim")
-            t.add_column("tps", justify="right", style="dim")
-        widest = max(len(ms) for _, ms in cols)
-        for row in zip(*[ms + [""] * (widest - len(ms)) for _, ms in cols]):
-            cells = []
-            for (name, _), val in zip(cols, row):
-                cells.append(Text(val, style=PROVIDER_STYLES.get(name, "dim")))
-                if val:
-                    full = val if "/" in val else name + "/" + val
-                    cells.append(health_cell(health, full))
-                    if name == "freepi":
-                        bare = full.split("/", 1)[-1]
-                        cells.append(Text(fp_mults.get(bare, "·"), style="dim"))
-                    cells.append(tok_cell(by_model, full))
-                    cells.append(tps_cell(by_model, full))
-                else:
-                    cells.append(Text(""))
-                    if name == "freepi":
-                        cells.append(Text(""))
-                    cells.append(Text(""))
-                    cells.append(Text(""))
-            t.add_row(*cells)
+        t = Table(show_header=True, header_style="bold", box=box.SIMPLE, pad_edge=False)
+        for label in ("model", "state", "req", "err", "tokens", "tok/s*"):
+            t.add_column(label, justify="right" if label in ("req", "err", "tokens", "tok/s*") else "left")
+        for name, models in cols:
+            for val in models:
+                # every row is one full id: provider and model never split,
+                # so the table matches what a client sends and what /status
+                # keys usage.by_model by.
+                full = val if "/" in val else name + "/" + val
+                totals = model_totals(by_model, full) or {}
+                t.add_row(Text(full, style=PROVIDER_STYLES.get(name, "dim")),
+                          health_cell(health, full), str(totals.get("requests", 0)),
+                          str(totals.get("errors", 0)), tok_cell(by_model, full), tps_cell(by_model, full))
         parts.append(t)
+        parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
         line = Text()
         line.append("%s freepi:%s  " % (mark, name),
@@ -497,8 +506,19 @@ def main():
             print(plain_status(d))
     elif cmd == "tail-status":
         if not RICH:
-            print("rich not available, install with: pip install rich")
-            return 1
+            import time
+            try:
+                while True:
+                    try:
+                        text = plain_status(fetch("/status"))
+                    except (OSError, ValueError) as e:
+                        text = "status unavailable: %s" % e
+                    if sys.stdout.isatty():
+                        print("\033[2J\033[H", end="")
+                    print(text, flush=True)
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                return 0
         con = Console()
 
         def render():

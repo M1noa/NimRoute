@@ -183,7 +183,7 @@ type zenConfig struct {
 	// serve other models. 0 disables (never burn).
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
 	// MaxRetries caps zen upstream attempts per request. 0 = default
-	// (first try + 4 retries), negative = single attempt, no retry.
+	// (first try + 6 retries), negative = single attempt, no retry.
 	MaxRetries int `yaml:"max_retries"`
 	// ProbeTimeoutMs verifies a lane's pinned exit before reuse. 0 = 1000.
 	ProbeTimeoutMs int `yaml:"probe_timeout_ms"`
@@ -480,7 +480,7 @@ func defaultConfig() appConfig {
 			PoolRefresh429s:          4,
 			PoolRefreshCooldownSecs:  120,
 			ExitBurnMinutes:          30,
-			MaxRetries:               4,
+			MaxRetries:               6,
 			ProbeTimeoutMs:           1000,
 			RaceTimeoutMs:            3000,
 			LaneGateMaxSecs:          10,

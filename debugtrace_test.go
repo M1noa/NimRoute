@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -198,6 +199,66 @@ func TestDbgRTRecordsHops(t *testing.T) {
 	}
 }
 
+// owner boundary: dbgRT must cap captures, never the upstream request.
+func TestDbgRTLargeRequestUnchanged(t *testing.T) {
+	resetDbgFile(t, t.TempDir())
+	for _, size := range []int{traceUpReqCap - 1, traceUpReqCap, traceUpReqCap + 1, 1 << 20} {
+		for _, replayable := range []bool{true, false} {
+			t.Run(fmt.Sprintf("bytes=%d/replayable=%v", size, replayable), func(t *testing.T) {
+				body := `{"input":"` + strings.Repeat("x", size-12) + `"}`
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					got, err := io.ReadAll(r.Body)
+					if err != nil || string(got) != body || !json.Valid(got) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+				}))
+				defer up.Close()
+				tr := &traceRec{}
+				ctx := context.WithValue(context.Background(), traceKey{}, tr)
+				req, err := http.NewRequestWithContext(ctx, "POST", up.URL, strings.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !replayable {
+					req.GetBody = nil
+					req.ContentLength = -1
+				}
+				length := req.ContentLength
+				cl := dbgClient(&http.Client{Timeout: 5 * time.Second}, "opencode")
+				resp, err := cl.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("upstream status = %d: debug capture corrupted the JSON request", resp.StatusCode)
+				}
+				if req.ContentLength != length {
+					t.Errorf("content length changed: got %d, want %d", req.ContentLength, length)
+				}
+				if replayable {
+					replay, err := req.GetBody()
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := io.ReadAll(replay)
+					replay.Close()
+					if err != nil || string(got) != body {
+						t.Error("debug capture corrupted the replay body")
+					}
+				}
+				hop := tr.Hops[0]
+				if hop.ReqBody != body[:min(len(body), traceUpReqCap)] || hop.ReqTruncated != (len(body) > traceUpReqCap) {
+					t.Errorf("capture len=%d truncated=%v, original len=%d", len(hop.ReqBody), hop.ReqTruncated, len(body))
+				}
+			})
+		}
+	}
+}
+
 // TestDbgRTNoTrace: with capture off the same client behaves exactly as an
 // unwrapped one, so the flag cannot change request behavior.
 func TestDbgRTNoTrace(t *testing.T) {
@@ -305,9 +366,58 @@ func TestTraceBodyCapturesInbound(t *testing.T) {
 	if string(got) != "hello world" {
 		t.Fatalf("read back %q", got)
 	}
-	tr.recordInbound(got)
 	if tr.InBody != "hello world" {
 		t.Errorf("captured %q", tr.InBody)
+	}
+}
+
+// owner boundary: debug readers and writers preserve traffic and bound captures.
+func TestDebugBodyCaptureBounds(t *testing.T) {
+	for _, size := range []int{traceUpRespCap - 1, traceUpRespCap, traceUpRespCap + 1, 1 << 20} {
+		t.Run(fmt.Sprintf("bytes=%d", size), func(t *testing.T) {
+			body := strings.Repeat("x", size)
+			tr := &traceRec{}
+			in := &traceBody{tr: tr, r: strings.NewReader(body)}
+			got, err := io.ReadAll(in)
+			if err != nil || string(got) != body {
+				t.Fatal("inbound traffic changed")
+			}
+			if tr.InBody != body[:min(size, traceInboundCap)] || tr.InTrunc != (size > traceInboundCap) {
+				t.Errorf("inbound capture len=%d truncated=%v", len(tr.InBody), tr.InTrunc)
+			}
+
+			resetDbgFile(t, t.TempDir())
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				io.WriteString(w, body)
+			}))
+			defer up.Close()
+			ctx := context.WithValue(context.Background(), traceKey{}, tr)
+			req, _ := http.NewRequestWithContext(ctx, "GET", up.URL, nil)
+			resp, err := dbgClient(&http.Client{Timeout: 5 * time.Second}, "opencode").Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || string(got) != body {
+				t.Errorf("response traffic changed: got %d bytes, want %d, err=%v", len(got), size, err)
+			}
+			hop := tr.Hops[0]
+			if hop.RespBody != body[:min(size, traceUpRespCap)] || hop.RespTrunc != (size > traceUpRespCap) {
+				t.Errorf("response capture len=%d truncated=%v", len(hop.RespBody), hop.RespTrunc)
+			}
+
+			rec := httptest.NewRecorder()
+			out := &dbgWriter{w: rec, tr: tr}
+			for i := 0; i < size; i += 10000 {
+				if _, err := out.Write([]byte(body[i:min(i+10000, size)])); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if rec.Body.String() != body || out.buf.String() != body[:min(size, traceOutCap)] {
+				t.Errorf("outbound traffic len=%d capture len=%d", rec.Body.Len(), out.buf.Len())
+			}
+		})
 	}
 }
 
@@ -337,11 +447,14 @@ type nopCloser struct{}
 
 func (nopCloser) Close() error { return nil }
 
-// TestTraceCaps: oversized bodies are trimmed and flagged.
+// TestTraceCaps: oversized bodies are trimmed and flagged, through the
+// reader the handlers actually get.
 func TestTraceCaps(t *testing.T) {
-	big := make([]byte, traceInboundCap+10)
 	tr := &traceRec{}
-	tr.recordInbound(big)
+	big := strings.Repeat("x", traceInboundCap+10)
+	if _, err := io.ReadAll(&traceBody{tr: tr, r: strings.NewReader(big)}); err != nil {
+		t.Fatal(err)
+	}
 	if !tr.InTrunc {
 		t.Error("oversized inbound body not flagged")
 	}

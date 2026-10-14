@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -393,11 +394,11 @@ func TestParseFreepiErr(t *testing.T) {
 func fakeFreepi(t *testing.T, h http.HandlerFunc) {
 	t.Helper()
 	srv := httptest.NewServer(h)
-	old := freePiBase
-	freePiBase = srv.URL
+	old := freepiBase()
+	freePiBase.Store(srv.URL)
 	t.Cleanup(func() {
 		srv.Close()
-		freePiBase = old
+		freePiBase.Store(old)
 		freepiMu.Lock()
 		freepiAccts = map[string]*freepiAcct{}
 		freepiMu.Unlock()
@@ -639,9 +640,10 @@ func TestLongBurn(t *testing.T) {
 	}
 }
 
-// a fresh exit (never succeeded) survives repeat 429s: two fast limits on
-// first touch are congestion, not saturation. banning new exits one by one
-// empties the usable pool until only a restart clears the 12h bans.
+// a fresh exit (never succeeded) survives a pair of fast 429s: two limits
+// on first touch are congestion, not saturation. the saturation rule for
+// fresh exits is three straight limits — more than two 429s ban the exit
+// for 12h regardless of success history.
 func TestLongBurnSkipsFreshExits(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
@@ -651,12 +653,21 @@ func TestLongBurnSkipsFreshExits(t *testing.T) {
 	exitTrackMu.Lock()
 	delete(exitTrack, "http://9.9.9.10:1")
 	exitTrackMu.Unlock()
-	for i := 0; i < 5; i++ {
-		noteExit429("http://9.9.9.10:1")
-	}
+	noteExit429("http://9.9.9.10:1")
 	if exitLongBurned("http://9.9.9.10:1") {
-		t.Fatal("fresh exit with no success must never long-burn")
+		t.Fatal("single 429 must not long-burn")
 	}
+	noteExit429("http://9.9.9.10:1")
+	if exitLongBurned("http://9.9.9.10:1") {
+		t.Fatal("fresh exit with two fast 429s must not long-burn")
+	}
+	noteExit429("http://9.9.9.10:1")
+	if !exitLongBurned("http://9.9.9.10:1") {
+		t.Fatal("three straight 429s must long-burn even a fresh exit")
+	}
+	longBurnMu.Lock()
+	delete(longBurned, "http://9.9.9.10:1")
+	longBurnMu.Unlock()
 	exitTrackMu.Lock()
 	delete(exitTrack, "http://9.9.9.10:1")
 	exitTrackMu.Unlock()
@@ -727,6 +738,49 @@ func TestHedgedDo(t *testing.T) {
 	cancel()
 	if _, err, _ := hedgedDo(cctx, slow, slow, 50*time.Millisecond); err == nil {
 		t.Fatal("cancelled ctx must return an error, not a response")
+	}
+}
+
+// owner boundary: retryable failures must not cancel a healthy hedged send.
+func TestHedgedDoPrefersSuccess(t *testing.T) {
+	for _, status := range []int{0, 429, 529, 502, 503, 400} {
+		for _, primaryFails := range []bool{true, false} {
+			t.Run(fmt.Sprintf("status=%d/primary=%v", status, primaryFails), func(t *testing.T) {
+				failure := func(ctx context.Context) (*http.Response, error) {
+					if !primaryFails {
+						time.Sleep(5 * time.Millisecond)
+					}
+					if status == 0 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("failure"))}, nil
+				}
+				success := func(ctx context.Context) (*http.Response, error) {
+					select {
+					case <-time.After(20 * time.Millisecond):
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("complete"))}, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				primary, hedge := failure, success
+				if !primaryFails {
+					primary, hedge = success, failure
+				}
+				res, err, _ := hedgedDo(context.Background(), primary, hedge, time.Millisecond)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer res.Body.Close()
+				want := 200
+				if status == 400 {
+					want = 400
+				}
+				if res.StatusCode != want {
+					t.Fatalf("status=%d, want %d", res.StatusCode, want)
+				}
+			})
+		}
 	}
 }
 

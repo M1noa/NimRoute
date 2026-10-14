@@ -209,11 +209,16 @@ func refreshZenProxies() {
 	countries := make(map[string]string, len(fast))
 	lats := make(map[string]int, len(fast))
 	relis := make(map[string]float64, len(fast))
+	seenCand := map[string]bool{}
 	for _, e := range fast {
 		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
 		if exitTLSBanned(u) {
 			continue // mitm exit: banned, never re-verify it
 		}
+		if seenCand[u] {
+			continue // list servers repeat entries: never check the same exit twice
+		}
+		seenCand[u] = true
 		cands = append(cands, u)
 		countries[u] = strings.ToUpper(strings.TrimSpace(e.Country))
 		lats[u] = e.ResponseTimeMs
@@ -415,7 +420,7 @@ func loadZenPool() bool {
 func verifyProxy(proxyURL string) bool {
 	cl := zenClient(proxyURL)
 	cl.Timeout = 5 * time.Second
-	req, err := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
+	req, err := http.NewRequest("GET", OpencodeBase+"/models", nil)
 	if err != nil {
 		return false
 	}
@@ -864,7 +869,9 @@ func zenBackoffCtx(ctx context.Context, retry int) {
 // and the pool has been idle, both lanes fire at once (race_hedge_after_ms,
 // 0 by default) and the first byte wins: costs a second inference, but the
 // pool has the headroom. otherwise the configured hedge delay applies.
-// hedge_after_ms -1 disables hedging, 0 means the 2s default.
+// hedge_after_ms -1 disables hedging, 0 means the 800ms default: slow
+// exits stall every attempt, so the second lane must fire early. the extra
+// inference spend only lands on sends with no first byte yet.
 func hedgeDelay() time.Duration {
 	if share, threshold := lanesIdleEnough(); share < threshold {
 		ms := cfg().Zen.RaceHedgeAfterMs
@@ -879,7 +886,7 @@ func hedgeDelay() time.Duration {
 		return 0 // -1 disables hedging entirely
 	}
 	if ms == 0 {
-		return 2 * time.Second
+		return 800 * time.Millisecond
 	}
 	return time.Duration(ms) * time.Millisecond
 }

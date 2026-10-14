@@ -451,7 +451,13 @@ func refreshBenchmarks() {
 	}
 	rows, stamp, err := fetchBenchmarks(c.URL)
 	if err != nil {
-		// keep whatever we had; a proxy must still route without scores.
+		// stale cache beats no scores; at boot there is no previous
+		// index to keep. a proxy must still serve without the network.
+		if ix := readAACache(path, 0); ix != nil {
+			setBenchIndex(ix, err)
+			log.Printf("WARN: benchmarks fetch failed, using stale cache: %v", err)
+			return
+		}
 		setBenchIndex(nil, err)
 		log.Printf("WARN: benchmarks fetch failed, keeping previous: %v", err)
 		return
