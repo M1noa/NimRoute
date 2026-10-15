@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2568,6 +2569,134 @@ func injectHelpfulLine(body *[]byte) {
 	*body = b
 }
 
+// b64Head decodes the first quads of a base64 payload: enough bytes to
+// sniff an image signature without decoding a megabyte payload.
+func b64Head(payload string) []byte {
+	n := len(payload)
+	if n > 64 {
+		n = 64
+	}
+	n -= n % 4
+	hb, err := base64.StdEncoding.DecodeString(payload[:n])
+	if err != nil {
+		return nil
+	}
+	return hb
+}
+
+// sniffImageMime reports the real image format from the magic bytes: a
+// client's data-url label is a claim, and providers hard-fail on a
+// label/bytes mismatch (a png declared image/jpeg comes back as "Provider
+// returned error" 400, which the client then retries blindly).
+func sniffImageMime(b []byte) string {
+	if len(b) >= 8 && string(b[:8]) == "\x89PNG\r\n\x1a\n" {
+		return "image/png"
+	}
+	if len(b) >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(b) >= 6 && (string(b[:6]) == "GIF87a" || string(b[:6]) == "GIF89a") {
+		return "image/gif"
+	}
+	if len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP" {
+		return "image/webp"
+	}
+	return ""
+}
+
+// fixDataURLMimes rewrites image parts whose declared type disagrees with
+// the payload: openai-style image_url (string or {url}) and anthropic-style
+// image{source{base64}} blocks both end up here. non-image content and
+// unknown signatures pass untouched; only the label moves, never the bytes.
+func fixDataURLMimes(body *[]byte) {
+	if len(*body) == 0 {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(*body, &m); err != nil {
+		return
+	}
+	msgs, ok := m["messages"].([]any)
+	if !ok {
+		return
+	}
+	changed := false
+	for _, raw := range msgs {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, praw := range parts {
+			pm, ok := praw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch pm["type"] {
+			case "image_url", "input_image":
+				var cur map[string]any
+				var url string
+				switch iu := pm["image_url"].(type) {
+				case string:
+					url = iu
+				case map[string]any:
+					cur = iu
+					url, _ = iu["url"].(string)
+				default:
+					continue
+				}
+				rest, ok := strings.CutPrefix(url, "data:image/")
+				if !ok {
+					continue
+				}
+				decl, payload, ok := strings.Cut(rest, ";base64,")
+				if !ok {
+					continue
+				}
+				mime := sniffImageMime(b64Head(payload))
+				if mime == "" || mime == "image/"+decl {
+					continue
+				}
+				newURL := "data:" + mime + ";base64," + payload
+				if cur != nil {
+					cur["url"] = newURL
+					pm["image_url"] = cur
+				} else {
+					pm["image_url"] = map[string]any{"url": newURL}
+				}
+				changed = true
+			case "image":
+				src, ok := pm["source"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, _ := src["type"].(string); t != "base64" {
+					continue
+				}
+				data, _ := src["data"].(string)
+				mime := sniffImageMime(b64Head(data))
+				mt, _ := src["media_type"].(string)
+				if mime == "" || mt == mime {
+					continue
+				}
+				src["media_type"] = mime
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	*body = b
+}
+
 // injectDiscloseLine prepends the anonymize notice to the system prompt so
 // the model treats masks as verbatim placeholders. runs before anonymize
 // so any terms inside the notice itself get masked too.
@@ -3222,6 +3351,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		injectParams(&body)
 	}
 	injectHelpfulLine(&body)
+	fixDataURLMimes(&body)
 
 	// mask pii before anything upstream sees the body; the wrapped
 	// writer restores surrogates on every response path below. the

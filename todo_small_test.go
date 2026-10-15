@@ -1352,3 +1352,87 @@ func TestDialDeadLadderStopsImmediately(t *testing.T) {
 		t.Fatalf("dead exit dialed %d times, want 1 (ladder must stop after the first dial-dead)", n)
 	}
 }
+
+// owner boundary: laneRotate owns "two consecutive 429s on the same pin
+// refuse the model". it burns the exit for the model after the second
+// strike; laneTouch's success resets the strike so a merely busy exit
+// never accumulates a burn.
+func TestLaneRotateBurnsOnSecondConsec429(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.PoolRefresh429s = 0 // noteRateLimit must not fire an async refresh
+	useConfig(t, c)
+	const pin = "http://10.9.9.9:9"
+	const model = "opencode/test-burn-model"
+	l := &zenLane{id: "burntest", session: zenSession(), proxy: pin}
+	lanesMu.Lock()
+	lanes["burntest"] = l
+	lanesMu.Unlock()
+
+	laneRotate(l, model)
+	if exitBurned(pin, model) {
+		t.Fatal("one 429 must not burn the exit")
+	}
+	laneTouch(l, pin, model) // a success resets the strike
+	laneRotate(l, model)
+	if exitBurned(pin, model) {
+		t.Fatal("a success between limits must reset the strike count")
+	}
+	laneRotate(l, model)
+	if !exitBurned(pin, model) {
+		t.Fatal("two consecutive 429s must burn the exit for the model")
+	}
+}
+
+// owner boundary: lanePinCrowded owns "cold-start single-exit pins must
+// not bottleneck the whole table": 3+ lanes holding one pin with an
+// untaken pool exit is crowded, and laneProxyFor spreads the newcomer
+// onto the spare. below the threshold and on a thin pool, pairs share.
+func TestLanePinCrowdedSpreadsToSpare(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	const pin = "http://10.0.0.1:1"
+	ls := make([]*zenLane, 3)
+	for i := range ls {
+		l := &zenLane{id: fmt.Sprintf("crowd%d", i), session: zenSession(), proxy: pin, lastUsed: time.Now()}
+		ls[i] = l
+		lanesMu.Lock()
+		lanes[l.id] = l
+		lanesMu.Unlock()
+	}
+	if !lanePinCrowded(pin) {
+		t.Fatal("3 lanes on one pin with an untaken spare must be crowded")
+	}
+	if got := laneProxyFor(ls[0], "opencode/big-pickle"); got != "http://10.0.0.2:2" {
+		t.Fatalf("crowded pin must spread onto the untaken spare, got %q", got)
+	}
+
+	// below the threshold: pairs share, no re-pinning churn
+	lanesMu.Lock()
+	delete(lanes, "crowd2")
+	lanesMu.Unlock()
+	if lanePinCrowded(pin) {
+		t.Fatal("2 lanes on one pin must stay put (hysteresis)")
+	}
+
+	// thin pool: the spare is taken or absent, so stays crowded-free
+	ls[2].proxy = "http://10.0.0.3:3"
+	zenProxiesMu.Lock()
+	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2", "http://10.0.0.3:3"}
+	zenProxiesMu.Unlock()
+	lanesMu.Lock()
+	lanes["crowd2"] = ls[2]
+	lanesMu.Unlock()
+	if lanePinCrowded("http://10.0.0.3:3") {
+		t.Fatal("every pool exit taken means nothing is crowded")
+	}
+}

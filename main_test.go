@@ -3799,3 +3799,106 @@ func TestZenBallastMatchesScript(t *testing.T) {
 		}
 	}
 }
+
+// owner boundary: fixDataURLMimes owns the rule "the label must match the
+// bytes". a png declared image/jpeg 400s at the provider ("Provider
+// returned error"), so the proxy repairs the label from the magic bytes
+// before the body ships. only the label moves, never the bytes.
+func TestFixDataURLMimes(t *testing.T) {
+	const pngB64 = "iVBORw0KGgo="  // 8-byte png signature
+	const jpegB64 = "/9j/"         // 3-byte jpeg signature soi
+	const gifB64 = "R0lGODlh"      // gif89a prefix, 6 bytes
+	const webpB64 = "UklGRiQAAABY" // RIFF....WEBP, 12 bytes
+	const junkB64 = "AAAA"         // 3 zero bytes: no known signature
+
+	fix := func(body string) string {
+		b := []byte(body)
+		fixDataURLMimes(&b)
+		return string(b)
+	}
+
+	// openai map form: jpeg label on png bytes -> image/png
+	in := `{"model":"x","stream":true,"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,` + pngB64 + `","detail":"high"}},` +
+		`{"type":"text","text":"hi"}]}]}`
+	out := fix(in)
+	var m map[string]any
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("rewritten body is not json: %v", err)
+	}
+	block := m["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	iu := block["image_url"].(map[string]any)
+	if u, _ := iu["url"].(string); u != "data:image/png;base64,"+pngB64 {
+		t.Fatalf("map form label not repaired: %q", u)
+	}
+	if iu["detail"] != "high" {
+		t.Fatalf("sibling keys must survive: %v", iu)
+	}
+	if m["model"] != "x" || m["stream"] != true {
+		t.Fatal("body keys must survive the rewrite")
+	}
+	txt := m["messages"].([]any)[0].(map[string]any)["content"].([]any)[1].(map[string]any)["text"].(string)
+	if txt != "hi" {
+		t.Fatalf("non-image content mutated: %q", txt)
+	}
+	// idempotent
+	if again := fix(out); again != out {
+		t.Fatalf("second pass changed the body:\n%s\n%s", out, again)
+	}
+
+	// openai string form: repaired into the map form
+	out = fix(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/jpeg;base64,` + pngB64 + `"}]}]}`)
+	block = m2FirstBlock(t, out)
+	iu, ok := block["image_url"].(map[string]any)
+	if !ok {
+		t.Fatalf("string form must become a map when repaired: %v", block["image_url"])
+	}
+	if u, _ := iu["url"].(string); u != "data:image/png;base64,"+pngB64 {
+		t.Fatalf("string form label not repaired: %q", u)
+	}
+
+	// correct labels stay untouched, byte for byte
+	correct := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,` + jpegB64 + `"}},{"type":"image_url","image_url":"data:image/gif;base64,` + gifB64 + `"},{"type":"image_url","image_url":{"url":"data:image/webp;base64,` + webpB64 + `"}}]}]}`
+	if out := fix(correct); out != correct {
+		t.Fatalf("correct labels must not be touched:\n%s\n%s", correct, out)
+	}
+
+	// unknown signature: untouched (may be svg or a format the sniffer
+	// does not know; rewriting it would be a guess)
+	unknown := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,` + junkB64 + `"}}]}]}`
+	if out := fix(unknown); out != unknown {
+		t.Fatalf("unknown signature must pass through:\n%s\n%s", unknown, out)
+	}
+
+	// anthropic-style base64 source blocks posted to an openai path
+	anthropic := `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"` + pngB64 + `"}}]}]}`
+	out = fix(anthropic)
+	var am map[string]any
+	if err := json.Unmarshal([]byte(out), &am); err != nil {
+		t.Fatalf("anthropic body is not json: %v", err)
+	}
+	src := am["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)["source"].(map[string]any)
+	if mt, _ := src["media_type"].(string); mt != "image/png" {
+		t.Fatalf("anthropic media_type not repaired: %q", mt)
+	}
+	// and a correct anthropic label stays untouched
+	anthropicOK := `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngB64 + `"}}]}]}`
+	if out := fix(anthropicOK); out != anthropicOK {
+		t.Fatalf("correct anthropic label must not be touched:\n%s\n%s", anthropicOK, out)
+	}
+
+	// non-image bodies leave byte-identical
+	plain := `{"model":"x","messages":[{"role":"user","content":"hi"}]}`
+	if out := fix(plain); out != plain {
+		t.Fatalf("body without images must not be re-marshalled:\n%s\n%s", plain, out)
+	}
+}
+
+func m2FirstBlock(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		t.Fatalf("body is not json: %v", err)
+	}
+	return m["messages"].([]any)[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+}

@@ -29,6 +29,10 @@ type zenLane struct {
 	lastUsed  time.Time
 	requests  int
 	rateLimit int
+	// consec429 counts consecutive limit events on this lane; laneTouch
+	// clears it on success. two in a row burns the pin for that model:
+	// one 429 is the exit being busy, two means it refuses the model.
+	consec429 int
 	// limitedSince stamps the first of a consecutive run of limits; a
 	// success clears it. a run lasting past stale_pool_secs marks the
 	// pool stale (refresh + session rotation).
@@ -839,8 +843,10 @@ func sharedLaneLocked() *zenLane {
 // laneRotate swaps the lane onto a fresh exit + session after any limit or
 // identity block. the old exit keeps serving other lanes; this lane never
 // waits, it just moves. stamps limitedSince so a run of consecutive limits
-// past stale_pool_secs trips the stale-pool refresh. returns the new
-// session id.
+// past stale_pool_secs trips the stale-pool refresh. a second consecutive
+// 429 on this lane burns the pin for this model: one 429 is the exit being
+// busy, two means it refuses this model, and pickLaneProxyFor would keep
+// re-picking the same fast exit otherwise. returns the new session id.
 func laneRotate(l *zenLane, model string) string {
 	lanesMu.Lock()
 	l.rateLimit++
@@ -849,7 +855,12 @@ func laneRotate(l *zenLane, model string) string {
 	}
 	l.session = zenSession()
 	l.lastUsed = time.Now()
+	l.consec429++
+	strikes, pin := l.consec429, l.proxy
 	lanesMu.Unlock()
+	if strikes >= 2 {
+		burnExit(pin, model)
+	}
 	laneReproxy(l, model)
 	noteRateLimit()
 	return laneSession(l)
@@ -966,6 +977,7 @@ func laneTouch(l *zenLane, proxy, model string) {
 	defer lanesMu.Unlock()
 	l.lastUsed = time.Now()
 	l.limitedSince = time.Time{}
+	l.consec429 = 0
 	l.requests++
 	if proxy != "" {
 		l.proxy = proxy
@@ -1608,10 +1620,51 @@ func laneProxyFor(l *zenLane, model string) string {
 	escalated := l.escalated
 	lanesMu.Unlock()
 	if p != "" && !exitBurned(p, model) && !exitLongBurned(p) && !exitTLSBanned(p) {
+		// a cold start pins every lane to the one exit the verify sweep
+		// published first. the pin stays valid forever after, so without
+		// rebalancing the whole table rides one ip while 12 others sit
+		// unused. spread when the pin is crowded and a spare exists.
+		if lanePinCrowded(p) {
+			return laneReproxy(l, model)
+		}
 		return p
 	}
 	if !cfg().Zen.AlwaysProxy && !escalated {
 		return ""
 	}
 	return laneReproxy(l, model)
+}
+
+// lanePinCrowded reports whether pin is held by 3+ lanes and some pool exit
+// is untaken. the 3 threshold (not 2) leaves hysteresis: with a pool
+// thinner than the lane count a pair must share, and re-picking on every
+// request would thrash them between the same two exits.
+func lanePinCrowded(pin string) bool {
+	lanesMu.Lock()
+	n := 0
+	for _, l := range lanes {
+		if l.proxy == pin {
+			n++
+		}
+	}
+	lanesMu.Unlock()
+	if n < 3 {
+		return false
+	}
+	used := map[string]bool{}
+	lanesMu.Lock()
+	for _, l := range lanes {
+		if l.proxy != "" {
+			used[l.proxy] = true
+		}
+	}
+	lanesMu.Unlock()
+	zenProxiesMu.RLock()
+	defer zenProxiesMu.RUnlock()
+	for _, p := range zenProxies {
+		if !used[p] {
+			return true
+		}
+	}
+	return false
 }
