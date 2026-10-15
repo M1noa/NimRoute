@@ -159,6 +159,69 @@ def models_status(d, limit):
     return Group(cap, Text(""), bench_table(rows))
 
 
+def bench_index(d):
+    """Build an id->row lookup for the status tables.
+
+    /status keys the benchmark rows by *catalog* id, but the menu lists
+    *serving* ids, and the two differ for models the catalog carries no
+    entry for (an unlisted zen id has no catalog key, while the same model
+    is keyed under its portal id). fall back to the bare model core so a
+    score that exists still shows, dimmed to mark the weaker join.
+    """
+    rows = (d.get("benchmarks") or {}).get("models") or []
+    by_id = {r.get("id"): r for r in rows}
+
+    def get(full):
+        r = by_id.get(full)
+        if r:
+            return r
+        core = _model_core(full)
+        for k, v in by_id.items():
+            if _model_core(k) == core:
+                v = dict(v)
+                v["match"] = "alias"
+                return v
+        return None
+    return get
+
+
+def _model_core(mid):
+    """bare model id: provider prefix dropped, dots folded, free/portal
+    suffixes trimmed. 'nous/stepfun/step-5-preview:free' -> 'step-5-preview'."""
+    core = (mid or "").rsplit("/", 1)[-1].replace(".", "-").lower()
+    for suf in (":free", "-free"):
+        if core.endswith(suf) and len(core) > len(suf):
+            core = core[: -len(suf)]
+    return core
+
+
+def score_cell(r):
+    """Benchmark score for one /v1/models row: aa's intelligence index, or a
+    muted dash when aa has no row for the model."""
+    if not r or not r.get("intelligence_index"):
+        return Text("·", style="dim")
+    kind = r.get("match") or ""
+    # "alias" means the renderer joined by model core, not that go matched
+    # it that way, so it stays dimmed.
+    style = "bold white" if kind == "exact" else "dim"
+    return Text("%.1f" % r["intelligence_index"], style=style)
+
+
+def bench_line(d):
+    """One-line benchmark caption for the status menu. Absent when the
+    section is redacted (unauthenticated + auth.tokens) or the flag is off,
+    which StatusFor already handles server-side."""
+    b = d.get("benchmarks") or {}
+    if not b.get("enabled") or not b.get("models"):
+        return None
+    best = b["models"][0]  # /status sorts the rows best-first
+    served = b.get("served_scored", 0)
+    return "benchmarks %d scored (%d catalog + %d unlisted) · %d aa models · best %s %.1f" % (
+        b.get("matched", 0) + served, b.get("matched", 0), served,
+        b.get("aa_models", 0), best.get("id", "?"),
+        best.get("intelligence_index") or 0)
+
+
 def plain_status(d):
     c = []
     c.append("NimRoute %s | up %s | load %d/%d" % (
@@ -172,6 +235,9 @@ def plain_status(d):
     p = d.get("pool") or {}
     c.append("pool %d verified, %d dropped" % (
         p.get("verified", 0), p.get("dropped_total", 0)))
+    bl = bench_line(d)
+    if bl:
+        c.append(bl)
     st = jsonl_stats()
     since = " since " + st["since"] if st["since"] else ""
     c.append("today %s req, %s tok · all-time %s req, %s tok%s" % (
@@ -389,9 +455,10 @@ def build_renderable(d, stats):
         cols.append(("nous", ["nous/" + m for m in nous_models]))
     if cols:
         by_model = (d.get("usage") or {}).get("by_model") or {}
+        bench = bench_index(d)
         t = Table(show_header=True, header_style="bold", box=box.SIMPLE, pad_edge=False)
-        for label in ("model", "state", "req", "err", "tokens", "tok/s*"):
-            t.add_column(label, justify="right" if label in ("req", "err", "tokens", "tok/s*") else "left")
+        for label in ("model", "score", "state", "req", "err", "tokens", "tok/s*"):
+            t.add_column(label, justify="right" if label in ("score", "req", "err", "tokens", "tok/s*") else "left")
         for name, models in cols:
             for val in models:
                 # every row is one full id: provider and model never split,
@@ -400,10 +467,14 @@ def build_renderable(d, stats):
                 full = val if "/" in val else name + "/" + val
                 totals = model_totals(by_model, full) or {}
                 t.add_row(Text(full, style=PROVIDER_STYLES.get(name, "dim")),
-                          health_cell(health, full), str(totals.get("requests", 0)),
+                          score_cell(bench(full)), health_cell(health, full),
+                          str(totals.get("requests", 0)),
                           str(totals.get("errors", 0)), tok_cell(by_model, full), tps_cell(by_model, full))
         parts.append(t)
         parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
+    bl = bench_line(d)
+    if bl:
+        parts.append(Text(bl, style="dim"))
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
         line = Text()
         line.append("%s freepi:%s  " % (mark, name),

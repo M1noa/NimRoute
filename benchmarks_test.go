@@ -85,6 +85,9 @@ func TestStripModelVariants(t *testing.T) {
 		{"gemma-4", "gemma-4"},
 		// double suffix: -reasoning on top of a variant.
 		{"deepseek-v4-flash-free", "deepseek-v4-flash"},
+		// opencode's free-tier branding: the model is muse-spark 1.3.
+		{"muse-spark-1-3-contributor", "muse-spark-1-3"},
+		{"muse-spark-1-3-contributor-free", "muse-spark-1-3"},
 	}
 	for _, c := range cases {
 		if got := stripModelVariants(c.in); got != c.want {
@@ -613,5 +616,63 @@ func TestRefreshFallsBackToStaleCache(t *testing.T) {
 	}
 	if benchLastError() == "" {
 		t.Error("benchmarks error must be recorded alongside the stale index")
+	}
+}
+
+// TestBenchSummaryScoresServedIDs pins the gap that made the status menu
+// lie by omission: /v1/models lists serving ids (unlisted zen models,
+// antseed sellers) that have no catalog key, and only walking the catalog
+// left their cells blank even though AA scored the model.
+// owner boundary: buildBenchSummary owns the id set it scores.
+func TestBenchSummaryScoresServedIDs(t *testing.T) {
+	c := defaultConfig()
+	c.Benchmarks.Enabled = true
+	applyConfig(&c)
+	defer func() {
+		reset := defaultConfig()
+		applyConfig(&reset)
+	}()
+
+	setModelInfo(map[string]modelInfoEntry{
+		"opencode/known-free": {Ctx: 200000},
+	})
+	setBenchIndex(buildAAIndex([]aaRow{
+		{Slug: "known-free", IntelligenceIndex: ptr(30.0)},
+		// the unlisted zen id and the antseed seller both strip to these.
+		{Slug: "unlisted-zen-model", IntelligenceIndex: ptr(41.0)},
+		{Slug: "antseed-seller-model", IntelligenceIndex: ptr(12.0)},
+	}, "2026-10-13T00:00:00Z"), nil)
+	defer func() {
+		setBenchIndex(nil, nil)
+		setModelInfo(nil)
+	}()
+
+	ocInfo.Store(&OpencodeInfo{Enabled: true, Models: []string{"opencode/unlisted-zen-model-free"}})
+	antMu2.Lock()
+	antModels = []string{"antseed-seller-model"}
+	antMu2.Unlock()
+	defer func() {
+		ocInfo.Store(&OpencodeInfo{})
+		antMu2.Lock()
+		antModels = nil
+		antMu2.Unlock()
+	}()
+
+	s := buildBenchSummary()
+	got := map[string]string{}
+	for _, r := range s.Models {
+		got[r.ID] = r.Match
+	}
+	if s.Matched != 1 || s.Served != 2 {
+		t.Fatalf("matched=%d served=%d, want 1 and 2", s.Matched, s.Served)
+	}
+	for id, want := range map[string]string{
+		"opencode/known-free":              "slug",
+		"opencode/unlisted-zen-model-free": "served",
+		"antseed/antseed-seller-model":     "served",
+	} {
+		if got[id] != want {
+			t.Errorf("%s: match=%q, want %q (rows: %v)", id, got[id], want, got)
+		}
 	}
 }

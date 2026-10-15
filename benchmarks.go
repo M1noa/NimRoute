@@ -253,6 +253,8 @@ var modelVariants = []string{
 	"-default-fallback", "-non-reasoning", "-reasoning", "-thinking",
 	"-xhigh", "-high", "-medium", "-low", "-minimal", "-max",
 	"-preview", "-latest", "-vision", "-vl", "-free",
+	// opencode's free-tier branding: same muse-spark 1.3 weights upstream.
+	"-contributor",
 }
 
 // stripModelVariants removes serving suffixes from a normalized id. the core
@@ -568,17 +570,20 @@ type benchRow struct {
 }
 
 type benchSummary struct {
-	Enabled   bool       `json:"enabled"`
-	Source    string     `json:"source_url,omitempty"`
-	Updated   string     `json:"updated_at,omitempty"`
-	Fetched   string     `json:"fetched_at,omitempty"`
-	Age       string     `json:"age,omitempty"`
-	AAModels  int        `json:"aa_models"`
-	Matched   int        `json:"matched"`
-	Unmatched int        `json:"unmatched"`
-	Count     int        `json:"count"`
-	Error     string     `json:"error,omitempty"`
-	Models    []benchRow `json:"models,omitempty"`
+	Enabled   bool   `json:"enabled"`
+	Source    string `json:"source_url,omitempty"`
+	Updated   string `json:"updated_at,omitempty"`
+	Fetched   string `json:"fetched_at,omitempty"`
+	Age       string `json:"age,omitempty"`
+	AAModels  int    `json:"aa_models"`
+	Matched   int    `json:"matched"`
+	Unmatched int    `json:"unmatched"`
+	// Served is the extra rows scored for ids /v1/models lists that carry
+	// no catalog key (unlisted zen ids, antseed sellers).
+	Served int        `json:"served_scored"`
+	Count  int        `json:"count"`
+	Error  string     `json:"error,omitempty"`
+	Models []benchRow `json:"models,omitempty"`
 }
 
 // benchBackends are the id prefixes the backends list under. note the
@@ -653,9 +658,65 @@ func buildBenchSummary() *benchSummary {
 			AASlug:  m.Row.Slug,
 		})
 	}
+	// ids a client can call but the catalog has no entry for: an unlisted
+	// zen model or an antseed seller still deserves its score, and the
+	// menu lists them next to the catalog entries.
+	known := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		known[k] = true
+	}
+	for _, id := range servedBenchIDs(known) {
+		m := benchFor(id)
+		if !m.ok() {
+			continue
+		}
+		s.Served++
+		s.Models = append(s.Models, benchRow{
+			ID:      id,
+			Name:    modelName(id),
+			Backend: benchBackendOf(id),
+			Intel:   round2(m.index()),
+			Ctx:     modelCtx(id),
+			MaxOut:  modelMaxOut(id),
+			Match:   "served",
+			AASlug:  m.Row.Slug,
+		})
+	}
+
 	s.Count = len(s.Models)
 	sortBenchRows(s.Models)
 	return s
+}
+
+// servedBenchIDs lists the ids /v1/models serves outside the catalog:
+// the cached zen list, every freepi account's models, and the antseed
+// sellers. known is the catalog key set, mutated to dedupe.
+func servedBenchIDs(known map[string]bool) []string {
+	var out []string
+	add := func(id string) {
+		if id == "" || known[id] {
+			return
+		}
+		known[id] = true
+		out = append(out, id)
+	}
+	if info := ocInfo.Load(); info != nil {
+		for _, m := range info.Models {
+			add(m)
+		}
+	}
+	for _, fa := range freepiAccounts() {
+		for _, m := range freepiModels(fa) {
+			add("freeepi/" + m)
+		}
+	}
+	antMu2.Lock()
+	for _, m := range antModels {
+		add("antseed/" + m)
+	}
+	antMu2.Unlock()
+	sort.Strings(out)
+	return out
 }
 
 // sortBenchRows orders by score desc, then id. only matched rows reach the
