@@ -88,9 +88,9 @@ class RendererTests(unittest.TestCase):
     def test_plain_status_shows_backend_load_and_capacity(self):
         with mock.patch.object(status, "jsonl_stats", return_value=self.stats):
             out = status.plain_status(self.data)
-        self.assertIn("opencode 30", out)
-        self.assertIn("30/30", out)
-        self.assertIn("nim lanes", out)
+        self.assertIn("load 30/30", out)
+        self.assertIn("opencode 12 exits (0 rate-limited, 0 dead)", out)
+        self.assertIn("3.0k tok served", out)
 
     def test_rich_status_fits_normal_terminal_and_has_single_model_table(self):
         if not status.RICH:
@@ -100,8 +100,7 @@ class RendererTests(unittest.TestCase):
             out = io.StringIO()
             Console(file=out, width=width, color_system=None).print(status.build_renderable(self.data, self.stats))
             text = out.getvalue()
-            self.assertIn("opencode 30", text)
-            self.assertIn("nim lanes", text)
+            self.assertIn("opencode 12 exits (0 rate-limited, 0 dead)", text)
             self.assertLess(len(text.splitlines()), 35)
             self.assertTrue(all(len(line) <= width for line in text.splitlines()))
 
