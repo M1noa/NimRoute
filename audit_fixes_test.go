@@ -381,3 +381,83 @@ func TestDumpIfErrPrunesAndWrites(t *testing.T) {
 		t.Fatalf("%d files after one dump over the cap, want %d", len(ents), traceMaxDumps)
 	}
 }
+
+// snapBody tees the stream, and a handler may reach Read and Close from
+// different goroutines (streaming responses are drained by a copy loop
+// while the transport closes on cancel). finish must stamp the hop
+// exactly once under that interleaving.
+func TestSnapBodyFinishIsRaceFree(t *testing.T) {
+	tr := &traceRec{}
+	hop := &traceHop{}
+	payload := []byte("data: {\"x\":1}\n\n")
+	src := bytes.NewReader(payload)
+	body := &snapBody{tr: tr, hop: hop, r: io.NopCloser(src), c: io.NopCloser(src)}
+
+	var wg sync.WaitGroup
+	// one drainer: two readers on one body is not the contract, and
+	// bytes.Reader itself is not safe for concurrent Read.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 8)
+		for {
+			if _, err := body.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	// concurrent closers: transport cancel lands on Close while the copy
+	// loop is still reading. whichever of Read's EOF and Close arrives
+	// first finalizes the hop, so the outcome there is scheduling, not
+	// contract: only once-only is contract.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			body.Close()
+		}()
+	}
+	wg.Wait()
+
+	tr.mu.Lock()
+	n := len(tr.Hops)
+	tr.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("trace recorded %d hops, want exactly 1", n)
+	}
+}
+
+// once the drain reaches EOF the tee holds the whole body, and a later
+// Close must not overwrite or duplicate the hop.
+func TestSnapBodyRecordsFullBodyOnEOF(t *testing.T) {
+	tr := &traceRec{}
+	hop := &traceHop{}
+	payload := []byte("data: {\"x\":1}\n\ndata: [DONE]\n\n")
+	src := bytes.NewReader(payload)
+	body := &snapBody{tr: tr, hop: hop, r: io.NopCloser(src), c: io.NopCloser(src)}
+
+	buf := make([]byte, 4096)
+	for {
+		if _, err := body.Read(buf); err != nil {
+			break
+		}
+	}
+	// closers after EOF, as a transport cancel would.
+	for i := 0; i < 4; i++ {
+		body.Close()
+	}
+
+	tr.mu.Lock()
+	n := len(tr.Hops)
+	got := ""
+	if n > 0 {
+		got = tr.Hops[0].RespBody
+	}
+	tr.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("trace recorded %d hops, want exactly 1", n)
+	}
+	if got != string(payload) {
+		t.Fatalf("hop body = %d bytes, want %d (the full teed stream)", len(got), len(payload))
+	}
+}

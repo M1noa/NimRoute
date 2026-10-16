@@ -136,10 +136,15 @@ func TestNousCatalogKeepsLastGoodOnFailure(t *testing.T) {
 		t.Fatal("fixture fetch returned nothing")
 	}
 	srv.Close()
-	// force a refetch against the dead server
+	// force a refetch against the dead server. arm the backoff so the
+	// assertion reads the cached list instead of racing a background
+	// goroutine on nousBase while this test's cleanup restores it.
 	nousCatMu.Lock()
 	nousCatAt = time.Now().Add(-2 * nousCatalogTTL)
 	nousCatMu.Unlock()
+	nousCatalogBackoff.Lock()
+	nousCatalogBackoff.next = time.Now().Add(time.Hour)
+	nousCatalogBackoff.Unlock()
 
 	if len(nousFreeModels()) == 0 {
 		t.Fatal("dead portal emptied the cached free list")
@@ -401,30 +406,46 @@ func TestNousStatusGating(t *testing.T) {
 	}
 }
 
-// nousFreeModels must never put a 10s upstream GET on the /status path: a
-// cold cache returns what it has and refetches in the background.
+// nousFreeModels must never put a 10s upstream GET on the /status path a
+// stale or cold cache serves what it holds and refetches in the
+// background. the backoff gate is armed here so the assertion exercises
+// the serve-cached path without racing a live goroutine on nousBase.
 func TestNousFreeModelsDoesNotBlock(t *testing.T) {
 	resetNous(t)
-	// unreachable base: a synchronous fetch would take the 10s client
-	// timeout, so anything under a second proves the path is async.
+	nousCatalogBackoff.Lock()
+	nousCatalogBackoff.next = time.Now().Add(time.Hour)
+	nousCatalogBackoff.Unlock()
+	// a hanging upstream: a synchronous call would block on the client
+	// timeout, so a fast return proves the fetch is off this path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
 	old := nousBase
-	nousBase = "http://127.0.0.1:1/v1"
+	nousBase = srv.URL
 	t.Cleanup(func() { nousBase = old })
 
 	start := time.Now()
 	got := nousFreeModels()
 	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("nousFreeModels blocked for %v on a dead portal", d)
+		t.Fatalf("nousFreeModels blocked for %v on a hanging portal", d)
 	}
 	if len(got) != 0 {
-		t.Fatalf("cold cache returned %d models, want 0 until the fetch lands", len(got))
+		t.Fatalf("cold cache returned %d models, want none until a fetch lands", len(got))
 	}
-	// the backoff gate holds: a second call does not kick another fetch.
-	done := make(chan struct{})
-	go func() { nousFreeModels(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("second nousFreeModels call blocked")
+	// a /status poll loop must not stack fetches either.
+	for i := 0; i < 5; i++ {
+		start = time.Now()
+		if m := nousFreeModels(); len(m) != 0 {
+			t.Fatalf("poll %d returned %d models, want the cached empty list", i, len(m))
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("poll %d took %v", i, d)
+		}
 	}
 }
