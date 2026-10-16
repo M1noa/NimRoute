@@ -1,0 +1,989 @@
+{
+  "codebasePath": "/Users/minoa/Documents/Projects/NimRoute",
+  "startedAt": "2026-10-16T00:48:21.142Z",
+  "batchSize": 5,
+  "filesPerHour": 150,
+  "totalLOC": 57458,
+  "files": [
+    {
+      "path": "config.go",
+      "loc": 1103,
+      "status": "done",
+      "priority": 0,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "qol",
+          "severity": "medium",
+          "line": 547,
+          "description": "yaml.Unmarshal without KnownFields silently ignores unknown/typo'd keys, so a mistyped knob (always_prox) no-ops with no warning",
+          "addedAt": "2026-10-16T00:51:01.878Z"
+        }
+      ],
+      "doneAt": "2026-10-16T00:51:01.902Z",
+      "skipReason": null
+    },
+    {
+      "path": "go.mod",
+      "loc": 16,
+      "status": "done",
+      "priority": 0,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "dependency",
+          "severity": "info",
+          "line": 0,
+          "description": "onnxruntime-purego pinned to a commit pseudo-version (v0.0.0-20260315...), so go get -u cannot track a release line for the -tags ner path"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "main.go",
+      "loc": 5475,
+      "status": "done",
+      "priority": 0,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "performance",
+          "severity": "high",
+          "line": 3652,
+          "description": "streaming NIM responses are buffered whole: the body is ReadAll'd (up to 128MB) and only then copied to the client, so a stream's first byte waits for the whole generation. pipe lastResp.Body for isStream and tee the usage tail only",
+          "addedAt": "2026-10-16T00:51:01.754Z"
+        },
+        {
+          "category": "performance",
+          "severity": "medium",
+          "line": 43,
+          "description": "upstreamBodyLimit 128MB x up to 16 in-flight slots = ~2GB peak, and debug mode keeps a second copy (respBodyBuf); the comment calls it a bound against memory exhaustion",
+          "addedAt": "2026-10-16T00:51:01.785Z"
+        },
+        {
+          "category": "improvement",
+          "severity": "low",
+          "line": 365,
+          "description": "lastKey/ModelLock stop inserting at 4096 distinct model ids and never evict, so stickiness and per-key model lockouts silently stop applying to new ids",
+          "addedAt": "2026-10-16T00:51:01.808Z"
+        }
+      ],
+      "doneAt": "2026-10-16T00:51:01.831Z",
+      "skipReason": null
+    },
+    {
+      "path": "anthropic.go",
+      "loc": 3005,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "antseed.go",
+      "loc": 1302,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "antseedp2p.go",
+      "loc": 1188,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "bad-code",
+          "severity": "info",
+          "line": 417,
+          "description": "uint16be panics on an oversized length instead of returning an error; fine while every call site is ours, but a peer-driven path would take the whole proxy down",
+          "addedAt": "2026-10-16T00:51:02.137Z"
+        }
+      ],
+      "doneAt": "2026-10-16T00:51:02.161Z",
+      "skipReason": null
+    },
+    {
+      "path": "benchmarks.go",
+      "loc": 733,
+      "status": "done",
+      "priority": 1,
+      "notes": "scanned: goroutines, timers, network calls, bounds",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "debugtrace.go",
+      "loc": 483,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [
+        {
+          "category": "performance",
+          "severity": "medium",
+          "line": 281,
+          "description": "--dbg-file writes one JSON per failed request (bodies included, 256KB/hop) into nimroute-debug/ with no count cap, size cap, rotation or pruning; docs/troubleshooting.md recommends it for 429 storms, i.e. the case that writes a file per failure"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "freepi.go",
+      "loc": 840,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "sloppy-code",
+          "severity": "low",
+          "line": 581,
+          "description": "freepiClientStatus keys off a substring of the error message rather than the parsed code field; it works only because freepiFetch appends (code X) to the text",
+          "addedAt": "2026-10-16T00:51:02.066Z"
+        }
+      ],
+      "doneAt": "2026-10-16T00:51:02.089Z",
+      "skipReason": null
+    },
+    {
+      "path": "modelinfo.go",
+      "loc": 380,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [
+        {
+          "category": "sloppy-code",
+          "severity": "low",
+          "line": 357,
+          "description": "globMatch locates pattern parts anywhere in order, unanchored: claude-* matches my-claude-x and a wildcard-free pattern matches any id containing it; backs route.exclude_models, claude_map and nudge overrides, which all over-match silently"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "nous.go",
+      "loc": 638,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "openrouter.go",
+      "loc": 589,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/custom.go",
+      "loc": 286,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/detect.go",
+      "loc": 275,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/fake.go",
+      "loc": 149,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/fetch_model.sh",
+      "loc": 39,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/isolation_test.go",
+      "loc": 122,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/ner_ort_test.go",
+      "loc": 32,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/ner_ort.go",
+      "loc": 371,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/ner_stub.go",
+      "loc": 11,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/pii_test.go",
+      "loc": 370,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/pii.go",
+      "loc": 285,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/scan.go",
+      "loc": 572,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/span.go",
+      "loc": 127,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/vault_test.go",
+      "loc": 90,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/vault.go",
+      "loc": 288,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/wordpiece_ref_test.go",
+      "loc": 75,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pii/wordpiece.go",
+      "loc": 538,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted scan: TTLs, caps, LRU eviction, sweep isolation",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "piiwiring.go",
+      "loc": 117,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "route.go",
+      "loc": 585,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "performance",
+          "severity": "medium",
+          "line": 76,
+          "description": "buildRouteTable re-unions every backend catalog per route request, per /v1/models hit and per 1Hz /status poll, and falls back to an uncached 10s-timeout GET /models on the request path when ocInfo is empty"
+        },
+        {
+          "category": "improvement",
+          "severity": "low",
+          "line": 424,
+          "description": "anthropic race path records every losing candidate's latency (openai-compat path at :323 records under `if won` and documents why), feeding the EWMA behind the latency strategy with losers"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "rtk.go",
+      "loc": 983,
+      "status": "done",
+      "priority": 1,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "rtkcompress.go",
+      "loc": 154,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "rtkdetect.go",
+      "loc": 51,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "usage.go",
+      "loc": 370,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "improvement",
+          "severity": "medium",
+          "line": 112,
+          "description": "outcomesByModel grows one 20-entry ring per client-chosen model id with no cap, while totals is capped at 4096 for exactly this reason; the health map is also serialized into /status, which clients poll continuously"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "zenlanes.go",
+      "loc": 2118,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": "2026-10-16T00:51:02.018Z",
+      "skipReason": null
+    },
+    {
+      "path": "zenproxy.go",
+      "loc": 1568,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "improvement",
+          "severity": "medium",
+          "line": 513,
+          "description": "verifyProxy treats every non-200 as a dead proxy, including 429/403 from the shared public key: a chat-capable exit that is busy on GET /models is written off for the whole sweep. an independent curl probe matched the same ~1-in-10 dial rate, so today's losses are real, but log the status mix to catch false negatives",
+          "addedAt": "2026-10-16T00:51:01.948Z"
+        }
+      ],
+      "doneAt": "2026-10-16T00:51:01.971Z",
+      "skipReason": null
+    },
+    {
+      "path": "zentools.go",
+      "loc": 26,
+      "status": "done",
+      "priority": 1,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [
+        {
+          "category": "bad-code",
+          "severity": "info",
+          "line": 22,
+          "description": "init panics on a malformed embedded ballast json; fail-fast on a build-time constant is defensible, noted because it is a hard crash in the serving binary and the ballast is load-bearing for the free-tier gate"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "antseed_test.go",
+      "loc": 224,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "audit_fixes_test.go",
+      "loc": 135,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "benchmarks_test.go",
+      "loc": 679,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "config_file_test.go",
+      "loc": 96,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "debugtrace_test.go",
+      "loc": 491,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "fidelity_test.go",
+      "loc": 133,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "freepi_errors_test.go",
+      "loc": 137,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "fuzz_test.go",
+      "loc": 75,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "lane_spread_test.go",
+      "loc": 278,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "lane_tokens_test.go",
+      "loc": 86,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "live_test.go",
+      "loc": 611,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "main_test.go",
+      "loc": 3886,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [
+        {
+          "category": "qol",
+          "severity": "low",
+          "line": 2570,
+          "description": "t.Skip(\"no verified pool available to escalate onto\") (and :2857, :639, todo_small_test.go:113) make a missing fixture read as a pass; the pool one guards the pin/rotation invariant the project rests on"
+        }
+      ],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "modelinfo_test.go",
+      "loc": 42,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "nous_test.go",
+      "loc": 400,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "pool_storm_test.go",
+      "loc": 588,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "regress_stream_nudge_test.go",
+      "loc": 290,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "route_test.go",
+      "loc": 190,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "stream_cancel_test.go",
+      "loc": 185,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "todo_small_test.go",
+      "loc": 1551,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "usage_test.go",
+      "loc": 124,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "zen_schema_test.go",
+      "loc": 549,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "zz_stalepin_test.go",
+      "loc": 67,
+      "status": "done",
+      "priority": 3,
+      "notes": "scanned: skip inventory (11 sites) + assertion strength",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "nimstatus.py",
+      "loc": 733,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/antseed_test.py",
+      "loc": 188,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/bench_proxy.py",
+      "loc": 113,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/cctest.py",
+      "loc": 126,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/freebuff_client.py",
+      "loc": 404,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/freebuff_login.py",
+      "loc": 96,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/freepi_login.py",
+      "loc": 135,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/freepi_probe.py",
+      "loc": 145,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/opencode_prompt.py",
+      "loc": 106,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/probe_zen_proxies.py",
+      "loc": 258,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/test_nimstatus.py",
+      "loc": 124,
+      "status": "done",
+      "priority": 5,
+      "notes": "targeted scan: secret printing, error handling, no shell/eval",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "system-prompts/system_prompts_leaks/Anthropic/claude-code/skills/dataviz/scripts/validate_palette.py",
+      "loc": 307,
+      "status": "skipped",
+      "priority": 5,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "system-prompts/system_prompts_leaks/Anthropic/claude-cowork/setup-writing-style/scripts/setup-writing-style-stylometry.py",
+      "loc": 530,
+      "status": "skipped",
+      "priority": 5,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": ".github/workflows/build.yml",
+      "loc": 100,
+      "status": "done",
+      "priority": 8,
+      "notes": "read in full (or every logic-bearing region)",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "scripts/opencode_ballast.json",
+      "loc": 413,
+      "status": "skipped",
+      "priority": 10,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": ".gitignore",
+      "loc": 63,
+      "status": "done",
+      "priority": 11,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": ".zenpool.json",
+      "loc": 1,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "aa_benchmarks.json",
+      "loc": 1,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "config.yml",
+      "loc": 392,
+      "status": "done",
+      "priority": 11,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "go.sum",
+      "loc": 17,
+      "status": "done",
+      "priority": 11,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "guardrails.json",
+      "loc": 8434,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "keys.jsonc",
+      "loc": 5,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "model_info.jsonc",
+      "loc": 140,
+      "status": "done",
+      "priority": 11,
+      "notes": "targeted review of the invariant-carrying regions",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": null
+    },
+    {
+      "path": "openrouter_models.json",
+      "loc": 1,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "system-prompts/guardrails.json",
+      "loc": 8361,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "system-prompts/leaked-system-prompts/.gitignore",
+      "loc": 17,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "system-prompts/system_prompts_leaks/.github/FUNDING.yml",
+      "loc": 4,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    },
+    {
+      "path": "testdata/cc_real_tool_schema.json",
+      "loc": 73,
+      "status": "skipped",
+      "priority": 11,
+      "notes": "",
+      "findings": [],
+      "doneAt": null,
+      "skipReason": "vendored/data artifact, not project code"
+    }
+  ],
+  "finishedAt": "2026-10-16T00:57:58.601Z"
+}
