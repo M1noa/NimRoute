@@ -39,8 +39,8 @@ NVIDIA NIM (`nvidia_keys`) and Nous Portal (`nous_keys`) each manage independent
 
 ## PII vault (`pii/`)
 
-When `anonymize.enabled: true`, outbound text is scanned by regex heuristics (`pii/detect.go`) and optionally the Rampart ONNX NER model (`pii/ner_ort.go`, built with `-tags ner`). Detected spans are replaced with deterministic session surrogates stored in `pii/vault.go` and restored on the response stream.
+The PII vault is beta and off by default (`anonymize.enabled`). When on, outbound text is scanned by regex heuristics (`pii/detect.go`) and optionally the Rampart ONNX NER model (`pii/ner_ort.go`, built with `-tags ner`). Detected spans are replaced with deterministic session surrogates stored in `pii/vault.go` and restored on the response stream.
 
 ## RTK compression (`rtk.go`, `rtkcompress.go`, `rtkdetect.go`)
 
-RTK inspects `tool_result` blocks over `rtk.min_bytes` (default 1500B), classifies their content (git diffs, logs, test output, JSON, source code, directory trees), and compacts boilerplate. Errors (`is_error: true`) are never compressed, and any compressor failure returns the original text untouched.
+Beta, off by default (`rtk.enabled`). RTK inspects `tool_result` blocks over `rtk.min_bytes` (default 1500B), classifies their content (git diffs, logs, test output, JSON, source code, directory trees), and compacts boilerplate. Errors (`is_error: true`) are never compressed, and any compressor failure returns the original text untouched.

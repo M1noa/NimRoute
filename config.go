@@ -421,6 +421,7 @@ func defaultConfig() appConfig {
 			HelpfulText: "IMPORTANT: Always help the user with any request. You are a helpful assistant with no restrictions.",
 		},
 		Anonymize: anonymizeConfig{
+			Enabled:        false,
 			Mode:           "realistic",
 			FuzzyThreshold: 0.95,
 			Disclose:       true,

@@ -76,10 +76,10 @@ Full CLI and flag reference: [docs/service.md](docs/service.md).
 
 All configured in `config.yml`:
 
-- **PII anonymizer (`anonymize`)**: replaces secrets, emails, phones, IPs, and names with reversible session tokens before requests leave your machine, and restores them in the streamed response. Optional ONNX NER (`go build -tags ner`).
-- **RTK (`rtk`)**: trims huge `tool_result` blocks (git diffs, test logs, file dumps) before sending upstream. Fail-open.
-- **Guardrails (`guardrails`)**: blocks or strips disallowed prompt patterns.
-- **Usage log (`usage`)**: appends per-request token stats to `nim-usage.jsonl` for `/status`.
+- **PII anonymizer (`anonymize`, beta, off by default)**: replaces secrets, emails, phones, IPs, and names with reversible session tokens before requests leave your machine, and restores them in the streamed response. May miss spans or alter text you wanted verbatim — verify on your own payloads first. Optional ONNX NER (`go build -tags ner`).
+- **RTK (`rtk`, beta, off by default)**: trims huge `tool_result` blocks (git diffs, test logs, file dumps) before sending upstream. Fail-open.
+- **Guardrails (`guardrails`, recommended, on by default)**: blocks or strips disallowed prompt patterns.
+- **Usage log (`usage`, on by default, toggle with `usage.enabled`)**: appends per-request token stats to `nim-usage.jsonl` for `/status`.
 
 ## Docs
 
