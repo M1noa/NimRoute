@@ -312,6 +312,16 @@ func parseFreepiErr(status int, body []byte, hdr http.Header) freepiErr {
 	return fe
 }
 
+// freepiFault is what a failed attempt or an exhausted fetch hands back: the
+// upstream status, its parsed code, and the client detail. the mapping keys on
+// Code, so rewording an upstream message cannot change what the client sees.
+type freepiFault struct {
+	Status    int    // upstream status, 0 for transport/local failures
+	Code      string // upstream code ("hourly_ceiling", ...), "" when absent
+	Msg       string // client detail; msgOf keeps the code visible here
+	Retryable bool   // another account or a resend can fix it
+}
+
 // freepiCatalogEntry is one model row from GET /client-version: the id is
 // the exact model string sent in completions, name carries the picker label
 // plus the usage multiplier ("GLM 5.3 Flash · ~0.7x usage").
@@ -469,17 +479,17 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 	}
 	acclog.Printf("%s routed to freepi model=%s", reqID, realModel)
 
-	_, rb, acct, status, ok := freepiFetch(r.Context(), r.Method, oaiBody, realModel)
+	_, rb, acct, fault, ok := freepiFetch(r.Context(), r.Method, oaiBody, realModel)
 	if !ok {
-		if status == 0 {
-			status = http.StatusBadGateway
+		if fault.Status == 0 {
+			fault.Status = http.StatusBadGateway
 		}
 		// the account's real fault and status reach the client: a 401 jwt
 		// or a 404 unknown model must not wear a generic 502. a rate limit
 		// does not: it is our account's cap, so it becomes a 503.
-		status, acct = freepiClientStatus(status, acct)
-		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
-		writeAnthropicError(w, status, "api_error", "freepi: "+acct)
+		status, errMsg := freepiClientStatus(fault)
+		acclog.Printf("!! freepi failed model=%s err=%q", realModel, errMsg)
+		writeAnthropicError(w, status, "api_error", "freepi: "+errMsg)
 		return
 	}
 	// fetch is always buffered (stream=false upstream), so both client
@@ -555,18 +565,20 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 // it is forwarded to the client with its status and detail instead of the
 // fetch loop retrying until the queue deadline.
 func freepiRetryable(fe freepiErr) bool {
-	switch {
-	case fe.Status == http.StatusTooManyRequests, fe.Status == http.StatusConflict:
-		return true
-	}
+	// the code decides before the status: the hourly cap can ride a 429 and
+	// no amount of queueing clears it.
 	switch fe.Code {
-	case "rate_limited", "concurrent_session", "ads_required":
-		return true
 	case "hourly_ceiling":
 		// the account is out of completions for this hour: waiting out the
 		// queue deadline cannot fix it, so fail fast and let the sibling
 		// accounts get their one shot.
 		return false
+	case "rate_limited", "concurrent_session", "ads_required":
+		return true
+	}
+	switch {
+	case fe.Status == http.StatusTooManyRequests, fe.Status == http.StatusConflict:
+		return true
 	}
 	return false
 }
@@ -576,14 +588,14 @@ func freepiRetryable(fe freepiErr) bool {
 // caller's request, and a client that backs off on 429 stalls on our plumbing
 // instead of on the real cause. the cap becomes a 503 that names itself, the
 // same way an exhausted zen pool reports proxy capacity.
-func freepiClientStatus(status int, errMsg string) (int, string) {
+func freepiClientStatus(fault freepiFault) (int, string) {
 	switch {
-	case strings.Contains(errMsg, "hourly_ceiling"):
-		return http.StatusServiceUnavailable, errMsg + " (proxy: every freeepi account is out of hourly completions; retry after the hour rolls over)"
-	case status == http.StatusTooManyRequests, status == http.StatusConflict:
-		return http.StatusServiceUnavailable, errMsg + " (proxy: every freeepi account is busy or limited)"
+	case fault.Code == "hourly_ceiling":
+		return http.StatusServiceUnavailable, fault.Msg + " (proxy: every freeepi account is out of hourly completions; retry after the hour rolls over)"
+	case fault.Status == http.StatusTooManyRequests, fault.Status == http.StatusConflict:
+		return http.StatusServiceUnavailable, fault.Msg + " (proxy: every freeepi account is busy or limited)"
 	}
-	return status, errMsg
+	return fault.Status, fault.Msg
 }
 
 // freepiRetry counts attempts and stops hard-failed accounts.
@@ -599,17 +611,17 @@ type freepiRetry struct {
 // lease (a crashed run): this process serializes locally, so no live
 // local request owns it and the documented /session/reset is safe.
 // errors that retrying cannot fix are forwarded on the first account that
-// hits them (or after every account is dead), status and detail intact:
-// the client sees the real failure instead of a generic 502 after a
+// hits them (or after every account is dead), the fault intact (status, code,
+// detail): the client sees the real failure instead of a generic 502 after a
 // deadline-long retry storm.
-func freepiFetch(ctx context.Context, method string, body []byte, model string) (*http.Response, []byte, string, int, bool) {
+func freepiFetch(ctx context.Context, method string, body []byte, model string) (*http.Response, []byte, string, freepiFault, bool) {
 	accts := freepiAccounts()
 	if len(accts) == 0 {
-		return nil, nil, "no freepi accounts configured", http.StatusServiceUnavailable, false
+		return nil, nil, "", freepiFault{Status: http.StatusServiceUnavailable, Msg: "no freepi accounts configured"}, false
 	}
 	target := freepiBase() + "/v1/chat/completions"
 	deadline := time.Now().Add(freepiQueueWait())
-	lastErr, lastStatus := "", 0
+	var last freepiFault
 	tried := map[string]time.Time{} // account -> when we last used it
 	fails := map[string]int{}       // account -> strikes; hard errors kill the account for this fetch
 	attempts, maxAttempts := 0, 3*len(accts)+1
@@ -617,7 +629,7 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 	for {
 		// client gone: stop queueing, never burn an account on orphan output.
 		if ctx.Err() != nil {
-			return nil, nil, "client disconnected", 0, false
+			return nil, nil, "", freepiFault{Msg: "client disconnected"}, false
 		}
 		if attempts >= maxAttempts {
 			break
@@ -664,22 +676,22 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 			select {
 			case <-time.After(150 * time.Millisecond):
 			case <-ctx.Done():
-				return nil, nil, "client disconnected", 0, false
+				return nil, nil, "", freepiFault{Msg: "client disconnected"}, false
 			}
 			continue
 		}
 
-		resp, rb, acct, errMsg, status, retry := freepiTry(ctx, method, target, body, fa, model)
+		resp, rb, acct, fault := freepiTry(ctx, method, target, body, fa, model)
 		fa.mu.Lock()
 		fa.inflight--
 		fa.mu.Unlock()
 		attempts++
-		if errMsg == "" {
-			return resp, rb, acct, http.StatusOK, true
+		if resp != nil {
+			return resp, rb, acct, freepiFault{}, true
 		}
-		lastErr, lastStatus = errMsg, status
+		last = fault
 		tried[fa.name] = time.Now()
-		if !retry {
+		if !fault.Retryable {
 			// not fixable by resending or rotating: three-strike forward.
 			// one strike already answered the client would keep a live
 			// account unused, so hard errors get strikes[2] = dead only
@@ -706,40 +718,44 @@ func freepiFetch(ctx context.Context, method string, body []byte, model string) 
 		select {
 		case <-time.After(500 * time.Millisecond):
 		case <-ctx.Done():
-			return nil, nil, "client disconnected", 0, false
+			return nil, nil, "", freepiFault{Msg: "client disconnected"}, false
 		}
 	}
-	if lastErr == "" {
-		lastErr, lastStatus = "all accounts busy (queue wait exceeded)", 0
+	if last.Msg == "" {
+		last = freepiFault{Msg: "all accounts busy (queue wait exceeded)"}
 	}
-	return nil, nil, lastErr, lastStatus, false
+	return nil, nil, "", last, false
 }
 
-// freepiTry makes one upstream attempt with lease recovery. retry=true
-// marks the failure as fixable by a resend or another account (account
-// rate limit, stale lease, swing ads gate, transport reset); false is a
-// hard endpoint fault the client sees as-is. status carries the upstream
-// status for forwarding. ctx cancels the upstream send: one live stream
-// per jwt, so a disconnect must free the account immediately.
-func freepiTry(ctx context.Context, method, target string, body []byte, fa *freepiAcct, model string) (*http.Response, []byte, string, string, int, bool) {
+// freepiTry makes one upstream attempt with lease recovery. a non-nil resp is
+// a 200; otherwise the returned fault carries the upstream status, the parsed
+// code, and the client detail, and Retryable marks a failure a resend or
+// another account can fix (account rate limit, stale lease, ads gate,
+// transport reset) as opposed to a hard endpoint fault the client sees as-is.
+// ctx cancels the upstream send: one live stream per jwt, so a disconnect must
+// free the account immediately.
+func freepiTry(ctx context.Context, method, target string, body []byte, fa *freepiAcct, model string) (*http.Response, []byte, string, freepiFault) {
 	fa.mu.Lock()
 	firstTurn := fa.turns == 0
 	fa.mu.Unlock()
 	go freepiAdCycle(fa, firstTurn)
-	var lastErr string
+	var lease freepiFault
 	msgOf := func(fe freepiErr) string {
 		if fe.Code != "" {
 			return fe.Msg + " (code " + fe.Code + ")"
 		}
 		return fe.Msg
 	}
+	faultOf := func(fe freepiErr) freepiFault {
+		return freepiFault{Status: fe.Status, Code: fe.Code, Msg: msgOf(fe), Retryable: freepiRetryable(fe)}
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if ctx.Err() != nil {
-			return nil, nil, "", ctx.Err().Error(), 0, false
+			return nil, nil, "", freepiFault{Msg: ctx.Err().Error()}
 		}
 		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 		if err != nil {
-			return nil, nil, "", err.Error(), 0, false
+			return nil, nil, "", freepiFault{Msg: err.Error()}
 		}
 		freepiHeaders(req, fa)
 		resp, err := dbgClient(&http.Client{Timeout: 300 * time.Second}, "freepi").Do(req)
@@ -747,17 +763,17 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 			// transport noise is account-or-network: another account or a
 			// resend can beat it, so this is fixable, not forwardable.
 			acclog.Printf("!! freepi net error acct=%s model=%s: %v", fa.name, model, err)
-			return nil, nil, "", err.Error(), 0, true
+			return nil, nil, "", freepiFault{Msg: err.Error(), Retryable: true}
 		}
 		// a mid-body reset is a retryable failure, not a 200: the
 		// client would see a stream that stops and pay twice on retry.
 		rb, rerr := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
 		if rerr != nil {
-			return nil, nil, "", rerr.Error(), 0, true
+			return nil, nil, "", freepiFault{Msg: rerr.Error(), Retryable: true}
 		}
 		if resp.StatusCode == http.StatusOK {
-			return resp, rb, fa.name, "", http.StatusOK, false
+			return resp, rb, fa.name, freepiFault{}
 		}
 		fe := parseFreepiErr(resp.StatusCode, rb, resp.Header)
 		if resp.StatusCode == http.StatusConflict && fe.Code == "concurrent_session" && attempt == 0 {
@@ -768,9 +784,9 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 			select {
 			case <-time.After(leaseGrace):
 			case <-ctx.Done():
-				return nil, nil, "", ctx.Err().Error(), 0, false
+				return nil, nil, "", freepiFault{Msg: ctx.Err().Error()}
 			}
-			lastErr = msgOf(fe)
+			lease = faultOf(fe)
 			continue
 		}
 		acclog.Printf("!! freepi %d [%s] acct=%s model=%s code=%s err=%q",
@@ -778,9 +794,9 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 		if resp.StatusCode == http.StatusForbidden && fe.Code == "ads_required" {
 			go freepiAdCycle(fa, true)
 		}
-		return nil, nil, "", msgOf(fe), fe.Status, freepiRetryable(fe)
+		return nil, nil, "", faultOf(fe)
 	}
-	return nil, nil, "", lastErr, http.StatusConflict, true
+	return nil, nil, "", lease
 }
 
 // handleFreepi routes freeepi/<model> to api.freepi.ai with account
@@ -799,18 +815,18 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 	}
 	acclog.Printf("%s routed to freepi model=%s", reqID, realModel)
 
-	resp, rb, acct, status, ok := freepiFetch(r.Context(), r.Method, body, realModel)
+	resp, rb, acct, fault, ok := freepiFetch(r.Context(), r.Method, body, realModel)
 	if !ok {
-		if status == 0 {
-			status = http.StatusBadGateway
+		if fault.Status == 0 {
+			fault.Status = http.StatusBadGateway
 		}
 		// a rate limit is our account's cap, not the caller's request: it is
 		// mapped to a 503 that names the cause instead of being forwarded.
-		status, acct = freepiClientStatus(status, acct)
+		status, errMsg := freepiClientStatus(fault)
 		// fixed envelope: upstream detail may quote-break Sprintf json, so
 		// the text goes in as a json string, not a Sprintf template.
-		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
-		writeJSONError(w, status, "freepi: "+acct)
+		acclog.Printf("!! freepi failed model=%s err=%q", realModel, errMsg)
+		writeJSONError(w, status, "freepi: "+errMsg)
 		return
 	}
 	u := respUsage(rb)

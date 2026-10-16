@@ -25,6 +25,7 @@ func TestFreepiRetryableClassification(t *testing.T) {
 		{"stale lease", freepiErr{Status: 409, Code: "concurrent_session"}, true},
 		{"ads gate", freepiErr{Status: 403, Code: "ads_required"}, true},
 		{"plain 429", freepiErr{Status: 429}, true},
+		{"hourly cap on a 429", freepiErr{Status: 429, Code: "hourly_ceiling"}, false},
 		{"bad request is ours", freepiErr{Status: 400, Msg: "bad body"}, false},
 		{"bad jwt", freepiErr{Status: 401, Code: "unauthorized"}, false},
 		{"unknown model", freepiErr{Status: 404, Code: "model_not_found"}, false},
@@ -74,22 +75,105 @@ func TestFreepiHardErrorForwardsImmediately(t *testing.T) {
 	freePiBase.Store(up.URL)
 
 	start := time.Now()
-	_, _, errMsg, status, ok := freepiFetch(context.Background(), http.MethodPost,
+	_, _, _, fault, ok := freepiFetch(context.Background(), http.MethodPost,
 		[]byte(`{"model":"m","messages":[]}`), "m")
 	if ok {
 		t.Fatal("401 upstream must not report success")
 	}
-	if status != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 forwarded", status)
+	if fault.Status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 forwarded", fault.Status)
 	}
-	if !strings.Contains(errMsg, "jwt expired") || !strings.Contains(errMsg, "unauthorized") {
-		t.Fatalf("detail lost: %q", errMsg)
+	if !strings.Contains(fault.Msg, "jwt expired") || !strings.Contains(fault.Msg, "unauthorized") {
+		t.Fatalf("detail lost: %q", fault.Msg)
 	}
 	if n := atomic.LoadInt32(&hits); n != 1 {
 		t.Fatalf("upstream hit %d times, want exactly 1 (no retry storm)", n)
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("hard error took %v, want immediate forward", d)
+	}
+}
+
+// the cap maps on the parsed code, never on the upstream wording: a reworded
+// message cannot drop the 503, and a message that merely mentions the cap
+// without the code cannot invent one. owner: freepiClientStatus, which
+// consumes the fault freepiFetch returns.
+func TestFreepiClientStatusKeysOnCode(t *testing.T) {
+	cases := []struct {
+		name   string
+		fault  freepiFault
+		want   int
+		sub    string
+		notSub string
+	}{
+		{"cap on 429", freepiFault{Status: 429, Code: "hourly_ceiling", Msg: "out of completions"}, 503, "hourly completions", ""},
+		{"cap on 500", freepiFault{Status: 500, Code: "hourly_ceiling", Msg: "quota"}, 503, "hourly completions", ""},
+		{"plain rate limit", freepiFault{Status: 429, Msg: "slow down"}, 503, "busy or limited", ""},
+		{"busy conflict", freepiFault{Status: 409, Msg: "one stream per account"}, 503, "busy or limited", ""},
+		{"cap only in the wording", freepiFault{Status: 400, Msg: "hourly_ceiling reached"}, 400, "hourly_ceiling reached", "hourly completions"},
+		{"real fault forwards", freepiFault{Status: 401, Code: "unauthorized", Msg: "jwt expired"}, 401, "jwt expired", "proxy:"},
+	}
+	for _, tc := range cases {
+		gotStatus, gotMsg := freepiClientStatus(tc.fault)
+		if gotStatus != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, gotStatus, tc.want)
+		}
+		if !strings.Contains(gotMsg, tc.sub) {
+			t.Errorf("%s: msg = %q, want it to name %q", tc.name, gotMsg, tc.sub)
+		}
+		if tc.notSub != "" && strings.Contains(gotMsg, tc.notSub) {
+			t.Errorf("%s: msg = %q, must not carry %q", tc.name, gotMsg, tc.notSub)
+		}
+	}
+}
+
+// an hourly-capped account fails fast and never leaks its 429 to the client:
+// the fetch stops on the first strike and the cap becomes a 503 naming
+// itself. owner: the freepi rotation contract in AGENTS.md.
+func TestFreepiHourlyCeilingNoRetryNoForward(t *testing.T) {
+	c := testConfig()
+	c.Freepi.QueueWaitSecs = 5
+	c.Freepi.Accounts = []freepiAccount{{Name: "t1", JWT: "fake"}}
+	useConfig(t, c)
+	defer resetFreepiAccountsForTest()()
+
+	var hits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/v1/chat/completions") {
+			atomic.AddInt32(&hits, 1)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"hourly_ceiling","message":"out of completions for this hour"}`))
+	}))
+	defer up.Close()
+	oldBase := freepiBase()
+	defer freePiBase.Store(oldBase)
+	freePiBase.Store(up.URL)
+
+	start := time.Now()
+	_, _, _, fault, ok := freepiFetch(context.Background(), http.MethodPost,
+		[]byte(`{"model":"m","messages":[]}`), "m")
+	if ok {
+		t.Fatal("rate-limited upstream must not report success")
+	}
+	if fault.Status != http.StatusTooManyRequests || fault.Code != "hourly_ceiling" {
+		t.Fatalf("fault = %+v, want the 429 hourly_ceiling envelope", fault)
+	}
+	if !strings.Contains(fault.Msg, "out of completions") || !strings.Contains(fault.Msg, "hourly_ceiling") {
+		t.Fatalf("detail lost: %q", fault.Msg)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("upstream hit %d times, want exactly 1 (the hourly cap is not retryable)", n)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("hourly cap took %v, want fail-fast", d)
+	}
+	status, msg := freepiClientStatus(fault)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d, want 503 (a rate limit is never forwarded)", status)
+	}
+	if !strings.Contains(msg, "hourly completions") {
+		t.Fatalf("cap not named for the client: %q", msg)
 	}
 }
 
@@ -121,10 +205,10 @@ func TestFreepiHardErrorSoloAttemptsSibling(t *testing.T) {
 	defer freePiBase.Store(oldBase)
 	freePiBase.Store(up.URL)
 
-	_, rb, _, status, ok := freepiFetch(context.Background(), http.MethodPost,
+	_, rb, _, _, ok := freepiFetch(context.Background(), http.MethodPost,
 		[]byte(`{"model":"m","messages":[]}`), "m")
 	if !ok {
-		t.Fatalf("sibling account must rescue the fetch: %d %.100s", status, rb)
+		t.Fatalf("sibling account must rescue the fetch: %.100s", rb)
 	}
 	var got map[string]any
 	if err := json.Unmarshal(rb, &got); err != nil || got["id"] != "1" {

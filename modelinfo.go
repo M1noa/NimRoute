@@ -353,20 +353,30 @@ func modelNudge(id string) bool {
 // "GLM 5.3 Flash · ~0.7x usage" -> "~0.7x".
 var multRe = regexp.MustCompile(`(~?[\d.]+x)\s+usage`)
 
-// globMatch is * glob matching, first-match-wins order left to callers.
+// globMatch is * glob matching, anchored at both ends: the first part must be
+// a prefix, the last part a suffix, and the middle parts keep their order.
+// a pattern with no * is an exact match, not a substring -- users write these
+// patterns (route.exclude_models, models.claude_map, models.nudge) as globs,
+// and locating the parts anywhere in the id silently over-matched them.
+// first-match-wins order left to callers.
 func globMatch(pattern, s string) bool {
 	parts := strings.Split(pattern, "*")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
+	if len(parts) == 1 {
+		return pattern == s
+	}
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	last := parts[len(parts)-1]
+	for _, part := range parts[1 : len(parts)-1] {
 		idx := strings.Index(s, part)
 		if idx < 0 {
 			return false
 		}
 		s = s[idx+len(part):]
 	}
-	return true
+	return strings.HasSuffix(s, last)
 }
 
 // freepiMultFromName extracts the multiplier from a catalog display name,
