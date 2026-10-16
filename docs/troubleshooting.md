@@ -33,7 +33,13 @@ To inspect the exact request and upstream response on failures:
 ./nim restart --dbg-file=/tmp/nim-dumps
 ```
 
-Each failed hop writes a JSON trace (`0600` permissions). Delete the dump directory when finished, as traces include prompt bodies.
+Each failed hop writes a JSON trace (`0600` permissions). Traces carry request
+and response *bodies*, not just headers — credential headers are masked, prompts
+are not — so keep the directory private and delete it when you are done.
+
+The directory is pruned at each dump to the newest 200 files / 64MB, so leaving
+the flag on cannot fill the disk during a long storm. Only the file written most
+recently is immune to pruning.
 
 ## Quick health checks
 

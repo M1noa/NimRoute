@@ -299,7 +299,58 @@ func (t *traceRec) dumpIfErr() {
 		acclog.Printf("WARN: dbg-file write %s: %v", p, err)
 		return
 	}
+	// this flag exists to debug 429/5xx storms, which is exactly when one
+	// file per failure arrives. prune here, not in a cron nobody runs.
+	pruneTraceDir(dir)
 	acclog.Printf("%s dumped to %s (%d hops)", t.ReqID, p, len(t.Hops))
+}
+
+// traceMaxDumps / traceMaxDumpBytes bound dump storage. each dump carries
+// request and response bodies, so a storm's disk cost is the real risk.
+const (
+	traceMaxDumps     = 200
+	traceMaxDumpBytes = 64 << 20
+)
+
+// pruneTraceDir drops the oldest dumps until the directory holds at most
+// traceMaxDumps files and traceMaxDumpBytes. best effort: a failed stat must
+// never cost the dump that was just written.
+func pruneTraceDir(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type file struct {
+		name string
+		size int64
+	}
+	var fs []file
+	var total int64
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		fs = append(fs, file{name: e.Name(), size: info.Size()})
+		total += info.Size()
+	}
+	// ReadDir sorts by name, and the name starts with a unix-nano
+	// timestamp, so index order is oldest-first: no second sort needed.
+	// the newest file always survives: pruning what was just written when a
+	// single dump alone exceeds the byte bound is worse than being over it.
+	oldest := 0
+	for oldest < traceMaxDumps && oldest < len(fs) && len(fs)-oldest > traceMaxDumps {
+		os.Remove(filepath.Join(dir, fs[oldest].name))
+		total -= fs[oldest].size
+		oldest++
+	}
+	for i := oldest; i+1 < len(fs) && total > traceMaxDumpBytes; i++ {
+		os.Remove(filepath.Join(dir, fs[i].name))
+		total -= fs[i].size
+	}
 }
 
 func sanitizeTraceName(id string) string {

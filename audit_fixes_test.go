@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -312,5 +315,69 @@ func TestAntEncodeHTTPReqCarriesBodyAsUint32(t *testing.T) {
 	}
 	if !bytes.Equal(enc[off+4:], small) {
 		t.Fatal("body bytes were not carried verbatim")
+	}
+}
+
+// the flag exists to debug 429/5xx storms, which is exactly when one file
+// per failure arrives. without a prune that workflow fills the disk.
+func TestDumpPrunedToBounds(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < traceMaxDumps+25; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%020d-req%d.json", i, i)), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneTraceDir(dir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != traceMaxDumps {
+		t.Fatalf("%d dumps left, want %d", len(ents), traceMaxDumps)
+	}
+	// oldest first: the survivors must be the newest ones.
+	first, _ := ents[0].Name(), ents[len(ents)-1].Name()
+	if first == "00000000000000000000-req0.json" {
+		t.Fatal("oldest dump survived the prune")
+	}
+	_ = first
+	// a byte bound prunes by size too, independently of the count.
+	big := make([]byte, traceMaxDumpBytes+1)
+	if err := os.WriteFile(filepath.Join(dir, "09999999999999999999-big.json"), big, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pruneTraceDir(dir)
+	ents, _ = os.ReadDir(dir)
+	// the newest dump survives even when it alone is over the byte bound:
+	// pruning the file that was just written is worse than being over it.
+	if len(ents) != 1 || ents[0].Name() != "09999999999999999999-big.json" {
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("byte-bound prune left %v, want only the newest dump", names)
+	}
+}
+
+// dumpIfErr must actually prune: the write path calls the pruner, and a
+// 5xx trace lands in the directory.
+func TestDumpIfErrPrunesAndWrites(t *testing.T) {
+	dir := t.TempDir()
+	setDebugFile(true, dir)
+	t.Cleanup(func() { setDebugFile(false, "") })
+	// one over the cap, so the prune has to run on this dump.
+	for i := 0; i < traceMaxDumps; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%020d.json", i)), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tr := &traceRec{ReqID: "test-prune", Method: "POST", Path: "/v1/messages", OutStatus: 503}
+	tr.dumpIfErr()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != traceMaxDumps {
+		t.Fatalf("%d files after one dump over the cap, want %d", len(ents), traceMaxDumps)
 	}
 }

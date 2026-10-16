@@ -30,7 +30,7 @@
 | `--port N` | Listen port `1..65535` (overrides `server.port` and `PORT` env) |
 | `--lanes N` | Override `zen.lanes` count |
 | `--debug` | Enable verbose debug logging |
-| `-df`, `--dbg-file[=DIR]` | Write JSON dumps of failed requests (default dir `nimroute-debug/`) |
+| `-df`, `--dbg-file[=DIR]` | Write JSON dumps of failed requests (default dir `nimroute-debug/`, pruned to 200 files / 64MB) |
 | `-h`, `--help` | Show help |
 
 Subcommands:
