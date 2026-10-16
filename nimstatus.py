@@ -227,26 +227,14 @@ def plain_status(d):
     c.append("NimRoute %s | up %s | load %d/%d" % (
         d.get("version", "?"), d.get("uptime", "?"),
         d.get("concurrent", 0), d.get("sem_limit", 0)))
+    lanes = d.get("zen_lanes") or []
+    served = sum(l.get("total_tokens", 0) for l in lanes)
+    c.append("opencode %d active · nvidia %d active · nim lanes %d/%d · %s tok served" % (
+        d.get("concurrent_opencode", 0), d.get("concurrent_nvidia", 0),
+        len(lanes), d.get("lane_cap", len(lanes)), fmt_tok(served)))
     p = d.get("pool") or {}
-    served = sum(l.get("total_tokens", 0) for l in (d.get("zen_lanes") or []))
-    c.append("opencode %d exits (%d rate-limited, %d dead) · nvidia %d active · %s tok served" % (
-        p.get("verified", 0), p.get("rate_limited", 0), p.get("dead", 0),
-        d.get("concurrent_nvidia", 0), fmt_tok(served)))
-    c.append("pool refreshed %s ago · %d candidates · %d dropped total" % (
-        p.get("last_refresh_ago", "?"), p.get("candidates", 0),
-        p.get("dropped_total", 0)))
-    rows, total = exit_rows(d, limit=8)
-    for r in rows:
-        e, a = r["e"], r["a"]
-        host = r["proxy"].split("://", 1)[-1] if r["proxy"] else "direct"
-        state = r["state"] or ("pinned" if a["lanes"] else "idle")
-        req = a["req"]
-        avg = int(a["dur"] / req) if req else 0
-        c.append("  %-21s %-3s %-16s %d lane(s) %4d req %3d 429 %6s %8s tok" % (
-            host[:21], e.get("country", "·"), state[:16], a["lanes"], req,
-            a["rl"], fmt_ms(avg), fmt_tok(a["tok"])))
-    if total > len(rows):
-        c.append("  (+%d more exits)" % (total - len(rows)))
+    c.append("pool %d verified, %d dropped" % (
+        p.get("verified", 0), p.get("dropped_total", 0)))
     bl = bench_line(d)
     if bl:
         c.append(bl)
@@ -293,84 +281,38 @@ def fmt_ms(ms):
     return "%dms" % ms
 
 
-EXIT_STYLES = {"working": "green", "rate_limited": "yellow", "dead": "red"}
-
-
-def exit_rows(d, limit=12):
-    """One row per exit the pool or a lane is using, busiest first: the proxy,
-    where it is, how it is doing, and the traffic it carried. lane ids stay in
-    /status — a lane is an implementation detail, the exit is what the reader
-    is watching."""
+def merged_table(d, limit=8):
+    """One table: lane + its exit (host, cc) + api latency + req."""
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
     exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
-    agg = {}
-    for l in lanes:
-        p = l.get("proxy") or ""
-        if not p:
-            continue
-        a = agg.setdefault(p, {"lanes": 0, "req": 0, "rl": 0, "tok": 0,
-                               "dur": 0})
-        req = l.get("requests", 0)
-        a["lanes"] += 1
-        a["req"] += req
-        a["rl"] += l.get("rate_limited", 0)
-        a["tok"] += l.get("total_tokens", 0)
-        a["dur"] += l.get("avg_ms", 0) * req
-    rows = []
-    for p in set(list(exits) + list(agg)):
-        e = exits.get(p, {})
-        a = agg.get(p) or {"lanes": 0, "req": 0, "rl": 0, "tok": 0, "dur": 0}
-        state = e.get("state") or ("working" if a["lanes"] else "")
-        rows.append({"proxy": p, "e": e, "a": a, "state": state})
-    rows.sort(key=lambda r: (-r["a"]["req"], r["proxy"]))
-    return rows[:limit] if limit else rows, len(rows)
-
-
-def exit_caption(d, shown, total):
-    pool = d.get("pool") or {}
-    cap = ("%d exit(s) in pool · %d rate-limited · %d dead · %d candidate(s) last sweep" % (
-        pool.get("verified", 0), pool.get("rate_limited", 0),
-        pool.get("dead", 0), pool.get("candidates", 0)))
-    if pool.get("next_refresh_in"):
-        cap += " · next refresh in %s" % pool["next_refresh_in"]
-    if total > shown:
-        cap += " · showing the %d busiest" % shown
-    return cap
-
-
-def merged_table(d, limit=12):
-    """The exit table for the rich view."""
-    rows, total = exit_rows(d, limit)
     t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
               pad_edge=False)
+    t.add_column("lane", style="slate_blue1")
     t.add_column("exit")
     t.add_column("cc")
-    t.add_column("state")
-    t.add_column("lanes", justify="right")
     t.add_column("ttfb", justify="right")
     t.add_column("req", justify="right")
     t.add_column("429", justify="right", style="yellow")
     t.add_column("avg turn", justify="right")
     t.add_column("tokens", justify="right")
-    for r in rows:
-        e, a, proxy = r["e"], r["a"], r["proxy"]
-        host = proxy.split("://", 1)[-1] if proxy else "direct"
-        style = EXIT_STYLES.get(r["state"], "dim")
-        label = r["state"] or "—"
-        if e.get("reason") and r["state"] != "working":
-            label = "%s (%s)" % (label, e["reason"])
-        req = a["req"]
-        avg = int(a["dur"] / req) if req else 0
-        t.add_row(Text(host, style=style if r["state"] else None),
+    lanes = sorted(lanes, key=lambda l: (-l.get("requests", 0), l.get("id", "")))
+    shown = lanes[:limit] if limit else lanes
+    for l in shown:
+        proxy = l.get("proxy") or ""
+        e = exits.get(proxy, {})
+        if proxy:
+            host = proxy.split("://", 1)[-1]
+            exit_t = Text(host)
+        else:
+            exit_t = Text("—", style="dim")
+        t.add_row((l.get("id") or "?")[:14], exit_t,
                   str(e.get("country", "·")),
-                  Text(label, style=style),
-                  str(a["lanes"] or "·"),
                   fmt_ms(e.get("avg_ms")),
-                  str(req), str(a["rl"]),
-                  fmt_ms(avg), fmt_tok(a["tok"]))
-    if d.get("pool"):
-        t.caption = exit_caption(d, len(rows), total)
+                  str(l.get("requests", 0)), str(l.get("rate_limited", 0)),
+                  fmt_ms(l.get("avg_ms")), fmt_tok(l.get("total_tokens", 0)))
+    if len(shown) < len(lanes):
+        t.caption = "%d more lanes · nim status shows the busiest 8" % (len(lanes) - len(shown))
     return t
 
 
@@ -465,10 +407,9 @@ def build_renderable(d, stats):
                                      d.get("total", 0)),
                    style="dark_sea_green" if ok else "red")
     parts.append(hdr)
-    pool = d.get("pool") or {}
-    parts.append(Text("opencode %d exits (%d rate-limited, %d dead) · nvidia %d active" % (
-        pool.get("verified", 0), pool.get("rate_limited", 0),
-        pool.get("dead", 0), d.get("concurrent_nvidia", 0)), style="dim"))
+    parts.append(Text("opencode %d active · nvidia %d active · nim lanes %d/%d" % (
+        d.get("concurrent_opencode", 0), d.get("concurrent_nvidia", 0),
+        len(d.get("zen_lanes") or []), d.get("lane_cap", 0)), style="dim"))
     if d.get("zen_lanes"):
         parts.append(merged_table(d))
     oc = d.get("opencode") or {}
@@ -516,9 +457,12 @@ def build_renderable(d, stats):
     if cols:
         by_model = (d.get("usage") or {}).get("by_model") or {}
         bench = bench_index(d)
+        mults = {}
+        for acct in (d.get("freepi") or {}).get("accounts") or []:
+            mults.update(acct.get("mults") or {})
         t = Table(show_header=True, header_style="bold", box=box.SIMPLE, pad_edge=False)
         t.add_column("", justify="left")
-        for label in ("model", "score", "req", "tokens", "tok/s*"):
+        for label in ("model", "score", "req", "tokens", "tok/s*", ""):
             t.add_column(label, justify="right" if label in ("score", "req", "tokens", "tok/s*") else "left")
         for name, models in cols:
             for val in models:
@@ -527,11 +471,17 @@ def build_renderable(d, stats):
                 # keys usage.by_model by.
                 full = val if "/" in val else name + "/" + val
                 totals = model_totals(by_model, full) or {}
+                # the trailing column is freepi-only: usage multiplier on
+                # freepi rows, empty everywhere else.
+                mult = ""
+                if name == "freepi":
+                    mult = mults.get(full.split("/", 1)[-1], "")
                 t.add_row(health_cell(health, full),
                           Text(full, style=PROVIDER_STYLES.get(name, "dim")),
                           score_cell(bench(full)),
                           str(totals.get("requests", 0)),
-                          tok_cell(by_model, full), tps_cell(by_model, full))
+                          tok_cell(by_model, full), tps_cell(by_model, full),
+                          Text(mult, style="dim") if mult else Text(""))
         parts.append(t)
         parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
     bl = bench_line(d)
