@@ -1308,11 +1308,11 @@ func TestAnthropicPathAll429Synthesizes(t *testing.T) {
 
 // anthropic path with a pool narrower than the lane table: when the drawn
 // lane holds no usable exit, the ladder must hand off to another lane and
-// keep rotating, not bail on hop 0 with a false "upstream unreachable".
-// the chat path already rotates here, so the same backend answered
-// differently per protocol: live, with 8 exits over 15 lanes, /v1/messages
-// 502'd in 8ms on a model /v1/chat/completions served from lane rotation a
-// moment later.
+// keep rotating, not bail on hop 0 with proxy_exhausted while a pin-holder
+// lane one failover away never gets its turn. the chat path already rotates
+// here, so the same backend answered differently per protocol: live, with 8
+// exits over 15 lanes, /v1/messages gave up in 8ms on a model
+// /v1/chat/completions served from lane rotation a moment later.
 //
 // owner: the anthropic zen ladder (handleOpenCodeAnthropic). lane staleness
 // is stamped so failover walks a pinless lane first and a pinned lane

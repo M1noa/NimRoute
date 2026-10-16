@@ -2585,7 +2585,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						proxy = laneProxyFor(lane, zenModel)
 						// pool is up but this lane drew no free exit (every
 						// one taken or written off): another lane is the
-						// answer, not a false "upstream unreachable".
+						// answer, not a proxy_exhausted 503 from hop 0.
 						if proxy == "" {
 							continue
 						}
