@@ -390,6 +390,39 @@ line. `--monitor` was added here and removed 2026-10-15 (see item 12).
 
 - [ ] live restart of the primary (:5419). deliberately left to the user.
 
+## audit residuals (2026-10-15 pass, 15 findings)
+
+Everything fixable landed; these are what remains and why.
+
+- [ ] **D1** `go.mod`: `onnxruntime-purego` is pinned to a commit
+      pseudo-version, so `go get -u` cannot track a release line and the
+      `-tags ner` path is tied to that snapshot. Blocked on upstream
+      publishing a tag; nothing to change here until it does.
+- [ ] `pii/scan.go:544`: `unsplit` rebuilds the surrogate prefix set on
+      every call, which the per-chunk scan pays once per chunk. Correct,
+      and the comment is accurate about what replaced the old
+      O(surrogates x cut) scan, so this is a measurement-then-cache job,
+      not a correctness fix. Left until it shows up in a profile.
+- [ ] `freepi.go`: `freepiErr.Retry` is parsed from the retry-after
+      header and never read. Pre-existing dead field, noted not deleted.
+- [ ] **P2 remainder**: the debug path keeps its own full copy of a
+      streamed response (`respBodyBuf`). Boundless only in the sense that
+      the stream is; P4 now caps the files it lands in, so the exposure
+      is one copy of one request while `--dbg-file` is on.
+- [ ] `zentools.go:22` inits a panic on a malformed ballast. Accepted:
+      the ballast is load-bearing for the free-tier gate, so a fail-fast
+      start is better than a degraded one, and
+      `TestZenBallastMatchesScript` (now unconditional after Q2) fails CI
+      on a malformed embedded copy.
+- [ ] `antseedp2p.go:417` `uint16be` panics past 0xffff. Both call sites
+      pass ids this proxy generated; the frame invariant is pinned by
+      `TestUint16beBoundary` and `TestAntEncodeHTTPReqCarriesBodyAsUint32`.
+      If a peer-driven path ever writes a frame, return an error then.
+
+`zenDebugCapture` (the ZEN_CAPTURE path) writes metadata only, never
+bodies, so it is not a PII surface; the body-bearing debug path is
+`--dbg-file`, which P4 bounds and documents.
+
 ## done — lanes, ttft, proxy rotation (was IMPROV_TODO.md)
 
 one line per item, checkbox marks state.
