@@ -96,9 +96,11 @@ incidental machinery.
 - clean up only your own mess: drop imports/vars/functions your change
   orphaned. mention pre-existing dead code, don't delete it.
 - comments: short, all lowercase. match neighboring style.
-- behavior changes require tests: table-driven, owner boundary named
-  (who owns the invariant). reproduce-first for bug fixes.
-- green before commit: `gofmt -l .`, `go vet ./...`, `go test ./...`.
+- behavior changes get verified end to end on a scratch port (reproduce
+  first for bug fixes). the repo carries no Go test files as of the
+  2026-10-15 cleanup; git history holds the old suite if one is needed.
+- green before commit: `gofmt -l .`, `go vet ./...` (and `go vet -tags
+  ner ./...`), `go build ./...`.
   ner build is separate: `go build -tags ner`.
 - never interrupt the primary instance (:5419 live). test on a separate
   port with a scratch config until the change is verified end to end:

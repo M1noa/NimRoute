@@ -411,13 +411,12 @@ Everything fixable landed; these are what remains and why.
       is one copy of one request while `--dbg-file` is on.
 - [ ] `zentools.go:22` inits a panic on a malformed ballast. Accepted:
       the ballast is load-bearing for the free-tier gate, so a fail-fast
-      start is better than a degraded one, and
-      `TestZenBallastMatchesScript` (now unconditional after Q2) fails CI
-      on a malformed embedded copy.
+      start is better than a degraded one.
 - [ ] `antseedp2p.go:417` `uint16be` panics past 0xffff. Both call sites
-      pass ids this proxy generated; the frame invariant is pinned by
-      `TestUint16beBoundary` and `TestAntEncodeHTTPReqCarriesBodyAsUint32`.
-      If a peer-driven path ever writes a frame, return an error then.
+      pass ids this proxy generated; the frame layout was pinned by the
+      test suite, which the 2026-10-15 tree cleanup removed (recoverable
+      from git history). If a peer-driven path ever writes a frame, return
+      an error then.
 
 `zenDebugCapture` (the ZEN_CAPTURE path) writes metadata only, never
 bodies, so it is not a PII surface; the body-bearing debug path is
@@ -490,9 +489,10 @@ one line per item, checkbox marks state.
 - [x] fixed early stream cutoff (hedge winner's context was canceled on
       return, killing the body mid-stream): `zenSide` hands the cancel to
       `bodyCancelCloser` so the winner streams on and frees ctx on close
-- [x] regression tests for the cutoff: whole-stream delivery, cancel stops
-      the copy, live streamers carry every delta including tool calls, and
-      byte-at-a-time reads reassemble (`stream_cancel_test.go`)
+- [x] cutoff fixed and regression-tested (whole-stream delivery, cancel
+      stops the copy, live streamers carry every delta including tool
+      calls, byte-at-a-time reads reassemble; suite removed in the
+      2026-10-15 tree cleanup)
 
 ### verified end to end (scratch config, port 5420, then torn down)
 

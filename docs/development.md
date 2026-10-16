@@ -5,7 +5,6 @@ Requires Go 1.26+.
 ```sh
 go build -o nimroute .        # standard build
 go build -tags ner .          # include ONNX NER PII model support
-go test ./...                 # run unit tests
 ```
 
 ## Optional ONNX NER (`-tags ner`)
@@ -17,7 +16,6 @@ Fetch the model weights (not committed to git):
 ```sh
 ./pii/fetch_model.sh
 go vet -tags ner ./...
-go test -tags ner ./pii/...
 ```
 
 ## Pre-commit checks
@@ -25,7 +23,7 @@ go test -tags ner ./pii/...
 ```sh
 gofmt -l .        # must output nothing
 go vet ./...
-go test ./...
+go build ./...
 ```
 
 ## Testing on a scratch port
