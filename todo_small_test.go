@@ -239,8 +239,6 @@ func TestMaybeRefreshStalePool(t *testing.T) {
 	c := testConfig()
 	c.Zen.StalePoolSecs = 15
 	useConfig(t, c)
-	old := lanes["a"]
-	_ = old
 	l := &zenLane{id: "a", session: zenSession(), lastUsed: time.Now()}
 	lanesMu.Lock()
 	lanes["a"] = l
@@ -350,29 +348,21 @@ func TestConvoIdleExpiry(t *testing.T) {
 	}
 }
 
-// lapsed burns are swept even when never re-read.
-func TestSweepBurns(t *testing.T) {
-	burnMu.Lock()
-	old := burned
-	burned = map[string]time.Time{}
-	burnMu.Unlock()
-	t.Cleanup(func() {
-		burnMu.Lock()
-		burned = old
-		burnMu.Unlock()
-	})
-	burnMu.Lock()
-	burned["x\x00m"] = time.Now().Add(-time.Minute)
-	burned["y\x00m"] = time.Now().Add(time.Hour)
-	burnMu.Unlock()
-	sweepBurns()
-	burnMu.Lock()
-	defer burnMu.Unlock()
-	if _, ok := burned["x\x00m"]; ok {
-		t.Fatal("lapsed burn must be swept")
+// exit-state rows for exits that left the pool and carry no live mark are
+// pruned: the registry only ever inserts, and the pool churns every cycle.
+func TestPruneExitStates(t *testing.T) {
+	resetBurns()
+	defer resetBurns()
+	// marked + out of the pool: kept, /status still has to explain it.
+	markExitRateLimited("http://10.0.0.9:9", "m", "test")
+	// seen but clean and out of the pool: forgotten.
+	exitStateFor("http://10.0.0.8:8")
+	pruneExitStates(map[string]bool{"http://10.0.0.7:7": true})
+	if !exitRateLimited("http://10.0.0.9:9") {
+		t.Fatal("a marked exit must survive the prune")
 	}
-	if _, ok := burned["y\x00m"]; !ok {
-		t.Fatal("live burn must survive")
+	if exitStateOf("http://10.0.0.8:8") != "" {
+		t.Fatal("an unmarked, unwatched exit must be pruned")
 	}
 }
 
@@ -526,8 +516,28 @@ func TestModelHealth(t *testing.T) {
 	noteModelOutcome("m", false, 502, "s1")
 	noteModelOutcome("m", false, 502, "s1")
 	noteModelOutcome("m", false, 502, "s2")
-	if got := modelHealthFor("m"); got.State != "broken" || got.Code != 502 {
-		t.Fatalf("3x502 across 2 sellers = %v, want broken/502", got)
+	if got := modelHealthFor("m"); got.State != "dead" || got.Code != 502 {
+		t.Fatalf("3x502 across 2 sellers = %v, want dead/502", got)
+	}
+	// a 429 streak is the model being busy, not dead.
+	totalsMu.Lock()
+	outcomesByModel["m429"] = nil
+	totalsMu.Unlock()
+	noteModelOutcome("m429", false, 429, "s1")
+	noteModelOutcome("m429", false, 429, "s2")
+	noteModelOutcome("m429", false, 429, "s1")
+	if got := modelHealthFor("m429"); got.State != "rate_limited" || got.Code != 429 {
+		t.Fatalf("3x429 across 2 sellers = %v, want rate_limited/429", got)
+	}
+	// a model the upstream listing dropped reports dead with the reason.
+	noteModelRemoved("mgone", "no longer listed upstream")
+	if got := modelHealthFor("mgone"); got.State != "dead" || got.Reason == "" {
+		t.Fatalf("removed model = %v, want dead with a reason", got)
+	}
+	// a working request outranks the listing.
+	noteModelOutcome("mgone", true, 0, "s1")
+	if got := modelHealthFor("mgone"); got.State != "working" {
+		t.Fatalf("removed but serving = %v, want working", got)
 	}
 	// reset: single-seller streak never counts, however long.
 	totalsMu.Lock()
@@ -556,8 +566,8 @@ func TestModelHealth(t *testing.T) {
 	noteModelOutcome("m3", false, 503, "s1")
 	noteModelOutcome("m3", false, 503, "s2")
 	noteModelOutcome("m3", false, 503, "s1")
-	if got := modelHealthFor("m3"); got.State != "broken" || got.Code != 503 {
-		t.Fatalf("3x503 across 2 sellers = %v, want broken/503", got)
+	if got := modelHealthFor("m3"); got.State != "dead" || got.Code != 503 {
+		t.Fatalf("3x503 across 2 sellers = %v, want dead/503", got)
 	}
 	// one success clears everything.
 	noteModelOutcome("m3", true, 0, "s9")
@@ -607,79 +617,79 @@ func TestFreepiSnapshotNoLeak(t *testing.T) {
 	}
 }
 
-// long burns ban saturated exits for every model.
-func TestLongBurn(t *testing.T) {
+// owner boundary: the 429 policy. two 429s in a row retire an exit+model
+// until the next refresh; one is the pair being busy. the mark is per model:
+// zen limits the pair, so a mark on one model must leave the exit serving the
+// rest. owner: noteExit429.
+func TestExit429StreakRetiresExit(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
-	burnMu.Lock()
-	burned = map[string]time.Time{}
-	burnMu.Unlock()
-	longBurnMu.Lock()
-	longBurned = map[string]time.Time{}
-	longBurnMu.Unlock()
-	exitTrackMu.Lock()
-	delete(exitTrack, "http://9.9.9.9:1")
-	exitTrackMu.Unlock()
-	// first 429: no ban. second 429 with stale success: 12h ban.
-	noteExit429("http://9.9.9.9:1")
-	if exitLongBurned("http://9.9.9.9:1") {
-		t.Fatal("single 429 must not long-burn")
+	resetBurns()
+	defer resetBurns()
+	c := testConfig()
+	c.Zen.Lanes = 2
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	setPool("http://9.9.9.9:1", "http://9.9.9.8:8")
+	defer setPool()
+
+	const pin = "http://9.9.9.9:1"
+	if noteExit429(pin, "m") || exitRateLimitedModel(pin, "m") {
+		t.Fatal("a single 429 must not retire the exit")
 	}
-	exitTrackMu.Lock()
-	exitTrack["http://9.9.9.9:1"].lastOK = time.Now().Add(-time.Minute)
-	exitTrackMu.Unlock()
-	noteExit429("http://9.9.9.9:1")
-	if !exitLongBurned("http://9.9.9.9:1") {
-		t.Fatal("repeat 429 with stale success must long-burn")
+	if !noteExit429(pin, "m") || !exitRateLimitedModel(pin, "m") {
+		t.Fatal("two 429s in a row must retire the exit")
 	}
-	noteExitOK("http://9.9.9.9:1")
-	// success clears streak but not an active ban (ban is time-based).
-	longBurnMu.Lock()
-	delete(longBurned, "http://9.9.9.9:1")
-	longBurnMu.Unlock()
-	if exitLongBurned("http://9.9.9.9:1") {
-		t.Fatal("cleared ban must lapse")
+	// the mark is per model: the same exit still serves everything else.
+	if !exitUsableFor(pin, "other") {
+		t.Fatal("a mark on one model must not write the exit off for others")
+	}
+	if exitUsableFor(pin, "m") {
+		t.Fatal("a marked exit+model must not be picked for that model")
+	}
+	// the exit stays poolable: it is one cycle of congestion, not a verdict.
+	zenProxiesMu.RLock()
+	n := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if n != 2 {
+		t.Fatalf("rate-limited exit must stay in the pool, pool = %d", n)
+	}
+	// a success clears the streak, not an active mark: the mark is per-cycle.
+	noteExitOK(pin, "m")
+	if !exitRateLimitedModel(pin, "m") {
+		t.Fatal("a success must not clear the cycle's rate-limit mark")
+	}
+	clearExitRateLimits()
+	if exitRateLimited(pin) {
+		t.Fatal("a completed refresh cycle must clear the mark")
 	}
 }
 
-// a fresh exit (never succeeded) survives a pair of fast 429s: two limits
-// on first touch are congestion, not saturation. the saturation rule for
-// fresh exits is three straight limits — more than two 429s ban the exit
-// for 12h regardless of success history.
-func TestLongBurnSkipsFreshExits(t *testing.T) {
+// the total rule catches an exit that limps along all cycle without ever
+// answering two 429s back to back.
+func TestExit429TotalRetiresExit(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
-	longBurnMu.Lock()
-	longBurned = map[string]time.Time{}
-	longBurnMu.Unlock()
-	exitTrackMu.Lock()
-	delete(exitTrack, "http://9.9.9.10:1")
-	exitTrackMu.Unlock()
-	noteExit429("http://9.9.9.10:1")
-	if exitLongBurned("http://9.9.9.10:1") {
-		t.Fatal("single 429 must not long-burn")
+	resetBurns()
+	defer resetBurns()
+	const pin = "http://9.9.9.10:1"
+	for i := 0; i < 5; i++ {
+		noteExitOK(pin, "m") // success between limits: no streak, only the cycle total
+		noteExit429(pin, "m")
 	}
-	noteExit429("http://9.9.9.10:1")
-	if exitLongBurned("http://9.9.9.10:1") {
-		t.Fatal("fresh exit with two fast 429s must not long-burn")
+	if exitRateLimitedModel(pin, "m") {
+		t.Fatal("5 total 429s with successes between must not retire the exit")
 	}
-	noteExit429("http://9.9.9.10:1")
-	if !exitLongBurned("http://9.9.9.10:1") {
-		t.Fatal("three straight 429s must long-burn even a fresh exit")
+	noteExit429(pin, "m")
+	if !exitRateLimitedModel(pin, "m") {
+		t.Fatal("6 429s in one cycle must retire the exit")
 	}
-	longBurnMu.Lock()
-	delete(longBurned, "http://9.9.9.10:1")
-	longBurnMu.Unlock()
-	exitTrackMu.Lock()
-	delete(exitTrack, "http://9.9.9.10:1")
-	exitTrackMu.Unlock()
 }
 
-// slow strikes: 2 in an hour drops the exit.
+// slow strikes: 2 in an hour marks the exit dead.
 func TestSlowStrikes(t *testing.T) {
-	exitTrackMu.Lock()
-	delete(exitTrack, "http://8.8.8.8:1")
-	exitTrackMu.Unlock()
+	resetBurns()
+	defer resetBurns()
 	zenProxiesMu.Lock()
 	zenProxies = append(zenProxies, "http://8.8.8.8:1", "http://8.8.8.9:9")
 	defer func() {
@@ -964,7 +974,8 @@ func TestPoolRefreshCooldown(t *testing.T) {
 	}
 }
 
-// flags parse in both orders around probe; unknown flags ignored.
+// flags parse in both orders around probe; unknown flags are collected so
+// main can reject them instead of silently dropping the typo.
 func TestParseFlags(t *testing.T) {
 	f, rest := parseFlags([]string{"--port", "5420", "probe", "--lanes=4"})
 	if f.port != 5420 || !f.set["port"] {
@@ -993,7 +1004,15 @@ func TestParseFlags(t *testing.T) {
 	}
 	f4, rest4 := parseFlags([]string{"--bogus", "probe"})
 	if len(f4.set) != 0 || len(rest4) != 1 {
-		t.Fatalf("unknown flags ignored: %+v %v", f4, rest4)
+		t.Fatalf("unknown flag must not land in set/rest: %+v %v", f4, rest4)
+	}
+	if len(f4.unknown) != 1 || f4.unknown[0] != "--bogus" {
+		t.Fatalf("unknown flags must be reported: %+v", f4.unknown)
+	}
+	// a real flag is never reported as unknown.
+	f5, _ := parseFlags([]string{"--port", "5420", "-df", "--config=x.yml"})
+	if len(f5.unknown) != 0 {
+		t.Fatalf("known flags reported unknown: %v", f5.unknown)
 	}
 }
 
@@ -1050,12 +1069,22 @@ func TestNetErrMovesLaneOffDeadExit(t *testing.T) {
 	}
 }
 
-// retryable-exhausted must never forward an empty body: synthesized JSON
-// 503 + Retry-After, never a bare 429.
-func TestExhausted429Synthesizes(t *testing.T) {
-	r := exhausted429("opencode/space-bunny-free", 429)
+// owner boundary: the retry ladder's last word. a spent ladder answers with
+// a JSON 503 about the proxy pool + Retry-After — never a 429 and never an
+// empty body. owner: exhaustedExits.
+func TestExhaustedExitsSynthesizesProxyError(t *testing.T) {
+	resetBurns()
+	defer resetBurns()
+	setPool("http://10.0.0.1:1")
+	defer setPool()
+	markExitRateLimited("http://10.0.0.1:1", "space-bunny-free", "test")
+
+	r := exhaustedExits("opencode/space-bunny-free", 429)
 	if r.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", r.StatusCode)
+		t.Fatalf("status = %d, want 503 (a rate limit must never reach the client)", r.StatusCode)
+	}
+	if r.StatusCode == http.StatusTooManyRequests {
+		t.Fatal("429 must never be forwarded")
 	}
 	if r.Header.Get("Retry-After") == "" {
 		t.Fatal("Retry-After must be set")
@@ -1065,9 +1094,58 @@ func TestExhausted429Synthesizes(t *testing.T) {
 	if len(bytes.TrimSpace(rb)) == 0 {
 		t.Fatal("body must be non-empty JSON")
 	}
-	var m map[string]any
+	var m struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
 	if err := json.Unmarshal(rb, &m); err != nil {
 		t.Fatalf("body must be JSON: %v", err)
+	}
+	if m.Error.Type != "proxy_exhausted" {
+		t.Fatalf("error type = %q, want proxy_exhausted", m.Error.Type)
+	}
+	if !strings.Contains(m.Error.Message, "verified") || !strings.Contains(m.Error.Message, "rate-limited") {
+		t.Fatalf("message must describe the pool, got %q", m.Error.Message)
+	}
+}
+
+// an exit that fails at transport level (504 from the exit or a proxy in
+// front of it) is retried on the next lane instead of reaching the client.
+// owner: the retryable-status branch of handleOpenCode.
+func TestRetryLoopRetriesExitFailure(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) <= 2 {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	old := OpencodeBase
+	OpencodeBase = srv.URL
+	t.Cleanup(func() { OpencodeBase = old })
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	setPool()
+	defer setPool()
+	c := testConfig()
+	c.Zen.AlwaysProxy = false
+	c.Zen.MaxRetries = 4
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+	p := newPool(nil)
+	body := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-504retry")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client status = %d, want 200 after 2x504 then 200 (hits=%d): %s", rec.Code, hits.Load(), rec.Body.String())
 	}
 }
 
@@ -1146,21 +1224,6 @@ func TestOverflowSpreadsConcurrently(t *testing.T) {
 	}
 }
 
-// --monitor flips the (row-less, item-12) monitor toggle on.
-func TestMonitorFlag(t *testing.T) {
-	f, _ := parseFlags([]string{"--monitor"})
-	if !f.monitor || !f.set["monitor"] {
-		t.Fatalf("--monitor not parsed: %+v", f)
-	}
-	c := testConfig()
-	if c.Monitor.Enabled {
-		t.Fatal("monitor must default off")
-	}
-	if c.Monitor.Path != "nim-perf.jsonl" || c.Monitor.IntervalMs != 1000 {
-		t.Fatalf("monitor defaults = %+v, want nim-perf.jsonl/1000", c.Monitor)
-	}
-}
-
 // --help parses without starting anything.
 func TestHelpFlag(t *testing.T) {
 	f, rest := parseFlags([]string{"--help"})
@@ -1195,6 +1258,9 @@ func TestRetryLoopAll429Synthesizes(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-13all429")
+	if rec.Code == http.StatusTooManyRequests {
+		t.Fatalf("a 429 must never reach the client (body: %s)", rec.Body.String())
+	}
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("client status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
 	}
@@ -1203,6 +1269,9 @@ func TestRetryLoopAll429Synthesizes(t *testing.T) {
 	}
 	if rec.Header().Get("Retry-After") == "" {
 		t.Fatal("Retry-After must pass through to the client")
+	}
+	if b := rec.Body.String(); !strings.Contains(b, "proxy_exhausted") || !strings.Contains(b, "rate-limited") {
+		t.Fatalf("exhausted ladder must explain the proxy pool, got %s", b)
 	}
 }
 
@@ -1231,6 +1300,81 @@ func TestAnthropicPathAll429Synthesizes(t *testing.T) {
 	p.handleOpenCodeAnthropic(rec, r, orig, oai, "claude-haiku-4-5-20251001", "opencode/big-pickle", nil, false, time.Now(), "test-13aanth")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("client status = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if len(bytes.TrimSpace(rec.Body.Bytes())) == 0 {
+		t.Fatal("client body must be non-empty JSON")
+	}
+}
+
+// anthropic path with a pool narrower than the lane table: when the drawn
+// lane holds no usable exit, the ladder must hand off to another lane and
+// keep rotating, not bail on hop 0 with a false "upstream unreachable".
+// the chat path already rotates here, so the same backend answered
+// differently per protocol: live, with 8 exits over 15 lanes, /v1/messages
+// 502'd in 8ms on a model /v1/chat/completions served from lane rotation a
+// moment later.
+//
+// owner: the anthropic zen ladder (handleOpenCodeAnthropic). lane staleness
+// is stamped so failover walks a pinless lane first and a pinned lane
+// second: one failover per hop, so the pin-holder is only reachable by
+// spending retries, which is the whole point of the fix.
+func TestAnthropicPathNoExitRotates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"error":"rate limited"}`)
+	}))
+	defer srv.Close()
+	old := OpencodeBase
+	OpencodeBase = srv.URL
+	t.Cleanup(func() { OpencodeBase = old })
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	// exits double as the upstream: an unroutable ip would fail the dial
+	// and reach the transport path instead of the 429 ladder under test.
+	zenProxiesMu.Lock()
+	zenProxies = []string{srv.URL, srv.URL + "/"}
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenProxies = nil
+		zenProxiesMu.Unlock()
+	}()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.Lanes = 4
+	c.Zen.MaxRetries = 1 // one retry: hop 0 walks a pinless lane, hop 1 reaches one
+	c.Zen.LaneMinGapMs = 0
+	useConfig(t, c)
+
+	body := []byte(`{"messages":[{"role":"user","content":"a"}]}`)
+	// both exits go to other lanes, so the drawn lane can pin nothing.
+	holder1, holder2 := laneFor("h1", body), laneFor("h2", body)
+	if laneReproxy(holder1, "big-pickle") == "" {
+		t.Fatal("failed to pin the first exit")
+	}
+	if laneReproxy(holder2, "big-pickle") == "" {
+		t.Fatal("failed to pin the second exit")
+	}
+	pinless := laneFor("p0", body)
+	// stalest wins the failover, and every hand-out restamps: p0 (-3h) is
+	// picked from the drawn lane, then holder1 (-2h) from p0. holder2 (-1h)
+	// stays unvisited, so hop 1 must move again to reach a pin.
+	lanesMu.Lock()
+	pinless.lastUsed = time.Now().Add(-3 * time.Hour)
+	holder1.lastUsed = time.Now().Add(-2 * time.Hour)
+	holder2.lastUsed = time.Now().Add(-1 * time.Hour)
+	lanesMu.Unlock()
+
+	p := newPool(nil)
+	orig := []byte(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	oai := []byte(`{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`)
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+	p.handleOpenCodeAnthropic(rec, r, orig, oai, "claude-haiku-4-5-20251001", "opencode/big-pickle", nil, false, time.Now(), "test-noexit")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("client status = %d, want 503 from the exhausted ladder (body: %s)", rec.Code, rec.Body.String())
 	}
 	if len(bytes.TrimSpace(rec.Body.Bytes())) == 0 {
 		t.Fatal("client body must be non-empty JSON")
@@ -1304,8 +1448,9 @@ func TestZenDialDeadClassifies(t *testing.T) {
 }
 
 // a dry pool keeps the dead exit alive as last resort, but a request must
-// not walk the whole ladder over it: first dial-dead fire ends the request
-// with the honest 502 instead of re-dialing the corpse maxRetries times.
+// not walk the whole ladder over it: the first dial-dead fire ends the
+// request with a proxy-capacity 503 instead of re-dialing the corpse
+// maxRetries times.
 func TestDialDeadLadderStopsImmediately(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
@@ -1342,26 +1487,32 @@ func TestDialDeadLadderStopsImmediately(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	rec := httptest.NewRecorder()
 	p.handleOpenCode(rec, r, body, "opencode/big-pickle", false, time.Now(), "test-dead")
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502, body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "connection refused") {
-		t.Fatalf("body must carry the dial error, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "no usable exit") {
+		t.Fatalf("body must name the proxy pool, got %s", rec.Body.String())
 	}
 	if n := dials.Load(); n != 1 {
 		t.Fatalf("dead exit dialed %d times, want 1 (ladder must stop after the first dial-dead)", n)
 	}
 }
 
-// owner boundary: laneRotate owns "two consecutive 429s on the same pin
-// refuse the model". it burns the exit for the model after the second
-// strike; laneTouch's success resets the strike so a merely busy exit
-// never accumulates a burn.
-func TestLaneRotateBurnsOnSecondConsec429(t *testing.T) {
+// owner boundary: laneRotate owns "a limited lane moves off the exit that
+// was limited". the exit's own 429 policy (noteExit429) is what retires it
+// pool-wide; rotation only walks this lane away, and a pin change resets
+// the counters that describe the old exit.
+func TestLaneRotateMovesOffLimitedExit(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	setPool("http://10.9.9.9:9", "http://10.9.9.8:8")
+	defer setPool()
 	c := testConfig()
 	c.Zen.PoolRefresh429s = 0 // noteRateLimit must not fire an async refresh
+	c.Zen.AlwaysProxy = true
+	c.Zen.Lanes = 2
 	useConfig(t, c)
 	const pin = "http://10.9.9.9:9"
 	const model = "opencode/test-burn-model"
@@ -1370,69 +1521,30 @@ func TestLaneRotateBurnsOnSecondConsec429(t *testing.T) {
 	lanes["burntest"] = l
 	lanesMu.Unlock()
 
+	// one 429 is the pair being busy: the ladder rotates the lane, and the
+	// picker is free to hand back the same exit.
+	noteExit429(pin, model)
 	laneRotate(l, model)
-	if exitBurned(pin, model) {
-		t.Fatal("one 429 must not burn the exit")
+	// a second 429 in a row retires the exit+model pair for the cycle, so the
+	// next rotation has to land on another one. park the lane back on the
+	// retired exit with a live strike count to pin that down.
+	noteExit429(pin, model)
+	if !exitRateLimited(pin) {
+		t.Fatal("two 429s in a row must retire the exit")
 	}
-	laneTouch(l, pin, model) // a success resets the strike
-	laneRotate(l, model)
-	if exitBurned(pin, model) {
-		t.Fatal("a success between limits must reset the strike count")
-	}
-	laneRotate(l, model)
-	if !exitBurned(pin, model) {
-		t.Fatal("two consecutive 429s must burn the exit for the model")
-	}
-}
-
-// owner boundary: lanePinCrowded owns "cold-start single-exit pins must
-// not bottleneck the whole table": 3+ lanes holding one pin with an
-// untaken pool exit is crowded, and laneProxyFor spreads the newcomer
-// onto the spare. below the threshold and on a thin pool, pairs share.
-func TestLanePinCrowdedSpreadsToSpare(t *testing.T) {
-	resetLanes()
-	defer resetLanes()
-	zenProxiesMu.Lock()
-	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2"}
-	zenProxiesMu.Unlock()
-	defer func() {
-		zenProxiesMu.Lock()
-		zenProxies = nil
-		zenProxiesMu.Unlock()
-	}()
-	const pin = "http://10.0.0.1:1"
-	ls := make([]*zenLane, 3)
-	for i := range ls {
-		l := &zenLane{id: fmt.Sprintf("crowd%d", i), session: zenSession(), proxy: pin, lastUsed: time.Now()}
-		ls[i] = l
-		lanesMu.Lock()
-		lanes[l.id] = l
-		lanesMu.Unlock()
-	}
-	if !lanePinCrowded(pin) {
-		t.Fatal("3 lanes on one pin with an untaken spare must be crowded")
-	}
-	if got := laneProxyFor(ls[0], "opencode/big-pickle"); got != "http://10.0.0.2:2" {
-		t.Fatalf("crowded pin must spread onto the untaken spare, got %q", got)
-	}
-
-	// below the threshold: pairs share, no re-pinning churn
 	lanesMu.Lock()
-	delete(lanes, "crowd2")
+	l.proxy, l.consec429 = pin, 1
 	lanesMu.Unlock()
-	if lanePinCrowded(pin) {
-		t.Fatal("2 lanes on one pin must stay put (hysteresis)")
-	}
-
-	// thin pool: the spare is taken or absent, so stays crowded-free
-	ls[2].proxy = "http://10.0.0.3:3"
-	zenProxiesMu.Lock()
-	zenProxies = []string{"http://10.0.0.1:1", "http://10.0.0.2:2", "http://10.0.0.3:3"}
-	zenProxiesMu.Unlock()
+	laneRotate(l, model)
 	lanesMu.Lock()
-	lanes["crowd2"] = ls[2]
+	moved := l.proxy
+	strikes := l.consec429
 	lanesMu.Unlock()
-	if lanePinCrowded("http://10.0.0.3:3") {
-		t.Fatal("every pool exit taken means nothing is crowded")
+	if moved == pin {
+		t.Fatal("a lane must not stay on a retired exit")
+	}
+	// the pin changed, so the old exit's counters must not follow it.
+	if strikes != 0 {
+		t.Fatalf("pin change must reset the lane's 429 counters, got %d", strikes)
 	}
 }

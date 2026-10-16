@@ -293,8 +293,14 @@ func nousSend(ctx context.Context, method, target string, body []byte,
 			acclog.Printf("!! 502 nous upstream-error [%s] model=%s: %v", k.Name, model, err)
 			return nil
 		}
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
+		rb, rerr := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
 		resp.Body.Close()
+		if rerr != nil {
+			// a truncated body is not a settled response: report a transport
+			// failure instead of handing the client half an answer.
+			acclog.Printf("!! 502 nous body-read [%s] model=%s: %v", k.Name, model, rerr)
+			return nil
+		}
 
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			nousCoolKey(k.Name)
@@ -321,7 +327,43 @@ func nousSend(ctx context.Context, method, target string, body []byte,
 			Retries: attempt,
 		}
 	}
-	return last429
+	if last429 != nil {
+		return last429
+	}
+	// every key was already cooling before the first attempt, so the portal's
+	// own 429 never arrived. report the pool's rate limit (with the wait)
+	// instead of letting the caller synthesize a 502.
+	if d := nousSoonestRetry(); d > 0 {
+		secs := int(d/time.Second) + 1
+		h := http.Header{}
+		h.Set("Retry-After", strconv.Itoa(secs))
+		h.Set("Content-Type", "application/json")
+		return &nousResult{
+			Status:      http.StatusTooManyRequests,
+			Body:        []byte(`{"error":{"type":"rate_limit_error","message":"nous: all keys rate limited"}}`),
+			Header:      h,
+			RateLimited: true,
+		}
+	}
+	return nil
+}
+
+// nousSoonestRetry is how long until the first cooling key is usable again.
+func nousSoonestRetry() time.Duration {
+	nousKeyMu.RLock()
+	defer nousKeyMu.RUnlock()
+	now := time.Now()
+	var best time.Duration
+	for _, k := range nousKeys {
+		d := k.CooldownTil.Sub(now)
+		if d <= 0 {
+			continue
+		}
+		if best == 0 || d < best {
+			best = d
+		}
+	}
+	return best
 }
 
 // nousFwdHeaders copies the client request, dropping the credentials and

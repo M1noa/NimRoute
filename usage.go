@@ -54,11 +54,14 @@ type usageTotals struct {
 }
 
 // modelHealth is the /status view of one model's recent behavior:
-// working after any success, broken with the code after 3 same-error
-// outcomes in a row across 2+ sellers, unknown before either.
+// working after any success, rate_limited for a 429/529 streak, dead for
+// any other error streak (3 same-code outcomes in a row across 2+ sellers),
+// unknown before either. a model the upstream listing dropped is reported
+// dead with a reason until a request succeeds, which clears the mark.
 type modelHealth struct {
-	State string `json:"state"` // working, broken, unknown
-	Code  int    `json:"code,omitempty"`
+	State  string `json:"state"` // working, rate_limited, dead, unknown
+	Code   int    `json:"code,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // modelOutcome is one finished request: error code (0 = success) and
@@ -77,6 +80,10 @@ var (
 	// outcomesByModel is the recent per-model outcome ring (newest
 	// last, capped) feeding modelHealth.
 	outcomesByModel = map[string][]modelOutcome{}
+	// removedByModel holds models the upstream listing dropped, with the
+	// reason. a success clears the entry: a working request outranks a
+	// missing line in someone else's catalog.
+	removedByModel = map[string]string{}
 )
 
 // noteModelOutcome records one finished request for health. ok =
@@ -94,6 +101,10 @@ func noteModelOutcome(model string, ok bool, code int, key string) {
 // noteModelOutcomeLocked is noteModelOutcome with the lock held
 // (logUsage folds it in without re-locking).
 func noteModelOutcomeLocked(model string, ok bool, code int, key string) {
+	if ok {
+		// the listing is not the truth, a working request is.
+		delete(removedByModel, model)
+	}
 	o := modelOutcome{key: key}
 	if !ok {
 		o.code = code
@@ -104,10 +115,21 @@ func noteModelOutcomeLocked(model string, ok bool, code int, key string) {
 	}
 }
 
+// noteModelRemoved marks a model that vanished from the upstream listing.
+// it is informational: an unlisted model can still serve (stealth/preview
+// ids come and go), so the mark clears on the next success.
+func noteModelRemoved(model, reason string) {
+	totalsMu.Lock()
+	defer totalsMu.Unlock()
+	removedByModel[model] = reason
+}
+
 // modelHealthFor folds a model's recent outcomes: any success in the
 // window = working. else the last 3 failures with the same code across
-// 2+ sellers = broken (single-seller streaks are proxy trouble, not a
-// dead model). anything less = unknown.
+// 2+ sellers = rate_limited for a 429/529 streak, dead for anything else
+// (single-seller streaks are proxy trouble, not a dead model). a model the
+// upstream listing dropped reports dead with that reason. anything less
+// = unknown.
 func modelHealthFor(model string) modelHealth {
 	totalsMu.Lock()
 	defer totalsMu.Unlock()
@@ -115,6 +137,9 @@ func modelHealthFor(model string) modelHealth {
 }
 
 func modelHealthLocked(model string) modelHealth {
+	if reason := removedByModel[model]; reason != "" {
+		return modelHealth{State: "dead", Reason: reason}
+	}
 	oc := outcomesByModel[model]
 	for _, o := range oc {
 		if o.code == 0 {
@@ -129,19 +154,27 @@ func modelHealthLocked(model string) modelHealth {
 				keys[o.key] = true
 			}
 			if len(keys) >= 2 {
-				return modelHealth{State: "broken", Code: last[2].code}
+				state := "dead"
+				if last[2].code == 429 || last[2].code == 529 {
+					state = "rate_limited"
+				}
+				return modelHealth{State: state, Code: last[2].code}
 			}
 		}
 	}
 	return modelHealth{State: "unknown"}
 }
 
-// modelHealthSnapshot returns health for every model with outcomes.
+// modelHealthSnapshot returns health for every model with outcomes or a
+// removal mark.
 func modelHealthSnapshot() map[string]modelHealth {
 	totalsMu.Lock()
 	defer totalsMu.Unlock()
-	out := make(map[string]modelHealth, len(outcomesByModel))
+	out := make(map[string]modelHealth, len(outcomesByModel)+len(removedByModel))
 	for m := range outcomesByModel {
+		out[m] = modelHealthLocked(m)
+	}
+	for m := range removedByModel {
 		out[m] = modelHealthLocked(m)
 	}
 	return out

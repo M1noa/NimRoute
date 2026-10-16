@@ -3,6 +3,7 @@ package pii
 import (
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -82,12 +83,39 @@ func NewCustomDetector(terms []string, entities []CustomTerm, threshold float64)
 // seconds of cpu on the request path. prefilter lines cheaply first.
 const fuzzyWorkBudget = 200000
 
+// lowerMap lowercases text and records, per lowercased byte, the raw byte it
+// came from. strings.ToLower can change byte length (İ U+0130 -> "i",
+// K U+212A -> "k"), so an index into the lowercased copy does not address
+// the original: slicing raw text with it masks the wrong bytes.
+func lowerMap(raw string) (string, []int) {
+	var b strings.Builder
+	b.Grow(len(raw))
+	off := make([]int, 0, len(raw))
+	for i := 0; i < len(raw); {
+		r, size := decodeRune(raw[i:])
+		var buf [4]byte
+		n := encodeRune(buf[:], unicode.ToLower(r))
+		b.Write(buf[:n])
+		for k := 0; k < n; k++ {
+			off = append(off, i)
+		}
+		i += size
+	}
+	return b.String(), off
+}
+
 func (d *customDetector) detect(text string) []Span {
 	var out []Span
 	// exact pass, case-insensitive with case-preserving restore: "Minoa"
 	// must not bypass entity "minoa". offsets walk forward per spelling,
 	// so duplicate lines anchor to their own occurrence, not the first.
-	lower := strings.ToLower(text)
+	lower, off := lowerMap(text)
+	rawEnd := func(i int) int {
+		if i < len(off) {
+			return off[i]
+		}
+		return len(text)
+	}
 	for _, sp := range d.spellings {
 		lsp := strings.ToLower(sp)
 		start := 0
@@ -96,9 +124,10 @@ func (d *customDetector) detect(text string) []Span {
 			if i < 0 {
 				break
 			}
-			st := start + i
-			out = append(out, Span{st, st + len(sp), LCustom, 1, d.source, text[st : st+len(sp)]})
-			start = st + len(sp)
+			lo := start + i
+			st, en := off[lo], rawEnd(lo+len(lsp))
+			out = append(out, Span{st, en, LCustom, 1, d.source, text[st:en]})
+			start = lo + len(lsp)
 		}
 	}
 	// fuzzy pass per line for near-miss spellings. long lines run on

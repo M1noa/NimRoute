@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -227,12 +228,24 @@ func noteRouteLatency(backend string, d time.Duration) {
 	routeLatencyMs.Unlock()
 }
 
+// routeBufLimit caps one buffered candidate response. route/ replays whole
+// bodies (it never streams), so an unbounded upstream response would be
+// held entirely in RAM; past the cap the candidate fails and the next one
+// gets a turn.
+const routeBufLimit = 32 << 20
+
+var errRouteTooLarge = errors.New("route: response exceeds buffer limit")
+
 // routeRecorder buffers one backend attempt: headers, status, body. flush
 // replays it onto the real writer when the attempt wins.
 type routeRecorder struct {
 	header http.Header
 	body   bytes.Buffer
 	status int
+	// set by a completed attempt so the race path can record only the
+	// winner's latency.
+	label   string
+	elapsed time.Duration
 }
 
 func newRouteRecorder() *routeRecorder {
@@ -246,6 +259,10 @@ func (r *routeRecorder) Flush()              {}
 // Write buffers, marking implicit 200 like net/http does when handlers
 // never call WriteHeader explicitly.
 func (r *routeRecorder) Write(b []byte) (int, error) {
+	if r.body.Len()+len(b) > routeBufLimit {
+		r.status = http.StatusBadGateway
+		return 0, errRouteTooLarge
+	}
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
@@ -271,9 +288,7 @@ func routeTry(ctx context.Context, w http.ResponseWriter, fn func(http.ResponseW
 	if ctx.Err() != nil {
 		return false
 	}
-	if !fn(rec) && !rec.won() {
-		return false
-	}
+	fn(rec)
 	if !rec.won() {
 		return false
 	}
@@ -287,7 +302,7 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 	cands := routeCandidates(p, key)
 	if len(cands) == 0 {
 		acclog.Printf("<- 404 %s %s model=%s (no route backends serve %q)", r.Method, r.URL.Path, model, key)
-		http.Error(w, fmt.Sprintf(`{"error":"route: no backends serve %q"}`, key), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("route: no backends serve %q", key))
 		return
 	}
 	try := func(w http.ResponseWriter, cand string) bool {
@@ -322,7 +337,12 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 				rr := r.WithContext(ctx)
 				t0 := time.Now()
 				p.dispatchRouteOAI(rw, rr, nb, cand, backend, id, isStream, start, reqID)
-				noteRouteLatency(backend, time.Since(t0))
+				// only the winner's latency is recorded: a loser's pollutes
+				// the ranking, and which attempt won is not known until the
+				// race settles.
+				if rec, ok := rw.(*routeRecorder); ok && rec.won() {
+					rec.label, rec.elapsed = backend, time.Since(t0)
+				}
 				return true
 			})
 		}
@@ -338,7 +358,7 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 		}
 	}
 	acclog.Printf("<- 502 %s %s model=%s (route %q: all %d backends failed)", r.Method, r.URL.Path, model, key, len(cands))
-	http.Error(w, fmt.Sprintf(`{"error":"route: all backends failed for %q"}`, key), http.StatusBadGateway)
+	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("route: all backends failed for %q", key))
 }
 
 // dispatchRouteOAI runs one candidate on openai-compat paths.
@@ -555,6 +575,9 @@ func routeRace(ctx context.Context, w http.ResponseWriter, fns []func(context.Co
 	rec, ok := <-wins
 	if !ok || rec == nil {
 		return false
+	}
+	if rec.label != "" {
+		noteRouteLatency(rec.label, rec.elapsed)
 	}
 	rec.flush(w)
 	return ok

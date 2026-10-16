@@ -13,11 +13,9 @@ import (
 )
 
 // maskFallbacks counts MaskBody fail-open fallbacks (valid json in,
-// broken json out, original shipped unmasked). exposed for /status.
+// broken json out, original shipped unmasked). kept as a counter because a
+// standing fail-open is an invisible PII leak.
 var maskFallbacks atomic.Int64
-
-// MaskFallbacks returns the process-lifetime fail-open count.
-func MaskFallbacks() int64 { return maskFallbacks.Load() }
 
 // session wiring: per-request guard built from config + incoming headers.
 // replaces anon.go's anonMap end to end.
@@ -175,14 +173,26 @@ func build(cfg Config, sessionID string) *Guard {
 		if e.Replacement == "" {
 			continue
 		}
+		// one fixed surrogate per entity: its own variations share it (they
+		// restore to the entity's name), but a second entity on the same
+		// token would mask to text that restores as the first entity's
+		// value, so that spelling falls back to a vault surrogate instead.
+		claimed, warned := false, false
 		for _, s := range append([]string{e.Name}, e.Variations...) {
 			if s == "" {
 				continue
 			}
-			repl[strings.ToLower(strings.TrimSpace(s))] = e.Replacement
-			if !v.SeedFixed(e.Replacement, s, customLabel(e)) {
-				log.Printf("WARN: anonymize entity %q reuses replacement %q: refusing (first owner wins)", e.Name, e.Replacement)
+			key := strings.ToLower(strings.TrimSpace(s))
+			if !v.SeedFixed(e.Replacement, s, customLabel(e)) && !claimed {
+				if !warned {
+					log.Printf("WARN: anonymize entity %q reuses replacement %q: refusing (first owner wins)", e.Name, e.Replacement)
+					warned = true
+				}
+				delete(repl, key)
+				continue
 			}
+			claimed = true
+			repl[key] = e.Replacement
 		}
 	}
 	return &Guard{
@@ -203,7 +213,9 @@ func (g *Guard) MaskBody(body []byte) []byte {
 	// broke a body that was valid json, ship the original instead — but
 	// say so: silent fail-open is a standing PII leak.
 	if json.Valid(body) && !json.Valid(masked) {
-		maskFallbacks.Add(1)
+		if n := maskFallbacks.Add(1); n == 1 || n%1000 == 0 {
+			log.Printf("WARN: pii mask broke valid json, shipping original unmasked (fallback %d)", n)
+		}
 		return body
 	}
 	return masked

@@ -35,14 +35,16 @@ def main():
     out, into_config = args.out, args.into_config
 
     st, dev = api("POST", "/auth/github/device", {})
-    assert st == 200 and "session_id" in dev, f"device start failed: {st} {dev}"
+    if st != 200 or "session_id" not in dev:
+        sys.exit(f"freepi login: device start failed (HTTP {st}): {dev}")
     sid, interval = dev["session_id"], dev.get("interval", 5)
     print(f"open {dev['verification_uri']} and enter code: {dev['user_code']}")
     input("sign in with github in the browser, then press enter here... ")
 
     st, res = api("POST", "/auth/consent",
                   {"session_id": sid, "consent_version": CONSENT_VERSION})
-    assert st == 200, f"consent failed: {st} {res}"
+    if st != 200:
+        sys.exit(f"freepi login: consent failed (HTTP {st}): {res}")
 
     fails = 0
     while True:
@@ -63,11 +65,14 @@ def main():
             break
         time.sleep(max(interval, res.get("retry_after", 0)))
 
-    # owner-only: the jwt is a 90-day credential.
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(res["token"])
-    print(f"saved jwt to {out} (mode 600)")
+    # owner-only: the jwt is a 90-day credential. skip the standalone file
+    # when the jwt goes into config.yml, so `./nim freepi auth` does not
+    # drop a stray freepi_jwt.txt in the cwd.
+    if not into_config:
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(res["token"])
+        print(f"saved jwt to {out} (mode 600)")
 
     st, me = api("GET", "/me", token=res["token"])
     print(f"token check: HTTP {st} {me if st != 200 else me.get('handle')}")
@@ -114,7 +119,7 @@ def save_into_config(path, jwt, handle):
             lines[aj:aj] = [block.rstrip("\n")]
         s = "\n".join(lines)
     else:
-        s = s.rstrip() + ("\n# --- freepi: ad-supported free models (see FREEPI-DOCS.md) ---\n"
+        s = s.rstrip() + ("\n# --- freepi: ad-supported free models (see docs/reference/freepi-api.md) ---\n"
                           "freepi:\n  enabled: true\n  accounts:\n" + block)
     with open(path, "w") as f:
         f.write(s)

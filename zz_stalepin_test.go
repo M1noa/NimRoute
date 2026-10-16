@@ -2,14 +2,14 @@ package main
 
 import (
 	"testing"
-	"time"
 )
 
 // a dead exit dropped from the pool but still pinned on the lane must not
-// eat every retry: laneReproxy keeps the stale pin when no spare exists,
-// so the transport-error path must fail the lane over like the 429 path
-// does. regression for the nemotron probe case: 5 dials to 192.203.0.250
-// in a row while the model served fine on another lane a second later.
+// eat every retry: laneReproxy moves the lane off it (onto a spare, or onto
+// no pin at all when nothing unique is left), so the transport-error path
+// must fail the lane over like the 429 path does. regression for the
+// nemotron probe case: 5 dials to 192.203.0.250 in a row while the model
+// served fine on another lane a second later.
 func TestStalePinFailsLaneOver(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
@@ -41,11 +41,12 @@ func TestStalePinFailsLaneOver(t *testing.T) {
 	dead := a.proxy
 
 	// the exit dies mid-request: dropped from the pool, still pinned.
-	// thin pool (1 exit left, 2 lanes) shares the live exit instead of
-	// keeping the dead pin: a live shared send beats a dead redial.
+	// thin pool (1 exit left, 2 lanes, b holds it) leaves the lane with no
+	// pin rather than the dead one: a lane never rides an exit another lane
+	// holds, and it never redials the corpse either.
 	dropProxy(dead)
 	if got := laneReproxy(a, "m"); got == dead {
-		t.Fatalf("reproxy kept the dead pin %s, want the shared live exit", got)
+		t.Fatalf("reproxy kept the dead pin %s", got)
 	}
 	if a.proxy == dead {
 		t.Fatalf("lane still pinned to dropped exit %s", dead)
@@ -54,13 +55,12 @@ func TestStalePinFailsLaneOver(t *testing.T) {
 	// the fixed branch: same pin back means move lanes, not re-dial.
 	if laneReproxy(a, "m") == dead {
 		a = laneFailover(a)
+		if a == nil {
+			t.Fatal("failover must never be nil")
+		}
 		laneRotate(a, "m")
 	}
 	if a.proxy == dead {
 		t.Fatalf("lane still pinned to dropped exit %s", dead)
 	}
-	if a == nil {
-		t.Fatal("failover must never be nil")
-	}
-	_ = time.Now // keep the import honest if the body above shrinks
 }

@@ -35,11 +35,9 @@ func TestIsTLSFailure(t *testing.T) {
 	}
 }
 
-func resetTLSBurns() {
-	tlsBurnMu.Lock()
-	defer tlsBurnMu.Unlock()
-	tlsBurned = map[string]time.Time{}
-}
+// resetTLSBurns clears the exit-health registry (dead and rate-limited marks
+// live in the same rows as the 429 counters).
+func resetTLSBurns() { resetBurns() }
 
 func setPool(proxies ...string) {
 	zenProxiesMu.Lock()
@@ -61,8 +59,8 @@ func TestTLSBanSkipsPicker(t *testing.T) {
 		t.Fatalf("unbanned single exit must be picked, got %q", got)
 	}
 	banTLSExit("http://9.9.9.9:1")
-	if !exitTLSBanned("http://9.9.9.9:1") {
-		t.Fatal("banned exit must report banned")
+	if !exitDead("http://9.9.9.9:1") {
+		t.Fatal("banned exit must report dead")
 	}
 	if got := pickLaneProxyFor(""); got != "" {
 		t.Fatalf("banned exit must not be picked, got %q", got)
@@ -106,15 +104,33 @@ func TestTLSBanEvictsPins(t *testing.T) {
 	}
 }
 
-// the refresh must not re-admit banned exits: a mitm exit passes verify
-// intermittently, so the candidate filter is the only gate.
-func TestRefreshSkipsTLSBanned(t *testing.T) {
+// a dead exit must never be picked, must not come back through the picker
+// after a dry-pool recheck (the recheck clears rate-limit marks only: a
+// mitm exit fails every real send), and must not be re-verified into the
+// pool by the refresh candidate filter.
+func TestDeadExitStaysOutOfRotation(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
 	resetTLSBurns()
 	defer resetTLSBurns()
+	setPool("http://9.9.9.9:1", "http://10.0.0.2:2")
+	defer setPool()
+
 	banTLSExit("http://9.9.9.9:1")
-	got := skipTLSBanned([]string{"http://9.9.9.9:1", "http://10.0.0.2:2"})
-	if len(got) != 1 || got[0] != "http://10.0.0.2:2" {
-		t.Fatalf("banned exit must be filtered, got %v", got)
+	if !exitDead("http://9.9.9.9:1") {
+		t.Fatal("mitm exit must be marked dead")
+	}
+	for i := 0; i < 20; i++ {
+		if p := pickLaneProxyFor(""); p == "http://9.9.9.9:1" {
+			t.Fatalf("dead exit picked: %s", p)
+		}
+	}
+	recheckAllExits()
+	if !exitDead("http://9.9.9.9:1") {
+		t.Fatal("a dry-pool recheck must not revive a dead exit")
+	}
+	if n := countDeadExits(); n != 1 {
+		t.Fatalf("dead count = %d, want 1", n)
 	}
 }
 
@@ -157,32 +173,47 @@ func TestNetErrRefreshCooldown(t *testing.T) {
 	}
 }
 
-// a thin pool must share, not starve: with 1 exit and 2 lanes the second
-// lane takes the taken exit (least-loaded) instead of "". owner: lane
-// picker (pickLaneProxyFor). regression for cold-start 502s where every
-// lane past the first failed until the sweep finished.
-func TestThinPoolSharesExit(t *testing.T) {
+// a thin pool never shares: with 1 exit and a second lane asking, the picker
+// answers "" instead of the exit the first lane holds. two lanes on one exit
+// split its per-exit budget, so the shared exit 429s sooner and both lanes
+// eat the limit. owner: lane picker (pickLaneProxyFor) + laneReproxy.
+func TestThinPoolNeverShares(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	resetBurns()
 	defer resetBurns()
 	resetTLSBurns()
 	defer resetTLSBurns()
+	// the pool is thinner than the lane table, so the pin path asks for a
+	// refill: hold the refresh mutex so the trip collapses without network.
+	zenRefreshMu.Lock()
+	defer zenRefreshMu.Unlock()
 	setPool("http://10.0.0.1:1")
 	defer setPool()
 
-	body := []byte(`{"messages":[{"role":"user","content":"a"}]}`)
-	a := laneFor("share-a", body)
-	b := laneFor("share-b", body)
-	if p := laneReproxy(a, "m"); p == "" {
-		t.Fatal("first lane pinned nothing")
+	a := &zenLane{id: "share-a", session: zenSession()}
+	b := &zenLane{id: "share-b", session: zenSession()}
+	lanesMu.Lock()
+	lanes["a"], lanes["b"] = a, b
+	lanesMu.Unlock()
+	if p := laneReproxy(a, "m"); p != "http://10.0.0.1:1" {
+		t.Fatalf("first lane must pin the only exit, got %q", p)
 	}
-	// every exit taken: must share the live exit, never "".
-	if p := pickLaneProxyFor("m"); p != "http://10.0.0.1:1" {
-		t.Fatalf("thin pool must share the exit, got %q", p)
+	// every exit taken: no pin, never a second lane on the same exit.
+	if p := pickLaneProxyFor("m"); p != "" {
+		t.Fatalf("thin pool must not hand the taken exit to a second lane, got %q", p)
 	}
-	if p := laneReproxy(b, "m"); p != "http://10.0.0.1:1" {
-		t.Fatalf("second lane must share the exit, got %q", p)
+	if p := laneReproxy(b, "m"); p != "" {
+		t.Fatalf("second lane must get no pin, got %q", p)
+	}
+	lanesMu.Lock()
+	bp := b.proxy
+	lanesMu.Unlock()
+	if bp != "" {
+		t.Fatalf("second lane kept the shared pin %q", bp)
+	}
+	if got := dupPin(); got != "" {
+		t.Fatalf("two lanes hold %q", got)
 	}
 }
 
@@ -261,31 +292,296 @@ func TestConcurrentReproxyStaysUnique(t *testing.T) {
 	}
 }
 
-// leastLoadedExit balances: the exit with fewer pins wins, burned exits
-// never win. owner: lane picker.
-func TestLeastLoadedExit(t *testing.T) {
+// a pool narrower than the lane table must ask for a refill: every exit
+// ends up pinned, so no lane can draw a unique one and the pins that verify
+// pile up. cooldown-gated like every other trip, and silent on a cold start
+// (watchZenProxies already owns that sweep). owner: pool sizing.
+func TestPoolThinTriggersRefill(t *testing.T) {
+	c := testConfig()
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
+	// collapse the sweep without network.
+	zenRefreshMu.Lock()
+	defer zenRefreshMu.Unlock()
+	stamp := func(ago time.Duration) {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = time.Now().Add(-ago)
+		zenProxiesMu.Unlock()
+	}
+	lanes := func(n int) {
+		resetLanes()
+		for i := 0; i < n; i++ {
+			lanesMu.Lock()
+			lanes[fmt.Sprintf("l%d", i)] = &zenLane{id: "x", session: zenSession()}
+			lanesMu.Unlock()
+		}
+	}
+	old := zenPoolRefreshed
+	defer func() {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = old
+		zenProxiesMu.Unlock()
+	}()
+
+	// fat pool: nothing to refill, no trip.
+	setPool("http://10.0.0.1:1", "http://10.0.0.2:2", "http://10.0.0.3:3")
+	defer setPool()
+	lanes(3)
+	stamp(time.Hour)
+	before := zenPoolRefreshed
+	maybeRefreshPoolThin()
+	if !zenPoolRefreshed.Equal(before) {
+		t.Fatal("pool covering the lane table must not trip a refresh")
+	}
+
+	// thin pool outside the cooldown: trip.
+	lanes(5)
+	stamp(time.Hour)
+	before = zenPoolRefreshed
+	maybeRefreshPoolThin()
+	if zenPoolRefreshed.Equal(before) {
+		t.Fatal("pool narrower than the lane table must trip a refresh")
+	}
+
+	// thin pool inside the cooldown: skip, no stamp.
+	lanes(5)
+	stamp(10 * time.Second)
+	before = zenPoolRefreshed
+	maybeRefreshPoolThin()
+	if !zenPoolRefreshed.Equal(before) {
+		t.Fatal("trip inside the cooldown must skip")
+	}
+
+	// cold start: the boot sweep owns it.
+	setPool()
+	resetLanes()
+	stamp(time.Hour)
+	before = zenPoolRefreshed
+	maybeRefreshPoolThin()
+	if !zenPoolRefreshed.Equal(before) {
+		t.Fatal("empty pool must not trip: watchZenProxies owns the cold sweep")
+	}
+}
+
+// a pool whose every exit is taken or marked for a model sweeps for fresh
+// exits and hands out the least-recently-marked one as a second chance,
+// instead of sharing an exit or clearing every mark. clearing the marks put
+// the exits that had just 429'd straight back at the front of the rotation.
+// owner: pickLaneProxyExcluding's dry branch + recheckAllExits.
+func TestDryPoolSecondChanceKeepsMarks(t *testing.T) {
 	resetLanes()
 	defer resetLanes()
 	resetBurns()
 	defer resetBurns()
+	resetTLSBurns()
+	defer resetTLSBurns()
+	// hold the refresh mutex so the trip collapses without network.
+	zenRefreshMu.Lock()
+	defer zenRefreshMu.Unlock()
 	setPool("http://10.0.0.1:1", "http://10.0.0.2:2")
 	defer setPool()
+	oldRefreshed := zenPoolRefreshed
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now().Add(-time.Hour)
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = oldRefreshed
+		zenProxiesMu.Unlock()
+	}()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
 
+	// both exits written off for m: one rate-limited, one refusing the model.
+	markExitRateLimited("http://10.0.0.1:1", "m", "test")
+	noteExitModelBurned("http://10.0.0.2:2", "m")
+
+	// a free-tier refusal is a hard no; the rate-limited exit gets the pick.
+	if got := pickLaneProxyFor("m"); got != "http://10.0.0.1:1" {
+		t.Fatalf("dry pick = %q, want the least-recently-marked exit http://10.0.0.1:1", got)
+	}
+	if left := countRateLimited(); left != 1 {
+		t.Fatalf("a dry pick must not clear marks, %d left of 1", left)
+	}
+	if !exitModelBurned("http://10.0.0.2:2", "m") {
+		t.Fatal("a dry pick must not clear the model refusals")
+	}
+	// the dry pick outside the cooldown fired a fresh sweep.
+	zenProxiesMu.RLock()
+	moved := time.Since(zenPoolRefreshed) < time.Minute
+	zenProxiesMu.RUnlock()
+	if !moved {
+		t.Fatal("a dry pick outside the cooldown must fire a fresh sweep")
+	}
+}
+
+// a pool thinner than the lane table is not a dry pool: nothing is written
+// off, so there is nothing to recheck and the cooldown stamp stays put.
+func TestThinPoolIsNotDry(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	setPool("http://10.0.0.1:1")
+	defer setPool()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	useConfig(t, c)
+
+	before := zenPoolRefreshed
+	if recheckAllExits() {
+		t.Fatal("nothing written off: recheck must not fire")
+	}
+	zenProxiesMu.RLock()
+	after := zenPoolRefreshed
+	zenProxiesMu.RUnlock()
+	if !after.Equal(before) {
+		t.Fatal("a no-op recheck must not stamp the refresh cooldown")
+	}
+}
+
+// a dry pick inside the refresh cooldown still answers with an exit (the
+// oldest mark) and leaves the cooldown stamp alone: the cooldown gates
+// verify sweeps, not the pick itself, and a "no proxy available" 502 is what
+// the ladder must never see. owner: pickLaneProxyExcluding + recheckAllExits.
+func TestDryPickSecondChanceInsideCooldown(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	resetTLSBurns()
+	defer resetTLSBurns()
+	setPool("http://10.0.0.1:1", "http://10.0.0.2:2")
+	defer setPool()
+	oldRefreshed := zenPoolRefreshed
+	defer func() {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = oldRefreshed
+		zenProxiesMu.Unlock()
+	}()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
+	// refresh fired 10s ago: the refetch sits inside the cooldown window.
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now().Add(-10 * time.Second)
+	zenProxiesMu.Unlock()
+
+	// both exits written off for m: one rate-limited, one refusing the model.
+	markExitRateLimited("http://10.0.0.1:1", "m", "test")
+	noteExitModelBurned("http://10.0.0.2:2", "m")
+
+	before := zenPoolRefreshed
+	if got := pickLaneProxyFor("m"); got != "http://10.0.0.1:1" {
+		t.Fatalf("dry pick inside cooldown = %q, want the marked exit, not 502", got)
+	}
+	zenProxiesMu.RLock()
+	after := zenPoolRefreshed
+	zenProxiesMu.RUnlock()
+	if !after.Equal(before) {
+		t.Fatal("refetch inside the cooldown window must not stamp the cooldown")
+	}
+	left, leftBurned := countRateLimited(), 0
+	if exitModelBurned("http://10.0.0.2:2", "m") {
+		leftBurned = 1
+	}
+	if left != 1 || leftBurned != 1 {
+		t.Fatalf("a dry pick must keep the written-off state: %d marks, %d burns", left, leftBurned)
+	}
+}
+
+// regression for live 502s with 11 verified exits across 15 lanes: when the
+// pool is thinner than the lane table AND every free exit is written off,
+// pinUniqueProxy must still land a pin through the dry pick's second chance.
+// owner: pinUniqueProxy + pickLaneProxyExcluding.
+func TestPinUniqueProxyThinPoolDoesNotStarveRecheck(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	resetBurns()
+	defer resetBurns()
+	resetTLSBurns()
+	defer resetTLSBurns()
+	zenRefreshMu.Lock()
+	defer zenRefreshMu.Unlock()
+	setPool("http://10.0.0.1:1", "http://10.0.0.2:2")
+	defer setPool()
+	oldRefreshed := zenPoolRefreshed
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now().Add(-time.Hour)
+	zenProxiesMu.Unlock()
+	defer func() {
+		zenProxiesMu.Lock()
+		zenPoolRefreshed = oldRefreshed
+		zenProxiesMu.Unlock()
+	}()
+	c := testConfig()
+	c.Zen.AlwaysProxy = true
+	c.Zen.Lanes = 5
+	c.Zen.PoolRefreshCooldownSecs = 120
+	useConfig(t, c)
+
+	// 5 lanes > 2 pool exits (thin pool); exit 1 pinned on the first lane,
+	// exit 2 marked for the model so every free exit is written off for it.
+	ensureSharedLanes()
+	var target *zenLane
 	lanesMu.Lock()
-	lanes["x"] = &zenLane{id: "x", session: zenSession(), proxy: "http://10.0.0.1:1"}
-	lanes["y"] = &zenLane{id: "y", session: zenSession(), proxy: "http://10.0.0.1:1"}
-	lanes["z"] = &zenLane{id: "z", session: zenSession(), proxy: "http://10.0.0.2:2"}
+	first := true
+	for _, l := range lanes {
+		if first {
+			l.proxy = "http://10.0.0.1:1"
+			first = false
+		} else if target == nil {
+			target = l
+		}
+	}
+	lanesMu.Unlock()
+	markExitRateLimited("http://10.0.0.2:2", "m", "test")
+
+	got := pinUniqueProxy(target, "m")
+	if got != "http://10.0.0.2:2" {
+		t.Fatalf("pinUniqueProxy on thin+written-off pool = %q, want http://10.0.0.2:2", got)
+	}
+}
+
+// regression for live 502s ("no proxy available") when 14 of 15 lanes are
+// unpinned and 1 lane holds the only working exit: laneFailover must prefer
+// a pinned lane over unpinned ones so the retry ladder reaches the working
+// exit in one hop instead of walking 7 pinless lanes and 502ing.
+// owner: laneFailover.
+func TestLaneFailoverPrefersPinnedLane(t *testing.T) {
+	resetLanes()
+	defer resetLanes()
+	c := testConfig()
+	c.Zen.Lanes = 15
+	useConfig(t, c)
+
+	now := time.Now()
+	var start, pinned *zenLane
+	lanesMu.Lock()
+	for i := 0; i < 14; i++ {
+		l := &zenLane{
+			id:       fmt.Sprintf("shared:p%02d", i),
+			session:  zenSession(),
+			lastUsed: now.Add(-time.Duration(i+2) * time.Minute),
+		}
+		lanes[l.id] = l
+		if start == nil {
+			start = l
+		}
+	}
+	pinned = &zenLane{
+		id:       "shared:holder",
+		session:  zenSession(),
+		proxy:    "socks4://142.54.239.1:4145",
+		lastUsed: now.Add(-10 * time.Second), // fresher than every pinless lane
+	}
+	lanes[pinned.id] = pinned
 	lanesMu.Unlock()
 
-	if got := leastLoadedExit("m"); got != "http://10.0.0.2:2" {
-		t.Fatalf("want the 1-pin exit, got %q", got)
-	}
-	burnExit("http://10.0.0.2:2", "m")
-	if got := leastLoadedExit("m"); got != "http://10.0.0.1:1" {
-		t.Fatalf("burned exit must lose, got %q", got)
-	}
-	burnExit("http://10.0.0.1:1", "m")
-	if got := leastLoadedExit("m"); got != "" {
-		t.Fatalf("all burned must be dry, got %q", got)
+	if got := laneFailover(start); got != pinned {
+		t.Fatalf("laneFailover picked %s (proxy=%q), want pinned lane %s", got.id, got.proxy, pinned.id)
 	}
 }

@@ -43,12 +43,15 @@ incidental machinery.
   is present; fewer than six of the exact definitions 403s FreeTierError,
   and client tool name spoofing/extra client tools pass). upstream tool
   call names pointing at the ballast (`shell`, `subagent`, ...) map back
-  via `zenToolAliases` in `toolNames.resolve`.
-- **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
+  via `zenToolAliases` in `toolNames.resolve`.- **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
   one live stream per account jwt (server 409s a second); accounts rotate
   on failure, queue up to `freepi.queue_wait_secs` (default 60s). jwt only
-  ever rides as a request header, never logged, never in `/status`.
-  ads run silently per account (banner + inline impressions).
+  ever rides as a request header, never logged, never in `/status`. ads run
+  silently per account (banner + inline impressions). a rate limit is never
+  forwarded: `hourly_ceiling` is not retryable (waiting on the queue cannot
+  clear an hourly cap, so it fails fast and lets siblings take their shot),
+  and every exhausted-account limit becomes a 503 naming the cap
+  (`freepiClientStatus`).
 - **antseed**: p2p `antseed/<model>` ids via dialed sellers (stats snapshot
   discovery, DHT fallback). keyless: identity minted fresh in memory per
   run. snapshot addresses are untrusted claims: `antEndpointOK` rejects
@@ -78,8 +81,10 @@ incidental machinery.
   both dispatch tables (ServeHTTP and `handleAnthropic`) carry the prefix;
   a new backend needs a branch in each. `backendForModel` (debugtrace.go)
   needs a case too or traces mislabel the backend.
-  inbound bodies capped at 10MB (`bodyLimit`). service via
-  `./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|install|uninstall|freepi auth`.
+  inbound bodies capped at 10MB (`bodyLimit`). `route/` is handled in
+  `route.go` (dispatch sites in `main.go` and `anthropic.go`). service via
+  `./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|models [N]|models sync|install|uninstall|freepi auth|help`
+  (docs/service.md is the user-facing copy).
 
 ## 2. code quality rules
 
@@ -107,11 +112,11 @@ incidental machinery.
 
 - `config.yml.example` is the schema source of truth. `defaultConfig()`
   (config.go) holds runtime defaults; the two must agree.
-- true-by-default bools need raw-doc presence checks in `loadConfigFile`:
-  yaml can't tell absent from false, so check the raw map for the key
-  before honoring a false (see `nvidia.enabled`, `zen.enabled`,
-  `usage.enabled`, `status.show_usage`/`show_pool`, guardrail
-  threshold/weights). any new default-true bool needs the same treatment.
+- true-by-default bools need no special handling in `loadConfigFile`: it
+  starts from `defaultConfig()`, and yaml.v3 leaves an absent or null key
+  untouched, so only an explicit `false` flips a default. the old raw-doc
+  presence checks were no-ops and were removed (2026-10-15);
+  `TestLoadConfigFileEnabledDefaults` pins the invariant.
 - new keys: document in the example with a comment, give a default in
   `defaultConfig()`, wire the presence check if default-true.
   `mergeMissingKeys` is append-only commented (`# added:` header,
@@ -123,8 +128,8 @@ incidental machinery.
   `model_info.jsonc`, loaded by `modelinfo.go`, hot-reloaded with the
   config. `injectParams` only folds camelCase and strips `"_nim"`; no
   sampling defaults are ever injected. new models need an entry or they
-  fall back to 131072 ctx + derived name (TODO item 9: startup warn for
-  unmatched `/v1/models` ids).
+  fall back to 131072 ctx + derived name (docs/TODO.md item 9: startup warn
+  for unmatched `/v1/models` ids).
 - usage tracking (`usage.go`): gated on `usage.enabled`, one json line
   per request to `nim-usage.jsonl` plus in-memory totals for `/status`.
   counters only move through `logUsage`; zero overhead when disabled.
@@ -148,17 +153,46 @@ incidental machinery.
 
 | signal | meaning | action |
 |---|---|---|
-| 429 | per-exit rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits. `pool_refresh_429s` lanes limited = stale pool, refresh fires | normal, no fix |
-| 403 FreeTierError | per-exit-per-model burn (`burnExit`, `exit_burn_minutes` default 30m). lane forgets exit, rotates away | normal, no fix. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
+| 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15) and ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for the cycle (`noteExit429`), cleared by the next refresh. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
+| 403 FreeTierError | per-exit-per-model refusal for the cycle (`noteExitModelBurned`). the exit stays poolable for other models; lane rotates away | normal, no fix. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
+| 502/503/504 from an exit | dead exit or a proxy in front of it failing (`zenRetryableStatus`). rotated like a 429, also never forwarded | normal noise, no fix |
 | 403 geo (`not available in your country`) / `[user_blocked]` | exit banned or region-blocked. `dropProxy` + failover; threshold (`error_threshold`, default 3) refreshes pool | normal, no fix |
 | 502 / transport error | dead exit, dropped from pool (`dropProxy`, transport closed) | normal noise, no fix |
 | 529 | treated as 429 in both NIM and zen paths | normal, no fix |
 | persistent all-exit failure | no success for `stale_pool_secs` (default 15s) with a lane limited the whole time = stale pool/sessions: refresh + `resetStaleLanes` | fix the refresh/rotation path, not the retry loop |
 
-Investigate only when rotation stops working: same burned exit reused,
-sessions never refreshing, refresh storms (see TODO item 10: raise
-`pool_refresh_429s`, cooldown between refreshes before touching retry
-logic).
+client contract: no zen response ever carries a rate limit. every 429/529
+an exit returns is absorbed by rotation, and a spent ladder answers
+`exhaustedExits` — a `proxy_exhausted` 503 naming the pool state — so the
+caller retries against us instead of waiting us out. `ProxyUnavailableMsg`
+is the shared text for the other "could not place this request on an exit"
+exits (dial-dead, no pin under `always_proxy`, empty pool).
+
+exit states live in one registry (`exitState` in zenlanes.go):
+`rate_limited` keyed by exit+model (2 in a row or 6 a cycle, expires at the
+refresh), `dead` (transport/tls, `deadTTL`). both are cleared by
+`clearExitRateLimits` when a sweep completes, and *only* there: a dry pick
+must never clear marks. it used to, which put the exits that had just 429'd
+straight back at the front of the rotation and made the same few exits
+ping-pong between limited and usable while the pool looked permanently
+dry. instead, a dry pick fires a fresh sweep (cooldown-gated, skipping the
+current exits) and hands out the least-recently-marked one
+(`secondChancePick`).
+
+pool sizing is what keeps that path rare: one sweep aims for 3 exits per
+lane (`poolTarget`, floor 24) and stops as soon as it holds them, so the
+pool is bigger than the lane table and rotation has spares. `max_response_ms`
+is a coarse pre-filter on the list's own noisy figure, not a latency
+promise — tightening it is what starves the pool (only ~1 in 10 candidates
+dials at any claimed speed). lanes are capped at the pool size
+(`laneCapFor`) so every lane can hold its own exit; a 30m refresh
+(`refresh_interval_minutes`) refills the table and re-pins idle lanes
+(`ensureLanePins`).
+
+Investigate only when rotation stops working: same rate-limited exit
+reused, sessions never refreshing, refresh storms (see docs/TODO.md item
+10: raise `pool_refresh_429s`, cooldown between refreshes before touching
+retry logic).
 
 ## 6. skills
 
@@ -179,6 +213,14 @@ logic).
   limits rotate exit+session instantly (`laneRotate`), never a cooldown.
   conversions allocate a fresh lane and drop the idlest shared one;
   in-place lane renames are forbidden (in-flight pointer aliasing).
+- one proxy exit per lane, always. the picker never hands out a taken exit
+  and no pin path keeps a pin another lane holds (`lanePinnedElsewhere`,
+  `pinUniqueProxy`, `laneTouch`); a lane with nothing unique left carries no
+  pin and sends direct (or hands the request to a lane that owns one).
+  when every exit is taken or written off, `recheckAllExits` clears the
+  long-burns + per-model burns and refetches the list rather than sharing.
+  sharing one exit across lanes is what piles a table onto one ip and
+  429s it, so never reintroduce a least-loaded fallback.
 - proxy urls may embed `user:pass`. run `redactProxyUserinfo` before any
   proxy value reaches `/status` AND logs.
 - never forward client credentials upstream: NIM path has a header

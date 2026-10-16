@@ -184,49 +184,6 @@ func zenLeafSegments(v any, seg int) int {
 	return best
 }
 
-// zenSchemaRank kept for the rank-based assertion below: deepest schema-node
-// rank in v, starting at rank. root schema is rank 1, properties/items
-// children rank+1, anyOf/oneOf/allOf branches at the parent rank.
-func zenSchemaRank(v any, rank int) int {
-	switch t := v.(type) {
-	case map[string]any:
-		m := rank
-		for k, x := range t {
-			switch k {
-			case "anyOf", "oneOf", "allOf":
-				// branches charged at the parent's rank
-				if d := zenSchemaRank(x, rank); d > m {
-					m = d
-				}
-			case "properties":
-				// holder map: children are rank+1, holder itself free
-				if pm, ok := x.(map[string]any); ok {
-					for _, pv := range pm {
-						if d := zenSchemaRank(pv, rank+1); d > m {
-							m = d
-						}
-					}
-				}
-			case "items", "additionalProperties":
-				if d := zenSchemaRank(x, rank+1); d > m {
-					m = d
-				}
-			}
-		}
-		return m
-	case []any:
-		m := rank - 1 // a bare array is a container only in items position
-		for _, x := range t {
-			if d := zenSchemaRank(x, rank); d > m {
-				m = d
-			}
-		}
-		return m
-	default:
-		return rank - 1
-	}
-}
-
 // TestSanitizeZenSchemaDropsOverBudgetRequired covers the second-order
 // 400: the tail beyond zen's budget is omitted, so any surviving required
 // list must not name a property that was dropped with it.

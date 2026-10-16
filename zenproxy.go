@@ -19,10 +19,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0&response_max=400"
+// proxyListURL is the third-party exit list. a var, not a const, so the test
+// suite can point it at a dead local port: a stray refresh trip during a test
+// used to fetch the real list and fill the pool with live internet exits.
+//
+// the list's own response-time figure is unreliable (a "5ms"
+// entry is as likely to be dead as a "1500ms" one), so the fetch asks for
+// everything and lets verification decide. capping the list at 400ms was
+// what starved the pool: only ~160 https-capable entries survived, and about
+// one in ten of those dials, leaving fewer exits than lanes.
+var proxyListURL = "https://proxies.minoa.cat/list?format=json&sort=response&limit=0&response_max=6000"
 
 // zenBlockedCountries are api-reported countries whose exits zen geo-blocks
 // for muse-spark (RegionError "not available in your country"). from the
@@ -166,7 +176,25 @@ func schemeFor(protocols []string) string {
 	return ""
 }
 
-func refreshZenProxies() {
+// poolTarget is how many verified exits a sweep aims to hold: three per
+// lane, so every lane owns an exit and a 429 rotation has two spares to
+// move through before the pool is dry. never more than the configured
+// pool_size, never less than 24.
+func poolTarget() int {
+	t := 3 * laneCap()
+	if t < 24 {
+		t = 24
+	}
+	if n := cfg().Zen.PoolSize; n > 0 && t > n {
+		t = n
+	}
+	return t
+}
+
+// refreshZenProxies sweeps the list and swaps in the verified set. fresh
+// skips re-verifying the exits already in the pool: the dry-pool path uses
+// it to go looking for exits other than the ones that just rate-limited.
+func refreshZenProxies(fresh bool) {
 	cl := &http.Client{Timeout: 15 * time.Second}
 	resp, err := cl.Get(proxyListURL)
 	if err != nil {
@@ -212,9 +240,11 @@ func refreshZenProxies() {
 	seenCand := map[string]bool{}
 	for _, e := range fast {
 		u := schemeFor(e.Protocols) + "://" + e.IP + ":" + strconv.Itoa(e.Port)
-		if exitTLSBanned(u) {
-			continue // mitm exit: banned, never re-verify it
+		if exitDead(u) {
+			continue // mitm/transport-dead exit: never re-verify into the pool
 		}
+		// rate-limited exits stay candidates on purpose: the sweep is how
+		// they earn their way back, and the marks clear when it completes.
 		if seenCand[u] {
 			continue // list servers repeat entries: never check the same exit twice
 		}
@@ -224,6 +254,44 @@ func refreshZenProxies() {
 		lats[u] = e.ResponseTimeMs
 		relis[u] = e.Reliability
 	}
+	// order the sweep: a periodic refresh re-checks the exits it is already
+	// serving first, so the pool it replaces keeps its known-good members and
+	// the early stop below spends most of the budget there. a fresh sweep
+	// (dry pool) skips the current set on purpose: those are the exits that
+	// just 429'd every model, and re-verifying them buys nothing.
+	zenProxiesMu.RLock()
+	existing := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	if !fresh && len(existing) > 0 {
+		seen := make(map[string]bool, len(cands)+len(existing))
+		order := make([]string, 0, len(cands)+len(existing))
+		for _, u := range existing {
+			if seen[u] {
+				continue
+			}
+			seen[u] = true
+			order = append(order, u)
+		}
+		for _, u := range cands {
+			if seen[u] {
+				continue
+			}
+			seen[u] = true
+			order = append(order, u)
+		}
+		cands = order
+	}
+	// target is the pool the sweep aims for, budget the candidate ceiling:
+	// one exit per lane plus a rotation set, and a bounded number of dials so
+	// a list with thousands of entries cannot turn one refresh into minutes.
+	// the early stop below halts the sweep the moment the target is met.
+	target := poolTarget()
+	budget := target * 16
+	if budget > len(cands) {
+		budget = len(cands)
+	}
+	cands = cands[:budget]
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	verified := make([]string, 0, len(cands))
@@ -245,7 +313,8 @@ func refreshZenProxies() {
 	// is already serving is left alone: the final applyVerifiedPool below owns
 	// that swap, so an hourly refresh never churns exits mid-sweep.
 	cold := coldSweep
-	lastPub, warmed := time.Time{}, false
+	lastPub := time.Time{}
+	var warmOnce sync.Once
 	publish := func() {
 		if !cold {
 			return
@@ -283,13 +352,26 @@ func refreshZenProxies() {
 		zenPoolRefreshed = time.Now()
 		zenPoolCands = len(cands)
 		zenProxiesMu.Unlock()
-		if !warmed {
-			warmed = true
-			// lanes + transports on the first usable exits, so the
-			// earliest request skips lane creation and tls setup.
+		// lanes + transports on the first usable exits, so the earliest
+		// request skips lane creation and tls setup. sync.Once: every
+		// verify goroutine calls publish concurrently.
+		warmOnce.Do(func() {
 			ensureSharedLanes()
 			warmZenTransports(snap)
 			log.Printf("  zen proxies: %d verified (pool warming, %d candidates left)", len(snap), len(cands)-len(snap))
+		})
+	}
+	// stop closes once the target is verified. every worker re-checks it
+	// after taking a verify slot, so the sweep ends within one wave of the
+	// target being met instead of dialing the rest of the list.
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	hitTarget := func() {
+		mu.Lock()
+		n := len(verified)
+		mu.Unlock()
+		if n >= target {
+			stopOnce.Do(func() { close(stop) })
 		}
 	}
 	sem := make(chan struct{}, verifyConc)
@@ -297,13 +379,24 @@ func refreshZenProxies() {
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			select {
+			case <-stop:
+				return // the wave ahead of us filled the pool
+			default:
+			}
 			if verifyProxy(u) {
 				mu.Lock()
 				verified = append(verified, u)
 				mu.Unlock()
 				publish()
+				hitTarget()
 			}
 		}(u)
 	}
@@ -339,7 +432,7 @@ func refreshZenProxies() {
 	// also pre-build transports so the first send skips tls/dial setup.
 	ensureSharedLanes()
 	warmZenTransports(verified)
-	log.Printf("  zen proxies: %d verified of %d candidates", len(verified), len(cands))
+	log.Printf("  zen proxies: %d verified of %d candidates dialed (target %d)", len(verified), len(cands), target)
 }
 
 // savedPool is the last verified pool, loaded at boot so requests serve
@@ -598,7 +691,9 @@ func probeHTTPConnect(ctx context.Context, pu *url.URL, target string) bool {
 	if _, err := io.WriteString(c, sb.String()); err != nil {
 		return false
 	}
-	line, err := bufio.NewReader(c).ReadString('\n')
+	// cap the reply: a hostile proxy that never sends a newline must not
+	// stream into memory.
+	line, err := bufio.NewReader(io.LimitReader(c, 4096)).ReadString('\n')
 	if err != nil {
 		return false
 	}
@@ -637,11 +732,19 @@ func sampleProxies(n int) []string {
 
 // applyVerifiedPool swaps in a fresh verified set. empty verifies keep
 // the old pool: a failed sweep must never wipe working exits. lanes keep
-// their pins on refresh: an old exit keeps serving until a real send
-// proves it dead, so refresh can never clear all lanes at once.
+// their pins while the exit is still usable, so refresh can never clear
+// every lane at once; a lane whose exit is gone or marked is re-pinned to
+// a spare instead of falling back to direct.
+//
+// a completed sweep is a cycle boundary: the 429 marks from the last cycle
+// are dropped here, together with their per-cycle counters, so an exit that
+// was merely busy this cycle is usable again. dead marks survive until
+// their ttl (a dead exit must verify again before it is used).
 func applyVerifiedPool(verified []string) {
 	if len(verified) == 0 {
 		log.Printf("  zen proxies: verify found 0, keeping old pool")
+		clearExitRateLimits()
+		ensureLanePins()
 		return
 	}
 	zenProxiesMu.Lock()
@@ -655,6 +758,8 @@ func applyVerifiedPool(verified []string) {
 		keep[v] = true
 	}
 	pruneDeadExits(keep)
+	clearExitRateLimits()
+	ensureLanePins()
 	log.Printf("  zen proxies: %d verified", left)
 }
 
@@ -669,6 +774,7 @@ func dropProxy(proxyURL string) {
 	}
 	zenProxiesMu.Lock()
 	found := false
+	left := 0
 	for i, p := range zenProxies {
 		if p == proxyURL {
 			if len(zenProxies) <= 1 {
@@ -678,13 +784,16 @@ func dropProxy(proxyURL string) {
 			}
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			found = true
+			left = len(zenProxies)
 			zenPoolDropped++
-			log.Printf("  zen proxies: dropped %s (left %d)", redactProxyUserinfo(proxyURL), len(zenProxies))
 			break
 		}
 	}
 	zenProxiesMu.Unlock()
 	if found {
+		// logged outside the pool lock: an io writer must not stall every
+		// picker and snapshot behind it.
+		log.Printf("  zen proxies: dropped %s (left %d)", redactProxyUserinfo(proxyURL), left)
 		closeZenTransport(proxyURL)
 		// a dropped exit is proven dead: evacuate every lane pinned to
 		// it onto spares, so no lane keeps sending where the pool won't.
@@ -693,8 +802,9 @@ func dropProxy(proxyURL string) {
 }
 
 // evacuateProxyPins moves every lane pinned to a dropped exit onto a spare.
-// a lane with no spare keeps the dead pin: "" never sends, so the exit
-// still attempts until a replacement exists (same rule as laneReproxy).
+// a lane with no unique spare ends up with no pin (laneReproxy clears it):
+// two lanes never share an exit, and a pin on an exit the pool dropped is
+// worse than "" (direct, or a handoff to a lane that owns one).
 func evacuateProxyPins(dead string) {
 	for {
 		lanesMu.Lock()
@@ -710,9 +820,10 @@ func evacuateProxyPins(dead string) {
 			return
 		}
 		// "" model: evacuation outranks per-model burns; the next real
-		// send re-rotates if the spare is burned for its model.
+		// send re-rotates if the spare is burned for its model. the dead
+		// exit is out of the pool, so the pick can never hand it back.
 		if laneReproxy(victim, "") == dead {
-			return // dry pool: keep the pin, stop trying
+			return // empty pool: no unique spare to move to, stop trying
 		}
 	}
 }
@@ -752,60 +863,13 @@ func zenDialDead(err error) bool {
 	return strings.Contains(s, "dial tcp") || strings.Contains(s, "proxyconnect")
 }
 
-// tls burns: a mitm exit is out for every model for an hour. a plain drop
-// is not enough: the next refresh re-admits it (it passes verify
-// intermittently) and other lanes' pins keep using it.
-var (
-	tlsBurnMu sync.Mutex
-	tlsBurned = map[string]time.Time{}
-)
-
-// tlsBurnTTL is the mitm ban length. an hour outlasts a refresh cycle and
-// still forgives a transient.
-func tlsBurnTTL() time.Duration { return time.Hour }
-
-// banTLSExit bans a mitm exit, drops it from the pool, and evacuates every
-// lane pinned to it onto spares.
+// banTLSExit marks a mitm exit dead, drops it from the pool, and evacuates
+// every lane pinned to it onto spares. a plain drop is not enough: the next
+// refresh re-admits it (it passes verify intermittently) and other lanes'
+// pins keep using it. the dead mark expires with deadTTL, and the exit only
+// comes back if a later sweep verifies it again.
 func banTLSExit(proxy string) {
-	if proxy == "" {
-		return
-	}
-	tlsBurnMu.Lock()
-	tlsBurned[proxy] = time.Now().Add(tlsBurnTTL())
-	tlsBurnMu.Unlock()
-	acclog.Printf("  zen exit %s tls-banned 1h (mitm cert)", redactProxyUserinfo(proxy))
-	dropProxy(proxy)
-	evacuateProxyPins(proxy)
-}
-
-// exitTLSBanned reports whether an exit is under a mitm ban.
-func exitTLSBanned(proxy string) bool {
-	if proxy == "" {
-		return false
-	}
-	tlsBurnMu.Lock()
-	defer tlsBurnMu.Unlock()
-	until, ok := tlsBurned[proxy]
-	if !ok {
-		return false
-	}
-	if time.Now().After(until) {
-		delete(tlsBurned, proxy)
-		return false
-	}
-	return true
-}
-
-// skipTLSBanned filters banned exits out of refresh candidates: a mitm
-// exit passes verify intermittently, so the candidate filter is the gate.
-func skipTLSBanned(cands []string) []string {
-	out := make([]string, 0, len(cands))
-	for _, c := range cands {
-		if !exitTLSBanned(c) {
-			out = append(out, c)
-		}
-	}
-	return out
+	markExitDead(proxy, "mitm cert")
 }
 
 // maybeRefreshNetErr counts a network failure and fires a pool refresh once
@@ -836,7 +900,7 @@ func maybeRefreshNetErr() bool {
 	zenProxiesMu.Lock()
 	zenPoolRefreshed = time.Now()
 	zenProxiesMu.Unlock()
-	refreshZenProxiesAsync()
+	refreshZenProxiesAsync(false)
 	return true
 }
 
@@ -892,15 +956,22 @@ func zenBackoffCtx(ctx context.Context, retry int) {
 // hedge_after_ms -1 disables hedging, 0 means the 800ms default: slow
 // exits stall every attempt, so the second lane must fire early. the extra
 // inference spend only lands on sends with no first byte yet.
+// raceAnnounced tracks the off->on edge of the lane race so the idle-pool
+// message logs on transition, not once per request while idle.
+var raceAnnounced atomic.Bool
+
 func hedgeDelay() time.Duration {
 	if share, threshold := lanesIdleEnough(); share < threshold {
 		ms := cfg().Zen.RaceHedgeAfterMs
 		if ms < 0 {
 			ms = 0
 		}
-		acclog.Printf("  opencode lane race on (busy share %.0f%% < %.0f%%)", share*100, threshold*100)
+		if raceAnnounced.CompareAndSwap(false, true) {
+			acclog.Printf("  opencode lane race on (busy share %.0f%% < %.0f%%)", share*100, threshold*100)
+		}
 		return time.Duration(ms) * time.Millisecond
 	}
+	raceAnnounced.Store(false)
 	ms := cfg().Zen.HedgeAfterMs
 	if ms < 0 {
 		return 0 // -1 disables hedging entirely
@@ -963,6 +1034,10 @@ var (
 	zenFreeTierMu   sync.Mutex
 	zenFreeTierErrs int
 	zenRefreshMu    sync.Mutex
+	// zenRefreshFresh makes the next sweep skip the exits already in the
+	// pool. sticky until a sweep consumes it, so a fresh request that lands
+	// while a periodic refresh is running is not lost.
+	zenRefreshFresh atomic.Bool
 )
 
 // zenFreeTierBlocked reports whether an upstream error body refuses the exit
@@ -991,14 +1066,20 @@ func resetZenFreeTierErrs() {
 }
 
 // refreshZenProxiesAsync triggers a pool refresh without blocking the request
-// path. concurrent triggers collapse into one in-flight refresh.
-func refreshZenProxiesAsync() {
+// path. concurrent triggers collapse into one in-flight refresh. fresh asks
+// the sweep to skip the exits already in the pool (the dry-pool path); it is
+// sticky, so a periodic trigger that lands while a dry sweep is in flight
+// does not cancel the fresh intent.
+func refreshZenProxiesAsync(fresh bool) {
+	if fresh {
+		zenRefreshFresh.Store(true)
+	}
 	go func() {
 		if !zenRefreshMu.TryLock() {
 			return
 		}
 		defer zenRefreshMu.Unlock()
-		refreshZenProxies()
+		refreshZenProxies(zenRefreshFresh.Swap(false))
 	}()
 }
 
@@ -1039,15 +1120,23 @@ type poolExit struct {
 	Latency int    `json:"latency_ms"`
 	AvgMs   int    `json:"avg_ms,omitempty"`
 	Pinned  bool   `json:"pinned"`
+	// State is working, rate_limited, or dead. a marked exit is listed even
+	// when it is not in the pool, so the section explains a thin pool
+	// instead of just showing a short list.
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // poolSummary is the /status view of the proxy pool.
 type poolSummary struct {
-	Verified int        `json:"verified"`
-	Cands    int        `json:"candidates"`
-	Dropped  int        `json:"dropped_total"`
-	Refresh  string     `json:"last_refresh_ago"`
-	Exits    []poolExit `json:"exits,omitempty"`
+	Verified    int        `json:"verified"`
+	Cands       int        `json:"candidates"`
+	Dropped     int        `json:"dropped_total"`
+	RateLimited int        `json:"rate_limited"`
+	Dead        int        `json:"dead"`
+	Refresh     string     `json:"last_refresh_ago"`
+	NextRefresh string     `json:"next_refresh_in"`
+	Exits       []poolExit `json:"exits,omitempty"`
 }
 
 // poolSnapshot builds the pool section: counts, refresh age, per-exit
@@ -1069,13 +1158,38 @@ func poolSnapshot() poolSummary {
 	lanesMu.Unlock()
 	out := poolSummary{Dropped: dropped, Cands: cands}
 	out.Verified = len(pool)
+	out.RateLimited = countRateLimited()
+	out.Dead = countDeadExits()
 	if !refreshed.IsZero() {
 		out.Refresh = time.Since(refreshed).Round(time.Second).String()
+		if iv := poolInterval(); iv > 0 {
+			if left := iv - time.Since(refreshed); left > 0 {
+				out.NextRefresh = left.Round(time.Second).String()
+			} else {
+				out.NextRefresh = "due"
+			}
+		}
 	}
+	inPool := map[string]bool{}
 	for _, p := range pool {
+		inPool[p] = true
+		state := exitStateOf(p)
+		if state == "" {
+			state = "working"
+		}
 		out.Exits = append(out.Exits, poolExit{
 			Proxy: redactProxyUserinfo(p), Country: proxyCountry(p),
 			Latency: proxyLatency(p), AvgMs: proxyLiveMs(p), Pinned: pinned[p],
+			State: state,
+		})
+	}
+	for _, m := range markedExits() {
+		if inPool[m.Proxy] {
+			continue // already listed above with its state
+		}
+		out.Exits = append(out.Exits, poolExit{
+			Proxy: redactProxyUserinfo(m.Proxy), Country: proxyCountry(m.Proxy),
+			State: m.State, Reason: m.Reason,
 		})
 	}
 	return out
@@ -1099,17 +1213,35 @@ func logZenNetErr(retry int, model, proxy, tag string, err error) {
 		retry, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, err)
 }
 
-// exhausted429 synthesizes the retryable-exhausted response: JSON 503 +
-// Retry-After instead of the stale empty 429. the 429 branch closes the
-// upstream body before continuing, so without this the post-loop forward
-// re-reads a closed body and hands the client a bodyless 429 it gives up
-// on. 503 tells opencode to retry later.
-func exhausted429(model string, status int) *http.Response {
-	eb := []byte(`{"error":{"message":"opencode zen: all retries rate-limited (` + strconv.Itoa(status) + `), try again","type":"rate_limit_error"}}`)
+// proxyUnavailableMsg is the client-facing text for a request that could not
+// be placed on any exit. it names the pool and its state, never an upstream
+// status: the caller's remedy is to retry shortly, not to change anything.
+func proxyUnavailableMsg(model string) string {
+	zenProxiesMu.RLock()
+	verified := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	return fmt.Sprintf("opencode zen: no usable exit for %s — %d verified, %d rate-limited, %d dead. proxy capacity, not your request; retry shortly.",
+		model, verified, countRateLimited(), countDeadExits())
+}
+
+// exhaustedExits is the retry ladder's last word: every attempt landed on an
+// exit that could not serve the request (rate limit, transport, overload).
+// the client gets a 503 that names the proxy pool as the problem and never a
+// 429 echoed back — a rate limit is this proxy's business to absorb, and a
+// caller that sees one retries against us instead of waiting us out. the
+// status that ended the ladder is in the body reason and the log, not in the
+// http status.
+func exhaustedExits(model string, status int) *http.Response {
+	reason := "every exit rate-limited"
+	if status != http.StatusTooManyRequests && status != 529 {
+		reason = fmt.Sprintf("every exit failed (last upstream %d)", status)
+	}
+	msg := fmt.Sprintf("%s [%s, %d attempts]", proxyUnavailableMsg(model), reason, zenMaxRetries())
+	eb, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "proxy_exhausted", "message": msg}})
 	h := make(http.Header)
 	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", "30")
-	acclog.Printf("!! opencode retryable-exhausted model=%s last=%d, synthesizing 503", model, status)
+	h.Set("Retry-After", "5")
+	acclog.Printf("!! opencode exits exhausted model=%s attempts=%d last=%d, synthesizing 503", model, zenMaxRetries(), status)
 	return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(eb)), Header: h}
 }
 
@@ -1144,16 +1276,16 @@ func watchZenProxies() {
 			warmZenTransports(cached)
 			log.Printf("  zen proxies: %d from cache (%s)", len(cached), poolCachePath())
 		}
-		refreshZenProxies()
+		zenRefreshMu.Lock()
+		refreshZenProxies(zenRefreshFresh.Swap(false))
+		zenRefreshMu.Unlock()
 	}
 	for {
-		interval := time.Hour
-		if m := cfg().Zen.RefreshIntervalMinutes; m > 0 {
-			interval = time.Duration(m) * time.Minute
-		}
-		time.Sleep(interval)
+		time.Sleep(poolInterval())
 		if zenEnabled() {
-			refreshZenProxies()
+			zenRefreshMu.Lock()
+			refreshZenProxies(zenRefreshFresh.Swap(false))
+			zenRefreshMu.Unlock()
 		}
 		sweepLanes()
 	}
@@ -1249,13 +1381,7 @@ func pruneDeadExits(keep map[string]bool) {
 		}
 	}
 	zenLiveMu.Unlock()
-	exitTrackMu.Lock()
-	for u := range exitTrack {
-		if !keep[u] {
-			delete(exitTrack, u)
-		}
-	}
-	exitTrackMu.Unlock()
+	pruneExitStates(keep)
 }
 
 // zenClient builds a client routing via proxyURL, or direct if ""/bad.

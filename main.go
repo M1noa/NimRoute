@@ -810,12 +810,22 @@ func fetchZenModelIDsFrom(base string) []string {
 }
 
 // refreshOpencodeModels pulls the free model list from opencode zen and caches it.
+// models the previous refresh listed and this one does not are marked dead
+// in /status (reason: no longer listed upstream) instead of vanishing: a
+// preview id that keeps answering while the listing drops it is exactly the
+// case that reads as "why does this model still work / where did it go".
 func refreshOpencodeModels() {
 	info := &OpencodeInfo{Enabled: true, Base: OpencodeBase}
 	if !zenEnabled() {
 		info.Enabled = false
 		ocInfo.Store(info)
 		return
+	}
+	prev := map[string]bool{}
+	if old := ocInfo.Load(); old != nil {
+		for _, id := range old.Models {
+			prev[id] = true
+		}
 	}
 	for _, m := range fetchZenModelIDs() {
 		// big-pickle is free but lacks the -free suffix; everything
@@ -828,6 +838,25 @@ func refreshOpencodeModels() {
 	sort.Strings(info.Models)
 	ocInfo.Store(info)
 	log.Printf("  Opencode zen: %d free models", len(info.Models))
+	if len(prev) > 0 {
+		now := map[string]bool{}
+		for _, id := range info.Models {
+			now[id] = true
+		}
+		var gone []string
+		for id := range prev {
+			if !now[id] {
+				gone = append(gone, id)
+			}
+		}
+		sort.Strings(gone)
+		for _, id := range gone {
+			noteModelRemoved(id, "no longer listed upstream")
+		}
+		if len(gone) > 0 {
+			log.Printf("  Opencode zen: %d model(s) left the listing: %s", len(gone), strings.Join(gone, ", "))
+		}
+	}
 	for _, miss := range missingModelInfo(info.Models) {
 		log.Printf("  WARN: %s in /v1/models has no model_info.jsonc entry (falls back to 131072 ctx + derived name)", miss)
 	}
@@ -2071,6 +2100,12 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		} else {
 			// service overloaded: retry on the same lane proxy + session.
 			proxy = lastProxy
+			// killswitch: always_proxy must never send direct. lastProxy is
+			// "" only if the first attempt went direct, which the flag
+			// rules out, so this is belt and braces.
+			if proxy == "" && cfg().Zen.AlwaysProxy {
+				return nil
+			}
 			cl = zenClient(proxy)
 		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(nb))
@@ -2114,7 +2149,10 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 			up.Body.Close()
 			if zenServiceOverloaded(eb) {
-				rotating = false
+				// same policy as the main loops: rotate, never re-pin.
+				lane = laneHandoff(lane, laneFailover(lane))
+				*sessionID = laneRotate(lane, nbModel)
+				rotating = true
 				if !zenLastRetry(zenRetries) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
@@ -2172,19 +2210,6 @@ func (p *Pool) maybeNudgeResponses(r *http.Request, target string, posted, rb []
 }
 
 func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
-	var key *Key
-	p.mu.RLock()
-	for _, k := range p.keys {
-		if time.Now().After(k.CooldownUntil) {
-			key = k
-			break
-		}
-	}
-	if key == nil && len(p.keys) > 0 {
-		key = p.keys[0]
-	}
-	p.mu.RUnlock()
-
 	// cached 60s: the endpoint is pre-auth, so anonymous callers must
 	// not trigger an authenticated upstream fetch per request.
 	nvModelsMu.Lock()
@@ -2268,10 +2293,16 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 		modelInfoMu.RUnlock()
 	}
 
-	// opencode zen free models (no auth) -> opencode/<id>
+	// opencode zen free models (no auth) -> opencode/<id>. served from the
+	// startup + 45-minute cache: this endpoint is pre-auth, so a live fetch
+	// here would let anonymous callers spawn an upstream request per hit.
 	var liveIDs []string
 	if zenEnabled() {
-		liveIDs = fetchZenModelIDs()
+		if info := ocInfo.Load(); info != nil {
+			for _, id := range info.Models {
+				liveIDs = append(liveIDs, strings.TrimPrefix(id, "opencode/"))
+			}
+		}
 	}
 	ocSeen := make(map[string]bool)
 	for _, m := range liveIDs {
@@ -2908,13 +2939,25 @@ func isStopword(w string) bool {
 	return false
 }
 
-// dedupeGuardrail runs one pass over the guardrail list to collapse near-equal
-// entries (same first 60 normalized chars) so removal is not O(N^2) at 455.
-var guardrailPrefixes []string // normalized distinct guardrails, longest first
+// guardrailPrefixes holds the normalized distinct guardrails, longest first.
+// rebuilt by dedupeGuardrails on config reload and read on the request path,
+// so it is swapped under guardrailMu.
+var (
+	guardrailMu       sync.RWMutex
+	guardrailPrefixes []string
+)
 
+func guardrailPrefixSnapshot() []string {
+	guardrailMu.RLock()
+	defer guardrailMu.RUnlock()
+	return guardrailPrefixes
+}
+
+// dedupeGuardrails collapses near-equal entries (same first 60 normalized
+// chars) in one pass over guardrailList, so removal is not O(N^2) at 455.
 func dedupeGuardrails() {
 	seen := map[string]bool{}
-	guardrailPrefixes = nil
+	var out []string
 	for _, g := range guardrailList {
 		gn := normGuardrail(g)
 		if gn == "" || len(gn) < 20 {
@@ -2926,12 +2969,13 @@ func dedupeGuardrails() {
 		}
 		if !seen[key] {
 			seen[key] = true
-			guardrailPrefixes = append(guardrailPrefixes, gn)
+			out = append(out, gn)
 		}
 	}
-	sort.Slice(guardrailPrefixes, func(i, j int) bool {
-		return len(guardrailPrefixes[i]) > len(guardrailPrefixes[j])
-	})
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	guardrailMu.Lock()
+	guardrailPrefixes = out
+	guardrailMu.Unlock()
 }
 
 // stripSomeGuardrails removes matched guardrail spans from a system text.
@@ -2941,7 +2985,8 @@ func dedupeGuardrails() {
 // sentence holding the last matched token. Returns the cleaned text and a
 // removal count.
 func stripSomeGuardrails(text string) (string, int) {
-	if !cfg().Guardrails.Enabled || text == "" || len(guardrailPrefixes) == 0 {
+	prefixes := guardrailPrefixSnapshot()
+	if !cfg().Guardrails.Enabled || text == "" || len(prefixes) == 0 {
 		return text, 0
 	}
 	norm, spans := normSpans(text)
@@ -2951,7 +2996,7 @@ func stripSomeGuardrails(text string) (string, int) {
 	words := strings.Fields(norm)
 
 	n := 0
-	for _, gn := range guardrailPrefixes {
+	for _, gn := range prefixes {
 		if !guardrailMatchNorm(norm, words, gn) {
 			continue
 		}
@@ -3576,7 +3621,7 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 		resp, err := cl.Do(req)
 		if err != nil {
 			acclog.Printf("!! 502 upstream-error [%s] %s %s: %v", key.Name, r.Method, target, err)
-			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
+			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %s", err))
 			return
 		}
 
@@ -3865,6 +3910,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				proxy = laneProxyFor(lane, realModel)
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
+				// no exit left to hand out (every one taken, written off,
+				// or the pool drained). when the last attempt was a
+				// refused dial, that error is the honest answer: a bare
+				// "no proxy available" hides what actually happened.
+				if dialDeadErr != nil {
+					acclog.Printf("  opencode dial-dead %s, no distinct exit left for lane %s, ending retry ladder: %v", redactProxyUserinfo(dialDeadProxy), lane.id, dialDeadErr)
+					writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
+					return
+				}
 				continue
 			}
 			// rotation handed back the exit whose dial just failed: a
@@ -3872,8 +3926,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			// ladder here with the same honest 502 the exhausted ladder
 			// hands back.
 			if dialDeadErr != nil && proxy == dialDeadProxy {
-				acclog.Printf("  opencode dial-dead %s re-picked by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
-				http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, dialDeadErr), http.StatusBadGateway)
+				acclog.Printf("  opencode dial-dead %s re-picked by lane %s, ending retry ladder: %v", redactProxyUserinfo(proxy), lane.id, dialDeadErr)
+				writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
 				return
 			}
 			cl = zenClient(proxy)
@@ -3884,14 +3938,14 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			// killswitch, same as the anthropic path: never direct.
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				acclog.Printf("!! opencode no proxy under always_proxy model=%s, failing instead of direct", model)
-				http.Error(w, `{"error":"no proxy available (always_proxy killswitch)"}`, http.StatusBadGateway)
+				writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
 				return
 			}
 			cl = zenClient(proxy)
 		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if os.Getenv("ZEN_DUMP") != "" && zenRetries == 0 {
@@ -3940,9 +3994,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				// stamps health, else a 429 here arms the 12h long-burn on
 				// an exit that never produced a token.
 				if up.StatusCode == http.StatusOK {
-					noteExitOK(hp)
+					noteExitOK(hp, realModel)
 				} else if up.StatusCode == http.StatusTooManyRequests {
-					noteExit429(hp)
+					noteExit429(hp, realModel)
 				}
 			} else if hctx.Err() == nil {
 				// own proxy label: primary-side vs hedge-side
@@ -3960,9 +4014,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		primaryFn := func(pctx context.Context) (*http.Response, error) {
 			return cl.Do(traced.WithContext(pctx))
 		}
-		var hedged bool
-		resp, err, hedged = hedgedDo(r.Context(), primaryFn, hedgeFn, hedgeAfter)
-		_ = hedged
+		resp, err, _ = hedgedDo(r.Context(), primaryFn, hedgeFn, hedgeAfter)
 		if err == nil && !firstByteAt.IsZero() {
 			fb := firstByteAt.Sub(sendStart)
 			noteExitRTT(proxy, float64(fb.Milliseconds()))
@@ -3999,13 +4051,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
-			http.Error(w, fmt.Sprintf(`{"error":"upstream: %s"}`, err), http.StatusBadGateway)
+			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %s", err))
 			return
 		}
 		if os.Getenv("ZEN_DUMP") != "" {
 			acclog.Printf("ZEN_DUMPhdr <-%d %v", resp.StatusCode, req.Header)
 		}
 
+		// gaveUp marks a synthesized response: the ladder is over and the
+		// remaining checks must not re-treat it as an upstream failure.
+		gaveUp := false
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			st := resp.StatusCode
 			resp.Body.Close()
@@ -4014,11 +4069,31 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if proxy == "" {
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
-			noteExit429(proxy)
+			noteExit429(proxy, realModel)
 			if zenLastRetry(zenRetries) {
-				// exhausted: fall through to the forward with a
-				// synthesized body, never the closed empty one.
-				resp = exhausted429(model, st)
+				// the 15-retry ladder is spent: the client hears about the
+				// proxy pool, never the 429 we just absorbed.
+				resp, gaveUp = exhaustedExits(model, st), true
+			} else {
+				lane = laneHandoff(lane, laneFailover(lane))
+				sessionID = laneRotate(lane, realModel)
+				rotating = true
+				zenBackoffCtx(r.Context(), zenRetries)
+				continue
+			}
+		}
+
+		if !gaveUp && zenRetryableStatus(resp.StatusCode) {
+			// the exit (or a proxy in front of it) failed at transport
+			// level: same treatment as a rate limit, so a client never
+			// sees our plumbing break.
+			st := resp.StatusCode
+			resp.Body.Close()
+			acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, rotating exit+session",
+				st, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
+			dropProxy(proxy)
+			if zenLastRetry(zenRetries) {
+				resp, gaveUp = exhaustedExits(model, st), true
 			} else {
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
@@ -4050,7 +4125,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				rotating = true
 				if noteZenGeoErr() {
 					acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
-					refreshZenProxiesAsync()
+					refreshZenProxiesAsync(false)
 					resetZenGeoErrs()
 				}
 				if !zenLastRetry(zenRetries) {
@@ -4066,7 +4141,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				rotating = true
 				if noteZenBlockErr() {
 					acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
-					refreshZenProxiesAsync()
+					refreshZenProxiesAsync(false)
 					resetZenBlockErrs()
 				}
 				if !zenLastRetry(zenRetries) {
@@ -4077,8 +4152,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenFreeTierBlocked(eb) {
 				acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, switching lane",
 					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
-				dropProxy(proxy)
-				burnExit(proxy, realModel)
+				// per-model refusal, not a dead exit: it still serves other
+				// models, so it stays in the pool and the lane rotates off it.
+				noteExitModelBurned(proxy, realModel)
 				if proxy == "" {
 					laneEscalate(lane, realModel) // direct is flagged: give the lane an exit
 				}
@@ -4087,7 +4163,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				rotating = true
 				if noteZenFreeTierErr() {
 					acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
-					refreshZenProxiesAsync()
+					refreshZenProxiesAsync(false)
 					resetZenFreeTierErrs()
 				}
 				if !zenLastRetry(zenRetries) {
@@ -4111,15 +4187,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		resetZenNetErrs()
 		if resp.StatusCode == http.StatusOK {
 			p.noteZenSuccess(sessionID, usedProxy)
-			noteExitOK(usedProxy)
+			noteExitOK(usedProxy, realModel)
 			laneTouch(lane, usedProxy, realModel)
 		}
 		break
 	}
 
 	if resp == nil {
-		acclog.Printf("!! opencode zen unreachable model=%s (no proxy available)", model)
-		http.Error(w, `{"error":"upstream: no proxy available"}`, http.StatusBadGateway)
+		acclog.Printf("!! opencode zen unreachable model=%s (no usable exit)", model)
+		writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
 		return
 	}
 
@@ -4903,14 +4979,16 @@ type cliFlags struct {
 	port    int
 	lanes   int
 	debug   bool
-	monitor bool
 	dbgFile string
 	set     map[string]bool
+	unknown []string // unrecognized -flags, reported by main
 }
 
 // parseFlags handles `--flag v` / `--flag=v` anywhere around an optional
 // `probe` subcommand: `nimroute --port 5420 probe` and
-// `nimroute probe --port 5420` both work. unknown flags are ignored.
+// `nimroute probe --port 5420` both work. unknown flags are collected so
+// main can reject them: a typo'd flag silently doing nothing is worse than
+// a startup error.
 func parseFlags(args []string) (cliFlags, []string) {
 	var f cliFlags
 	f.set = map[string]bool{}
@@ -4929,11 +5007,6 @@ func parseFlags(args []string) (cliFlags, []string) {
 		if a == "--debug" {
 			f.debug = true
 			f.set["debug"] = true
-			continue
-		}
-		if a == "--monitor" {
-			f.monitor = true
-			f.set["monitor"] = true
 			continue
 		}
 		// --dbg-file / -df: boolean with an optional value. `-df` bare keeps
@@ -4962,17 +5035,29 @@ func parseFlags(args []string) (cliFlags, []string) {
 			continue
 		}
 		if v, ni := take(i, "--port"); ni >= 0 {
-			if p, err := strconv.Atoi(v); err == nil {
+			p, err := strconv.Atoi(v)
+			if err != nil || p <= 0 || p > 65535 {
+				f.unknown = append(f.unknown, fmt.Sprintf("--port=%q (want 1..65535)", v))
+			} else {
 				f.port, f.set["port"] = p, true
 			}
 			i = ni
 			continue
 		}
 		if v, ni := take(i, "--lanes"); ni >= 0 {
-			if n, err := strconv.Atoi(v); err == nil {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				f.unknown = append(f.unknown, fmt.Sprintf("--lanes=%q (want positive integer)", v))
+			} else {
 				f.lanes, f.set["lanes"] = n, true
 			}
 			i = ni
+			continue
+		}
+		// a value-taking flag with nothing after it is worth naming: the
+		// bare-flag guard has to run after every take() attempt.
+		if a == "--config" || a == "--port" || a == "--lanes" {
+			f.unknown = append(f.unknown, a+" (missing value)")
 			continue
 		}
 		if a == "--help" || a == "-h" {
@@ -4980,19 +5065,16 @@ func parseFlags(args []string) (cliFlags, []string) {
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
-			continue // unknown flag: ignore
+			f.unknown = append(f.unknown, a)
+			continue
 		}
 		rest = append(rest, a)
 	}
 	return f, rest
 }
 
-func serverMain() {
-	serverMainFlags(cliFlags{set: map[string]bool{}})
-}
-
-// serverMainFlags is serverMain with cli overrides applied: flags win over
-// config values, before pool build and listen.
+// serverMainFlags builds the pool and listens: cli flags win over config
+// values, applied before pool build and listen.
 func serverMainFlags(f cliFlags) {
 	initLogging()
 	fetchOpenCodeVersion()
@@ -5006,9 +5088,6 @@ func serverMainFlags(f cliFlags) {
 	c := loadOrCreateConfig(cpath)
 	if f.set["lanes"] && f.lanes > 0 {
 		c.Zen.Lanes = f.lanes
-	}
-	if f.set["monitor"] && f.monitor {
-		c.Monitor.Enabled = true
 	}
 	applyConfig(c)
 	if f.set["debug"] && f.debug {
@@ -5102,6 +5181,9 @@ func serverMainFlags(f cliFlags) {
 	}
 	if c.Anonymize.Enabled {
 		log.Printf("  pii heuristics: %.1f us/KB", pii.RegexUSPerKB())
+		if c.Anonymize.Ner.Enabled && !pii.NerAvailable() {
+			log.Printf("  WARN: anonymize.ner.enabled but this build has no ner (rebuild with -tags ner); detection is heuristics-only")
+		}
 	}
 	if !c.Nudge.Enabled {
 		log.Printf("  nudge: disabled")
@@ -5143,6 +5225,9 @@ func serverMainFlags(f cliFlags) {
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if strings.Contains(err.Error(), "address already in use") {
+			log.Fatalf("server error: %s is already in use (is nimroute already running? check `./nim status` or pass `--port N`)", addr)
+		}
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -5314,11 +5399,36 @@ func runProbe() {
 	closeUsageLog()
 }
 
+// cliUsage is printed by --help and on a bad flag. plain text, no colors:
+// it also lands in launchd/systemd logs where escapes are noise.
+const cliUsage = `nimroute - OpenAI/Anthropic-compatible LLM proxy (default port 5419)
+
+usage:
+  nimroute [flags]                 start the proxy
+  nimroute probe [flags]           probe upstream reachability, print a table
+  nimroute models sync [flags]     refresh the model catalog
+
+flags:
+  --config PATH         config file (default config.yml, env CONFIG_FILE)
+  --port N              listen port (overrides server.port, env PORT)
+  --lanes N             zen lane count (overrides zen.lanes)
+  --debug               verbose logging
+  -df, --dbg-file[=DIR] dump failed requests as json, optionally into DIR
+  -h, --help            print this
+
+config.yml is created on first run and hot-reloaded after that.
+`
+
 func main() {
 	f, rest := parseFlags(os.Args[1:])
 	if f.set["help"] {
-		fmt.Println("nimroute: llm proxy (:5419). flags: --config PATH --port N --lanes N --debug --monitor. subcommand: probe | models sync")
+		fmt.Print(cliUsage)
 		return
+	}
+	if len(f.unknown) > 0 {
+		fmt.Fprintf(os.Stderr, "nimroute: unknown flag %s\n", strings.Join(f.unknown, " "))
+		fmt.Fprint(os.Stderr, "run `nimroute --help` for the flag list\n")
+		os.Exit(2)
 	}
 	if len(rest) > 0 && rest[0] == "probe" {
 		runProbeFlags(f)
@@ -5327,6 +5437,11 @@ func main() {
 	if len(rest) > 1 && rest[0] == "models" && rest[1] == "sync" {
 		runModelsSyncFlags(f)
 		return
+	}
+	if len(rest) > 0 {
+		fmt.Fprintf(os.Stderr, "nimroute: unknown command %q\n", strings.Join(rest, " "))
+		fmt.Fprint(os.Stderr, "run `nimroute --help` for the command list\n")
+		os.Exit(2)
 	}
 	serverMainFlags(f)
 }

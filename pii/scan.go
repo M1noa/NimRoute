@@ -272,12 +272,6 @@ func wordCharAt(s string, i int) bool {
 	return c == '_' || '0' <= c && c <= '9' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 }
 
-// longestFirst orders surrogates longest first (kept for tests callers).
-func longestFirst(ss []string) []string {
-	sort.Slice(ss, func(i, j int) bool { return len(ss[i]) > len(ss[j]) })
-	return ss
-}
-
 func jsonEscape(s string) string {
 	b, _ := json.Marshal(s)
 	if len(b) >= 2 {
@@ -301,10 +295,12 @@ func (s *Scanner) maskBody(body []byte, v *Vault, includeSystem bool) []byte {
 		if surr == "" {
 			surr = v.For(sp.Label, orig)
 		}
-		text = text[:sp.Start] + surr + text[sp.End:]
-		// shift later zones/spans: recompute by re-walking is costly;
-		// spans are right-to-left so earlier offsets stay valid.
-		_ = zones
+		// the body is json, so the surrogate must be json-escaped: a custom
+		// `replacement` or a maskShape-preserved backslash would otherwise
+		// ship raw bytes that break the document (and trip the fail-open in
+		// MaskBody, leaking the original). spans are right-to-left, so
+		// earlier offsets stay valid.
+		text = text[:sp.Start] + jsonEscape(surr) + text[sp.End:]
 	}
 	return []byte(text)
 }

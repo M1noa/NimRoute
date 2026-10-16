@@ -75,20 +75,6 @@ func stripJSONComments(raw []byte) []byte {
 	return []byte(strings.Join(out, "\n"))
 }
 
-// loadModelInfo parses path into a lookup map. missing/unreadable file =
-// empty map, callers fall back to defaults.
-func loadModelInfo(path string) map[string]modelInfoEntry {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return map[string]modelInfoEntry{}
-	}
-	var m map[string]modelInfoEntry
-	if err := json.Unmarshal(stripJSONComments(raw), &m); err != nil {
-		return map[string]modelInfoEntry{}
-	}
-	return m
-}
-
 // loadModelInfoKeep parses path, keeping the live catalog when the file is
 // present but broken: a truncated save must not wipe every model fact.
 // returns nil when there is nothing usable (caller keeps the old map).

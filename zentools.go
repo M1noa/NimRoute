@@ -23,18 +23,3 @@ func zenOpenCodeDefs() []any {
 	}
 	return defs
 }
-
-// zenOCNames lists the ballast tool names.
-func zenOCNames() []string {
-	names := make([]string, 0, len(zenOpenCodeDefs()))
-	for _, d := range zenOpenCodeDefs() {
-		if m, ok := d.(map[string]any); ok {
-			if fn, ok := m["function"].(map[string]any); ok {
-				if n, ok := fn["name"].(string); ok {
-					names = append(names, n)
-				}
-			}
-		}
-	}
-	return names
-}

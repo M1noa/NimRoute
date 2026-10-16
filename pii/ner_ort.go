@@ -5,6 +5,7 @@ package pii
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"strings"
@@ -53,10 +54,13 @@ type nerEngine struct {
 }
 
 var (
-	nerMu  sync.Mutex
-	nerEng *nerEngine
-	nerKey string
-	nerErr error
+	nerMu       sync.Mutex
+	nerEng      *nerEngine
+	nerKey      string
+	nerErr      error
+	nerWarnOnce sync.Once
+	// nerSem bounds in-flight inference to one (matching e.mu's serialization).
+	nerSem = make(chan struct{}, 1)
 )
 
 func nerSingleton(modelPath, ortLib string, timeoutMs int, minScore float64) (*nerEngine, error) {
@@ -67,6 +71,13 @@ func nerSingleton(modelPath, ortLib string, timeoutMs int, minScore float64) (*n
 	defer nerMu.Unlock()
 	if nerEng != nil && nerKey == key {
 		return nerEng, nerErr
+	}
+	if nerEng != nil {
+		// different key: a config hot-reload moved the model or the lib.
+		// release the old native session/runtime instead of leaking one
+		// loaded model per reload.
+		nerEng.close()
+		nerEng, nerKey = nil, ""
 	}
 	e := &nerEngine{timeout: time.Duration(timeoutMs) * time.Millisecond, minScore: minScore}
 	if e.timeout <= 0 {
@@ -104,17 +115,35 @@ func nerSingleton(modelPath, ortLib string, timeoutMs int, minScore float64) (*n
 	env, err := rt.NewEnv("rampart", ort.LoggingLevelWarning)
 	if err != nil {
 		nerErr = err
+		e.close()
 		return nil, err
 	}
 	e.env = env
 	sess, err := rt.NewSession(env, modelPath, nil)
 	if err != nil {
 		nerErr = err
+		e.close()
 		return nil, err
 	}
 	e.sess = sess
 	nerEng, nerKey, nerErr = e, key, nil
 	return nerEng, nerErr
+}
+
+// close releases the native handles, tolerating a partially built engine.
+func (e *nerEngine) close() {
+	if e.sess != nil {
+		e.sess.Close()
+		e.sess = nil
+	}
+	if e.env != nil {
+		e.env.Close()
+		e.env = nil
+	}
+	if e.rt != nil {
+		e.rt.Close()
+		e.rt = nil
+	}
 }
 
 func modelDir(p string) string {
@@ -132,6 +161,11 @@ func NerAvailable() bool { return true }
 func NerDetector(modelPath, ortLib string, timeoutMs int, minScore float64) Detector {
 	e, err := nerSingleton(modelPath, ortLib, timeoutMs, minScore)
 	if err != nil || e == nil {
+		// once: the caller builds a guard per session, so this would
+		// otherwise repeat on every request.
+		nerWarnOnce.Do(func() {
+			log.Printf("WARN: pii ner unavailable, detection is heuristics-only: %v", err)
+		})
 		return nil
 	}
 	// one global mutex serializes all inference process-wide (ort
@@ -140,12 +174,21 @@ func NerDetector(modelPath, ortLib string, timeoutMs int, minScore float64) Dete
 	return func(text string) []Span {
 		ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 		defer cancel()
+		// one inference in flight process-wide (ort sessions are not
+		// concurrent-safe). a timed-out call keeps running under nerSem, so
+		// the slot is the back-pressure: a caller that cannot get it inside
+		// its own timeout degrades to heuristics instead of queueing an
+		// unbounded pile of orphans behind the timed-out one.
+		select {
+		case nerSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil
+		}
 		type res struct{ spans []Span }
 		ch := make(chan res, 1)
-		// non-blocking send: on timeout the orphaned infer still runs to
-		// completion (it holds e.mu), but at least it never leaks the
-		// goroutine on a full channel too.
+		// non-blocking send: the orphan never blocks on a full channel.
 		go func() {
+			defer func() { <-nerSem }()
 			spans := e.infer(text)
 			select {
 			case ch <- res{spans}:
@@ -162,8 +205,10 @@ func NerDetector(modelPath, ortLib string, timeoutMs int, minScore float64) Dete
 }
 
 func (e *nerEngine) infer(text string) []Span {
-	lowered := strings.ToLower(text)
-	folded, starts, ends := foldWithMap(lowered)
+	// fold the original text: foldWithMap already lowercases, and lowering
+	// first would shift every later offset (İ -> "i" changes byte length),
+	// making starts/ends address the lowercased copy instead of raw.
+	folded, starts, ends := foldWithMap(text)
 	// hyphen->space fold like rampart detectNerWindow: hyphens split
 	// entities in the vocab, spaces don't. length-preserving so the
 	// starts/ends map stays valid.
@@ -224,20 +269,22 @@ func (e *nerEngine) inferWindow(win []Tok, folded string, starts, ends []int, ra
 		return nil
 	}
 	// pick the logits tensor by name + shape, not map order: go map
-	// iteration is random and a second output would misread silently.
+	// iteration is random and a second output would misread silently. close
+	// every value as it is visited: a break would leak the rest.
 	var logits []float32
 	var shape []int64
+	named := false
 	for name, v := range res {
 		l, sh, gerr := ort.GetTensorData[float32](v)
 		v.Close()
-		if gerr != nil {
+		if gerr != nil || len(sh) != 3 || int(sh[1]) != n {
 			continue
 		}
-		if len(sh) == 3 && int(sh[1]) == n && strings.Contains(strings.ToLower(name), "logit") {
-			logits, shape = l, sh
-			break
+		if !named && strings.Contains(strings.ToLower(name), "logit") {
+			logits, shape, named = l, sh, true
+			continue
 		}
-		if logits == nil && len(sh) == 3 && int(sh[1]) == n {
+		if logits == nil {
 			logits, shape = l, sh
 		}
 	}

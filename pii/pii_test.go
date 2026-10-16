@@ -281,3 +281,89 @@ func TestRegexUSPerKB(t *testing.T) {
 		t.Fatalf("us/KB absurdly high: %v %v", a, b)
 	}
 }
+
+// owner: maskBody. a custom replacement carrying json-significant bytes must
+// be escaped, not shipped raw: raw bytes break the document, and MaskBody's
+// fail-open then ships the original value unmasked.
+func TestMaskBodyEscapesReplacement(t *testing.T) {
+	g := build(Config{
+		Enabled:        true,
+		DetectPII:      true,
+		Entities:       []CustomTerm{{Name: "minoa", Replacement: `a"b\c`}},
+		FuzzyThreshold: 0.95,
+	}, "escape")
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":"hi minoa"}]}`)
+	masked := g.MaskBody(body)
+	if !json.Valid(masked) {
+		t.Fatalf("masked body is not valid json: %s", masked)
+	}
+	if strings.Contains(string(masked), `"minoa"`) {
+		t.Fatalf("original leaked: %s", masked)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(masked, &m); err != nil {
+		t.Fatalf("masked body does not parse: %v", err)
+	}
+	// and it must round-trip back to the original spelling.
+	back := g.RestoreBody(masked)
+	if !strings.Contains(string(back), `"hi minoa"`) {
+		t.Fatalf("restore lost the original: %s", back)
+	}
+}
+
+// owner: build. two entities sharing a replacement must not both mask to it:
+// the token restores as whichever entity claimed it first, so the second
+// entity's text would come back as the first entity's value.
+func TestSharedReplacementRefused(t *testing.T) {
+	g := build(Config{
+		Enabled:        true,
+		DetectPII:      true,
+		Entities:       []CustomTerm{{Name: "minoa", Replacement: "REDACTED"}, {Name: "bob", Replacement: "REDACTED"}},
+		FuzzyThreshold: 0.95,
+	}, "shared")
+	if got := g.scanner.Replacements[strings.ToLower("bob")]; got != "" {
+		t.Fatalf("second entity kept the shared replacement %q", got)
+	}
+	if got := g.scanner.Replacements[strings.ToLower("minoa")]; got != "REDACTED" {
+		t.Fatalf("first entity lost its replacement: %q", got)
+	}
+	// a single entity's own variations share the token without being refused.
+	g2 := build(Config{
+		Enabled:        true,
+		DetectPII:      true,
+		Entities:       []CustomTerm{{Name: "minoa", Variations: []string{"M1noa"}, Replacement: "REDACTED"}},
+		FuzzyThreshold: 0.95,
+	}, "variations")
+	if got := g2.scanner.Replacements[strings.ToLower("m1noa")]; got != "REDACTED" {
+		t.Fatalf("variation lost the entity replacement: %q", got)
+	}
+}
+
+// owner: customDetector.detect. strings.ToLower can change byte length
+// (İ -> i), so lowercased offsets do not address the original body; the
+// span must still land exactly on the entity, not on shifted bytes.
+func TestExactMatchAfterLengthChangingRune(t *testing.T) {
+	d := NewCustomDetector(nil, []CustomTerm{{Name: "minoa"}}, 0.95)
+	spans := d("İstanbul minoa ok")
+	if len(spans) == 0 {
+		t.Fatal("no span found")
+	}
+	for _, s := range spans {
+		if s.Text != "minoa" {
+			t.Fatalf("span misaligned: %+v", s)
+		}
+	}
+	// body path: the masked value must decode back to what went in.
+	g := testGuard()
+	body := []byte(`{"model":"x","messages":[{"role":"user","content":"İstanbul minoa ok"}]}`)
+	masked := g.MaskBody(body)
+	if !json.Valid(masked) {
+		t.Fatalf("masked body invalid: %s", masked)
+	}
+	if strings.Contains(string(masked), "minoa") {
+		t.Fatalf("entity not masked: %s", masked)
+	}
+	if back := string(g.RestoreBody(masked)); back != string(body) {
+		t.Fatalf("round trip mismatch:\n got %s\nwant %s", back, body)
+	}
+}

@@ -71,6 +71,16 @@ func TestStreamAnthropicBlockIndicesMatch(t *testing.T) {
 				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
 		},
 		{
+			// text between two tools shifts the second tool's block index past
+			// the first: a contiguity-based stop loop double-stops the text
+			// block and leaves the real second tool open.
+			name: "tool-text-tool-interleave",
+			sse: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"content\":\"and now\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"glob\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+		},
+		{
 			name: "tool-without-finish-reason",
 			sse: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n" +
 				"data: [DONE]\n\n",

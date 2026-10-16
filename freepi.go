@@ -471,12 +471,14 @@ func (p *Pool) handleFreepiAnthropic(w http.ResponseWriter, r *http.Request, oai
 
 	_, rb, acct, status, ok := freepiFetch(r.Context(), r.Method, oaiBody, realModel)
 	if !ok {
-		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
 		// the account's real fault and status reach the client: a 401 jwt
-		// or a 404 unknown model must not wear a generic 502.
+		// or a 404 unknown model must not wear a generic 502. a rate limit
+		// does not: it is our account's cap, so it becomes a 503.
+		status, acct = freepiClientStatus(status, acct)
+		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)
 		writeAnthropicError(w, status, "api_error", "freepi: "+acct)
 		return
 	}
@@ -560,8 +562,28 @@ func freepiRetryable(fe freepiErr) bool {
 	switch fe.Code {
 	case "rate_limited", "concurrent_session", "ads_required":
 		return true
+	case "hourly_ceiling":
+		// the account is out of completions for this hour: waiting out the
+		// queue deadline cannot fix it, so fail fast and let the sibling
+		// accounts get their one shot.
+		return false
 	}
 	return false
+}
+
+// freepiClientStatus maps an exhausted fetch failure onto what the client
+// sees. a rate limit is never forwarded: freeepi limits our accounts, not the
+// caller's request, and a client that backs off on 429 stalls on our plumbing
+// instead of on the real cause. the cap becomes a 503 that names itself, the
+// same way an exhausted zen pool reports proxy capacity.
+func freepiClientStatus(status int, errMsg string) (int, string) {
+	switch {
+	case strings.Contains(errMsg, "hourly_ceiling"):
+		return http.StatusServiceUnavailable, errMsg + " (proxy: every freeepi account is out of hourly completions; retry after the hour rolls over)"
+	case status == http.StatusTooManyRequests, status == http.StatusConflict:
+		return http.StatusServiceUnavailable, errMsg + " (proxy: every freeepi account is busy or limited)"
+	}
+	return status, errMsg
 }
 
 // freepiRetry counts attempts and stops hard-failed accounts.
@@ -782,6 +804,9 @@ func (p *Pool) handleFreepi(w http.ResponseWriter, r *http.Request, body []byte,
 		if status == 0 {
 			status = http.StatusBadGateway
 		}
+		// a rate limit is our account's cap, not the caller's request: it is
+		// mapped to a 503 that names the cause instead of being forwarded.
+		status, acct = freepiClientStatus(status, acct)
 		// fixed envelope: upstream detail may quote-break Sprintf json, so
 		// the text goes in as a json string, not a Sprintf template.
 		acclog.Printf("!! freepi failed model=%s err=%q", realModel, acct)

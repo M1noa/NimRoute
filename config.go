@@ -179,11 +179,20 @@ type zenConfig struct {
 	// counter resets. 0 = 120, negative disables (every trip refreshes).
 	PoolRefreshCooldownSecs int `yaml:"pool_refresh_cooldown_secs"`
 	// ExitBurnMinutes keeps an exit that 403s FreeTierError for a model
-	// out of that model's rotation. per (exit, model): the exit can still
-	// serve other models. 0 disables (never burn).
+	// out of that model's rotation until the next pool refresh, and is the
+	// ttl for a dead exit (transport/tls failure). per (exit, model) for
+	// the free-tier case: the exit still serves other models. 0 = 30.
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
-	// MaxRetries caps zen upstream attempts per request. 0 = default
-	// (first try + 6 retries), negative = single attempt, no retry.
+	// Exit429Streak 429s in a row, or Exit429Total 429s since the last
+	// refresh, retires an exit until the next refresh. 0 disables either
+	// trip (0 = 2 and 6).
+	Exit429Streak int `yaml:"exit_429_streak"`
+	Exit429Total  int `yaml:"exit_429_total"`
+	// MaxRetries caps zen upstream retries per request (attempts =
+	// MaxRetries+1). 0 = default (first try + 15 retries, one walk of a
+	// full lane table), negative = single attempt, no retry. a rate limit
+	// is absorbed across lanes and never returned to the client: the
+	// ladder ends in a proxy-capacity error instead.
 	MaxRetries int `yaml:"max_retries"`
 	// ProbeTimeoutMs verifies a lane's pinned exit before reuse. 0 = 1000.
 	ProbeTimeoutMs int `yaml:"probe_timeout_ms"`
@@ -210,7 +219,8 @@ type zenConfig struct {
 	// before a pool refresh. 0 = 3.
 	ErrorThreshold int `yaml:"error_threshold"`
 	// RefreshIntervalMinutes re-verifies the pool on this tick; the lane
-	// sweep runs on the same tick. 0 = 60.
+	// sweep runs on the same tick, and the cycle's 429 marks are cleared.
+	// 0 = 30.
 	RefreshIntervalMinutes int `yaml:"refresh_interval_minutes"`
 	// RetryBackoffMs is the linear backoff step between zen retries,
 	// capped at retry_backoff_max_ms. 0 = 150/300.
@@ -344,14 +354,6 @@ type usageConfig struct {
 	Path    string `yaml:"path"`
 }
 
-// monitorConfig gates the perf monitor (item 12): stage timings +
-// resource sampling as jsonl. off = zero cost, writes nothing.
-type monitorConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	Path       string `yaml:"path"`
-	IntervalMs int    `yaml:"interval_ms"`
-}
-
 type claudeMapYAML struct {
 	Pattern string `yaml:"pattern"`
 	Model   string `yaml:"model"`
@@ -388,7 +390,6 @@ type appConfig struct {
 	OpenRouter openrouterConfig  `yaml:"openrouter"`
 	Status     statusConfig      `yaml:"status"`
 	Usage      usageConfig       `yaml:"usage"`
-	Monitor    monitorConfig     `yaml:"monitor"`
 	Models     modelsConfig      `yaml:"models"`
 }
 
@@ -468,8 +469,8 @@ func defaultConfig() appConfig {
 		Zen: zenConfig{
 			Enabled:                  true,
 			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
-			MaxResponseMs:            250,
-			PoolSize:                 400,
+			MaxResponseMs:            2000,
+			PoolSize:                 800,
 			Lanes:                    25,
 			LaneTTLMinutes:           30,
 			LaneCooldownSecs:         60,
@@ -480,7 +481,9 @@ func defaultConfig() appConfig {
 			PoolRefresh429s:          4,
 			PoolRefreshCooldownSecs:  120,
 			ExitBurnMinutes:          30,
-			MaxRetries:               6,
+			Exit429Streak:            2,
+			Exit429Total:             6,
+			MaxRetries:               15,
 			ProbeTimeoutMs:           1000,
 			RaceTimeoutMs:            3000,
 			LaneGateMaxSecs:          10,
@@ -490,7 +493,7 @@ func defaultConfig() appConfig {
 			ZenDirectTimeoutSecs:     300,
 			VerifyConcurrency:        40,
 			ErrorThreshold:           3,
-			RefreshIntervalMinutes:   60,
+			RefreshIntervalMinutes:   30,
 			RetryBackoffMs:           150,
 			RetryBackoffMaxMs:        300,
 			LaneHdr:                  boolPtr(true),
@@ -515,11 +518,6 @@ func defaultConfig() appConfig {
 		Usage: usageConfig{
 			Enabled: true,
 			Path:    "nim-usage.jsonl",
-		},
-		Monitor: monitorConfig{
-			Enabled:    false,
-			Path:       "nim-perf.jsonl",
-			IntervalMs: 1000,
 		},
 		Models: modelsConfig{
 			ClaudeMap: []claudeMapYAML{
@@ -549,106 +547,11 @@ func loadConfigFile(path string) (*appConfig, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, err
 	}
-	// enabled defaults true: yaml can't tell absent from false, so check
-	// the raw doc for the key before honoring a false.
-	var doc map[string]any
-	if yaml.Unmarshal(raw, &doc) == nil {
-		if n, ok := doc["nvidia"].(map[string]any); ok {
-			if v, has := n["enabled"]; !has || v == nil {
-				c.Nvidia.Enabled = true
-			}
-		} else {
-			c.Nvidia.Enabled = true
-		}
-		if p, ok := doc["nous"].(map[string]any); ok {
-			if v, has := p["enabled"]; !has || v == nil {
-				c.Nous.Enabled = true
-			}
-		} else {
-			c.Nous.Enabled = true
-		}
-		if z, ok := doc["zen"].(map[string]any); ok {
-			if v, has := z["enabled"]; !has || v == nil {
-				c.Zen.Enabled = true
-			}
-		} else {
-			c.Zen.Enabled = true
-		}
-		if u, ok := doc["usage"].(map[string]any); ok {
-			if v, has := u["enabled"]; !has || v == nil {
-				c.Usage.Enabled = true
-			}
-		} else {
-			c.Usage.Enabled = true
-		}
-		if rt, ok := doc["route"].(map[string]any); ok {
-			if v, has := rt["enabled"]; !has || v == nil {
-				c.Route.Enabled = true
-			}
-		} else {
-			c.Route.Enabled = true
-		}
-		if b, ok := doc["benchmarks"].(map[string]any); ok {
-			if v, has := b["enabled"]; !has || v == nil {
-				c.Benchmarks.Enabled = true
-			}
-		} else {
-			c.Benchmarks.Enabled = true
-		}
-		if o, ok := doc["openrouter"].(map[string]any); ok {
-			if v, has := o["enabled"]; !has || v == nil {
-				c.OpenRouter.Enabled = true
-			}
-		} else {
-			c.OpenRouter.Enabled = true
-		}
-		if _, ok := doc["status"].(map[string]any); ok {
-			if s, ok := doc["status"].(map[string]any); ok {
-				if v, has := s["show_usage"]; !has || v == nil {
-					c.Status.ShowUsage = true
-				}
-				if v, has := s["show_pool"]; !has || v == nil {
-					c.Status.ShowPool = true
-				}
-				if v, has := s["show_route"]; !has || v == nil {
-					c.Status.ShowRoute = true
-				}
-				if v, has := s["show_freepi"]; !has || v == nil {
-					c.Status.ShowFreepi = true
-				}
-				if v, has := s["show_nous"]; !has || v == nil {
-					c.Status.ShowNous = true
-				}
-				if v, has := s["show_benchmarks"]; !has || v == nil {
-					c.Status.ShowBenchmarks = true
-				}
-			}
-		} else {
-			c.Status.ShowUsage = true
-			c.Status.ShowPool = true
-			c.Status.ShowRoute = true
-			c.Status.ShowFreepi = true
-			c.Status.ShowNous = true
-			c.Status.ShowBenchmarks = true
-		}
-		if c.Usage.Path == "" {
-			c.Usage.Path = "nim-usage.jsonl"
-		}
-		if g, ok := doc["guardrails"].(map[string]any); ok {
-			if v, has := g["threshold"]; !has || v == nil {
-				c.Guardrails.Threshold = 0.6
-			}
-			if v, has := g["window_weight"]; !has || v == nil {
-				c.Guardrails.WindowWeight = 0.7
-			}
-			if v, has := g["density_weight"]; !has || v == nil {
-				c.Guardrails.DensityWeight = 0.3
-			}
-		} else {
-			c.Guardrails.Threshold = 0.6
-			c.Guardrails.WindowWeight = 0.7
-			c.Guardrails.DensityWeight = 0.3
-		}
+	// no raw-doc presence checks for the true-by-default bools: c starts
+	// from defaultConfig(), and yaml.v3 leaves an absent or null key
+	// untouched, so only an explicit `enabled: false` flips a default.
+	if c.Usage.Path == "" {
+		c.Usage.Path = "nim-usage.jsonl"
 	}
 	if c.NvidiaKeys == nil {
 		c.NvidiaKeys = map[string]string{}
@@ -755,7 +658,7 @@ func missingLeafKeys(userDoc, seedDoc *yaml.Node) []string {
 			missing = append(missing, k)
 		}
 	}
-	sortStrings(missing)
+	sort.Strings(missing)
 	return missing
 }
 
@@ -876,10 +779,6 @@ func mergeMissingKeys(path string) []string {
 	}
 	log.Printf("  %s: added %d missing key(s) as commented defaults", path, len(fresh))
 	return fresh
-}
-
-func sortStrings(s []string) {
-	sort.Strings(s)
 }
 
 // equalStrings is order-sensitive equality for reload change detection.
@@ -1010,7 +909,7 @@ func watchConfig(p *Pool, path string) {
 				// pool size/filters only apply on refresh: kick one now
 				// instead of waiting for the hourly tick.
 				refreshOpencodeModels()
-				refreshZenProxiesAsync()
+				refreshZenProxiesAsync(false)
 			}
 			added, removed := p.Reload(c.NvidiaKeys)
 			// portal keys are a separate pool: the reload rebuilds it too.
@@ -1019,7 +918,7 @@ func watchConfig(p *Pool, path string) {
 			// effect here without a restart.
 			p.syncSemLimit(c.NvidiaKeys)
 			stat := p.Status()
-			ng := len(guardrailPrefixes)
+			ng := len(guardrailPrefixSnapshot())
 			if !c.Guardrails.Enabled {
 				ng = 0
 			}
@@ -1112,6 +1011,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	}
 	if !c.Status.ShowUsage {
 		sr.Usage = nil
+		sr.Health = nil
 	}
 	if !c.Status.ShowPool {
 		sr.Pool = nil
@@ -1140,6 +1040,7 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.Nous = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
+		sr.Health = nil
 		sr.Pool = nil
 		sr.Route = nil
 		sr.Benchmarks = nil
@@ -1185,6 +1086,7 @@ func readProxyFile(path string) []string {
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		log.Printf("WARN: proxy file %s unreadable, running with none: %v", path, err)
 		return nil
 	}
 	var out []string

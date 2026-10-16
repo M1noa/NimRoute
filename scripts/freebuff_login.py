@@ -2,7 +2,7 @@
 # freebuff login helper. mints a login url, waits for the browser click,
 # verifies the token, writes it into config.yml (managed block at eof).
 # usage: python3 freebuff_login.py [--config config.yml] [--name acc1]
-import argparse, json, os, re, sys, tempfile, time, uuid, urllib.request, urllib.parse
+import argparse, json, os, re, sys, tempfile, time, uuid, urllib.request, urllib.parse, urllib.error
 
 BASE = "https://freebuff.com"          # login host (real client uses this)
 API = "https://www.codebuff.com"       # session/chat/ads host
@@ -23,6 +23,8 @@ def api(method, url, body=None, token=None):
             return e.code, json.loads(e.read() or b"null")
         except Exception:
             return e.code, {}
+    except (urllib.error.URLError, TimeoutError) as e:
+        sys.exit(f"network error: {e}")
 
 
 def main():
@@ -34,7 +36,8 @@ def main():
 
     fp = uuid.uuid4().hex
     st, code = api("POST", BASE + "/api/auth/cli/code", {"fingerprintId": fp})
-    assert st == 200 and "loginUrl" in code, f"login code failed: {st} {code}"
+    if not (st == 200 and "loginUrl" in code):
+        sys.exit(f"login code failed: {st} {code}")
     print("open this url in your browser (expires in 1h):")
     print(code["loginUrl"])
 
@@ -51,7 +54,8 @@ def main():
 
     tok = user["authToken"]
     st, sess = api("GET", API + "/api/v1/freebuff/session", token=tok)
-    assert st == 200 and "status" in sess, f"token verify failed: {st} {sess}"
+    if not (st == 200 and "status" in sess):
+        sys.exit(f"token verify failed: {st} {sess}")
     print(f"logged in as {user.get('email')} (session: {sess['status']})")
 
     # merge into managed block in config.yml (stdlib only, no yaml dep).
@@ -88,5 +92,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import urllib.error
     main()

@@ -248,33 +248,6 @@ still attempts (keep-last + keep-pin fallbacks unchanged). test
 `TestNetErrMovesLaneOffDeadExit`; live :5420 turn 200 with 429
 rotation onto a fresh exit intact.
 
-## 14. cli flags that override config [small]
-
-no flag parsing exists today: `os.Args[1] == "probe"` (see `parseFlags` in main.go) and
-the `CONFIG_FILE` env var (see `configPath` in config.go) are the only knobs. flags are
-for easy testing without editing `config.yml`.
-
-- parse with the stdlib `flag` package at entry: `--config`,
-  `--port`, `--lanes`, `--verbose` / `--debug` (log level), `--monitor`
-  (wires into item 12). whatever else turns out to be needed while
-  testing, keep the list short.
-- flags win over config values: apply after config load, before listen /
-  pool build, so `--port 5420` and `--lanes 4` are visible everywhere.
-- `probe` subcommand must keep working; bare first arg `probe` stays the
-  trigger (or accept flags before it — decide once, test both orders).
-- no flags = byte-identical behavior to today.
-- test: `--port` listens on the override, `--lanes` caps lanes,
-  `--debug` flips log verbosity, defaults unchanged without flags.
-
-done 2026-10-08: hand-rolled `parseFlags` in main.go (`--config`,
-`--port`, `--lanes`, `--debug`, both `--f v` / `--f=v`, both orders
-around `probe`, unknown flags ignored). applied in `serverMainFlags`
-after load, before pool build/listen; `--port` wins over PORT env;
-`probe` honors `--config`. no `--monitor` (item 12 skipped).
-tests `TestParseFlags`, `TestFlagOverrides`; live `--lanes 4` shows
-cap 4 on scratch :5420.
-plus: `--help`/`-h` prints usage and exits (`TestHelpFlag`).
-
 ## 12. perf monitoring: stage timings + resource sampling [large]
 
 optional monitor writing jsonl to its own file, mirroring the
@@ -315,6 +288,10 @@ row so a slow request can be correlated with memory pressure.
   item 11 as the quick toggle.
   done 2026-10-08: keys + example + `--monitor` flag (`TestMonitorFlag`).
   rows not yet written (the large remainder).
+  2026-10-15: reverted. the `monitor:` section, its three keys, and the
+  `--monitor` flag were removed: nothing read them, so the example
+  documented a feature that did nothing (AGENTS §2). re-stage the
+  config + flag in the same commit that writes the first row.
 - verify: unit test that disabled monitor writes nothing and that
   `proxy_overhead = total - upstream_total` on a fake timeline; live
   check a streaming request row carries `ttft`, `model_tps`, and rss.
@@ -375,6 +352,39 @@ the exit ip directly, http-connect shows the proxy — no confusion.
   drain + hedge-wait (the involved half). note: fast-429-beats-slow-200
   is current `hedgedDo` behavior by design (first response wins);
   changing it IS the hedge-wait rework, do not "fix" without it.
+
+## 14. cli flags that override config [small]
+
+no flag parsing exists today: `os.Args[1] == "probe"` (see `parseFlags` in main.go) and
+the `CONFIG_FILE` env var (see `configPath` in config.go) are the only knobs. flags are
+for easy testing without editing `config.yml`.
+
+- parse with the stdlib `flag` package at entry: `--config`,
+  `--port`, `--lanes`, `--verbose` / `--debug` (log level), `--monitor`
+  (wires into item 12). whatever else turns out to be needed while
+  testing, keep the list short.
+- flags win over config values: apply after config load, before listen /
+  pool build, so `--port 5420` and `--lanes 4` are visible everywhere.
+- `probe` subcommand must keep working; bare first arg `probe` stays the
+  trigger (or accept flags before it — decide once, test both orders).
+- no flags = byte-identical behavior to today.
+- test: `--port` listens on the override, `--lanes` caps lanes,
+  `--debug` flips log verbosity, defaults unchanged without flags.
+
+done 2026-10-08: hand-rolled `parseFlags` in main.go (`--config`,
+`--port`, `--lanes`, `--debug`, both `--f v` / `--f=v`, both orders
+around `probe`, unknown flags ignored). applied in `serverMainFlags`
+after load, before pool build/listen; `--port` wins over PORT env;
+`probe` honors `--config`. no `--monitor` (item 12 skipped).
+tests `TestParseFlags`, `TestFlagOverrides`; live `--lanes 4` shows
+cap 4 on scratch :5420.
+plus: `--help`/`-h` prints usage and exits (`TestHelpFlag`).
+
+2026-10-15: the "unknown flags ignored" half was wrong for users. a
+typo'd flag now prints the flag, a hint, and exits 2; a bare positional
+that is not `probe`/`models sync` exits 2 the same way. `-df`/`--dbg-file`
+also exist now, and `--help` prints a full usage block instead of one
+line. `--monitor` was added here and removed 2026-10-15 (see item 12).
 
 ## left open
 

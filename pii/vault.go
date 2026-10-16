@@ -98,13 +98,20 @@ func (v *Vault) For(label Label, original string) string {
 	// cpu, hanging the request. after maxSurrogateSalts tries, uniquify
 	// mints a free surrogate deterministically.
 	var surr string
+	free := false
 	for salt := uint32(0); salt < maxSurrogateSalts; salt++ {
 		surr = v.derive(label, original, salt)
+		// never mint a surrogate equal to the original: the mask would be a
+		// no-op and the "fake" a verbatim copy of the real value.
+		if surr == original {
+			continue
+		}
 		if _, taken := v.bySurr[surr]; !taken {
+			free = true
 			break
 		}
 	}
-	if _, taken := v.bySurr[surr]; taken {
+	if !free {
 		surr = v.uniquify(label, original)
 	}
 	e := &vaultEntry{original: original, surrogate: surr, label: label, expires: time.Now().Add(v.ttl)}
@@ -179,6 +186,9 @@ func (v *Vault) uniquify(label Label, original string) string {
 	base := v.derive(label, original, 0)
 	for n := 2; ; n++ {
 		cand := base + "~" + fmt.Sprint(n)
+		if cand == original {
+			continue
+		}
 		if _, taken := v.bySurr[cand]; !taken {
 			return cand
 		}
@@ -250,8 +260,10 @@ func SessionVault(id string, key []byte, ttl time.Duration, maxSize int) *Vault 
 }
 
 func SessionVaultMode(id string, key []byte, ttl time.Duration, maxSize int, mode string) *Vault {
-	if len(id) > 128 {
-		id = id[:128]
+	// bound an attacker-influenced key. ForRequest passes
+	// "sid:<64 hex>@<64 hex>" = 133 bytes, so the cut must sit above that.
+	if len(id) > 160 {
+		id = id[:160]
 	}
 	vaultsMu.Lock()
 	defer vaultsMu.Unlock()

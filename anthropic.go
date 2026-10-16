@@ -337,7 +337,18 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 	var result []map[string]any
 	var textParts []string
 	var imgParts []map[string]any
-	var docParts []map[string]any
+
+	// flush emits the text/images gathered so far as one user message. block
+	// order matters: parts written before a tool_result must land before the
+	// tool message and parts after it after, or a later user message splits
+	// the tool_result from the assistant turn that requested it.
+	flush := func() {
+		if len(textParts) == 0 && len(imgParts) == 0 {
+			return
+		}
+		result = append(result, map[string]any{"role": "user", "content": contentOf(textParts, imgParts)})
+		textParts, imgParts = nil, nil
+	}
 
 	for _, b := range blocks {
 		switch b.Type {
@@ -353,6 +364,7 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 			if b.IsError {
 				text = "Error: " + text
 			}
+			flush()
 			result = append(result, map[string]any{
 				"role":         "tool",
 				"tool_call_id": b.ToolUseID,
@@ -378,15 +390,11 @@ func convertUserMessage(raw json.RawMessage) []map[string]any {
 			// equivalent, so it rides as a file part and falls back to a
 			// data url, which is what multimodal providers accept.
 			if p := documentPart(b); p != nil {
-				docParts = append(docParts, p)
+				imgParts = append(imgParts, p)
 			}
 		}
 	}
-	imgParts = append(imgParts, docParts...)
-
-	if len(textParts) > 0 || len(imgParts) > 0 {
-		result = append([]map[string]any{{"role": "user", "content": contentOf(textParts, imgParts)}}, result...)
-	}
+	flush()
 
 	if len(result) == 0 {
 		return []map[string]any{{"role": "user", "content": ""}}
@@ -778,8 +786,7 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 	textIdx := 0
 	textOpen := false
 	blockIdx := 0
-	lastToolIdx := 0
-	toolBase := 0
+	var toolIdxs []int // block index of each opened tool_use, in open order
 	thinkClosed := false
 	closeThinking := func() {
 		if thinkIdx >= 0 && !thinkClosed {
@@ -804,7 +811,6 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 	}
 	hasToolCalls := false
 	toolIdxMap := map[int]int{}
-	hasSentStopReason := false
 	var strip sentinelStripper
 	flushStrip := func() {
 		if tail := strip.flush(); tail != "" {
@@ -943,19 +949,15 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 				// tools follow whatever blocks already opened (thinking, text).
 				// each upstream tool index gets its own block index: deltas for a
 				// second call in the same chunk must not reuse the first's index.
-				// textCount (not textOpen) so a closed text block keeps its index.
-				// the first base wins for the stop loop below: later text blocks
-				// open after the tools and must not shift their stops.
-				base := blockIdx
-				if lastToolIdx == 0 {
-					toolBase = base
-				}
+				// textIdx (not textOpen) so a closed text block keeps its index.
+				// every opened index is recorded so the stop loop closes exactly
+				// the tool blocks, even when a text block interleaves between two.
 				for _, tc := range choice.Delta.ToolCalls {
 					idx, open := toolIdxMap[tc.Index]
 					if !open {
 						idx = blockIdx
 						blockIdx++
-						lastToolIdx++
+						toolIdxs = append(toolIdxs, idx)
 						toolIdxMap[tc.Index] = idx
 						toolID := tc.ID
 						if toolID == "" {
@@ -978,8 +980,11 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 		}
 		promptT += segmentPrompt
 		compT += segmentComp
-		if scanner.Err() != nil || ctx.Err() != nil {
-			return
+		if ctx.Err() != nil {
+			return // client disconnected: nothing left to write to
+		}
+		if scanner.Err() != nil {
+			break // upstream truncated: still close the turn cleanly below
 		}
 		if segment == 0 && next != nil {
 			if continuation := next(text.String(), hasToolCalls); continuation != nil {
@@ -995,36 +1000,31 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 	}
 
 	// finish reason follows trailing usage and any continuation.
-	if !hasSentStopReason {
-		hasSentStopReason = true
-		flushStrip()
-		closeText()
+	flushStrip()
+	closeText()
 
-		closeThinking()
+	closeThinking()
 
-		// toolBase captured at first tool open above
-		for i := 0; i < lastToolIdx; i++ {
-			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, toolBase+i))
-		}
-
-		stopReason := "end_turn"
-		switch finishReason {
-		case "length":
-			stopReason = "max_tokens"
-		case "tool_calls":
-			stopReason = "tool_use"
-		}
-
-		written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
-		written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
-		n, _ := w.Write([]byte("data: [DONE]\n\n"))
-		written += int64(n)
-		if fl != nil {
-			fl.Flush()
-		}
-		return
+	// close exactly the tool blocks that opened, whatever their indices.
+	for _, idx := range toolIdxs {
+		written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, idx))
 	}
 
+	stopReason := "end_turn"
+	switch finishReason {
+	case "length":
+		stopReason = "max_tokens"
+	case "tool_calls":
+		stopReason = "tool_use"
+	}
+
+	written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
+	written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
+	n, _ := w.Write([]byte("data: [DONE]\n\n"))
+	written += int64(n)
+	if fl != nil {
+		fl.Flush()
+	}
 	return
 }
 
@@ -1352,50 +1352,6 @@ func toolsOffered(body []byte) bool {
 	return false
 }
 
-// endsWithQuestion reports whether text ends with a question, so genuine
-// user-directed questions are not nudged into assuming an answer.
-func endsWithQuestion(text string) bool {
-	t := strings.TrimSpace(text)
-	if t == "" {
-		return false
-	}
-	// check the last sentence: walk back past trailing quotes/parens/space
-	end := len(t)
-	for end > 0 {
-		c := t[end-1]
-		if c == '"' || c == '\'' || c == ')' || c == ']' || c == ' ' || c == '\n' || c == '\t' {
-			end--
-			continue
-		}
-		break
-	}
-	if end > 0 && t[end-1] == '?' {
-		return true
-	}
-	// also catch a question followed by a short tail ("Two options:") or an
-	// option list ("Which one?\n\n1. foo\n2. bar"). err toward treating it
-	// as a question: skipping a nudge is benign, nudging past a real
-	// question fabricates user consent.
-	tail := t[max(0, len(t)-200):]
-	if qi := strings.LastIndex(tail, "?"); qi >= 0 {
-		after := strings.TrimSpace(tail[qi+1:])
-		if len(after) <= 120 {
-			return true
-		}
-		for _, line := range strings.Split(after, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			c := line[0]
-			if (c >= '0' && c <= '9') || c == '-' || c == '*' || c == '(' {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // waitSentinel is what the model is told to emit when it is waiting on
 // the user or done. A retry body holding only this is swallowed so the
 // turn ends on the first body's output instead of a redundant summary.
@@ -1412,13 +1368,7 @@ func nudgeContinuation(oaiBody []byte, priorText string) []byte {
 	}
 	in, _ := m["input"].([]any)
 	in = append(in, map[string]any{"role": "assistant", "content": priorText})
-	in = append(in, map[string]any{
-		"role": "user",
-		"content": "You have tools available in this conversation. If any tool applies to the task above, call it now instead of describing what you would do. " +
-			"Do not narrate progress or restate what you already wrote. " +
-			"If you are waiting on the user to answer, or the task is fully done, reply with exactly " + waitSentinel + " and nothing else. " +
-			"Do not answer your own questions or assume the user's reply.",
-	})
+	in = append(in, map[string]any{"role": "user", "content": nudgeReprompt()})
 	m["input"] = in
 	delete(m, "nudge_no_tools")
 	b, err := json.Marshal(m)
@@ -1426,16 +1376,6 @@ func nudgeContinuation(oaiBody []byte, priorText string) []byte {
 		return nil
 	}
 	return b
-}
-
-// isWaitOnly reports whether a retry body holds only the wait sentinel and
-// no function calls, meaning it should be swallowed.
-func isWaitOnly(body []byte) bool {
-	text, hasCalls := scanResponsesSSE(body)
-	if hasCalls {
-		return false
-	}
-	return strings.TrimSpace(text) == waitSentinel
 }
 
 // scanChatSSE returns the concatenated delta content and whether any
@@ -1723,6 +1663,9 @@ func mergeChatJSON(first, retry []byte) []byte {
 	}
 	if fr := r.Choices[0].FinishReason; fr != nil {
 		f.Choices[0].FinishReason = fr
+	}
+	if len(r.Usage) > 0 && f.Usage == nil {
+		f.Usage = map[string]any{}
 	}
 	for k, rv := range r.Usage {
 		if fv, ok := f.Usage[k]; ok {
@@ -2238,7 +2181,7 @@ func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oai
 		// non-stream nvidia may arrive as SSE or plain JSON: fold
 		// SSE first, then nudge on the folded JSON throughout.
 		foldChat := func(b []byte) []byte {
-			if strings.Contains(string(b), "data: ") {
+			if looksSSE(b) {
 				return sseToNonStream(b, upstreamModel, tnames)
 			}
 			return b
@@ -2312,16 +2255,20 @@ func jsonStr(s string) string {
 	return string(b)
 }
 
-// boolInt turns a flag into a 0/1 block-index offset.
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
 // strPtr boxes a string for the finish_reason field.
 func strPtr(s string) *string { return &s }
+
+// looksSSE reports whether a body is an event stream rather than plain json.
+// structural, not a substring test: a line must start with "data: ", so a
+// non-stream body carrying a data: url inside a json string is not folded.
+func looksSSE(body []byte) bool {
+	for _, raw := range bytes.Split(body, []byte("\n")) {
+		if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("data: ")) {
+			return true
+		}
+	}
+	return false
+}
 
 // sseNormalize wraps a bare json body as a single sse chunk so the streaming
 // converters can parse it. sse input passes through untouched.
@@ -2636,8 +2583,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						lane = laneHandoff(lane, laneFailover(lane))
 						sessionID = laneSession(lane)
 						proxy = laneProxyFor(lane, zenModel)
-					}
-					if proxy == "" {
+						// pool is up but this lane drew no free exit (every
+						// one taken or written off): another lane is the
+						// answer, not a false "upstream unreachable".
+						if proxy == "" {
+							continue
+						}
+					} else {
 						return nil
 					}
 				}
@@ -2715,9 +2667,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						// transport success is not a served
 						// request: only a 200 stamps health.
 						if hup.StatusCode == http.StatusOK {
-							noteExitOK(hp)
+							noteExitOK(hp, zenModel)
 						} else if hup.StatusCode == http.StatusTooManyRequests {
-							noteExit429(hp)
+							noteExit429(hp, zenModel)
 						}
 					} else if hctx.Err() == nil {
 						// own proxy label: primary-side vs hedge-side
@@ -2768,6 +2720,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				return nil
 			}
 
+			// gaveUp marks a synthesized response: the ladder is over and the
+			// remaining checks must not re-treat it as an upstream failure.
+			gaveUp := false
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				st := up.StatusCode
 				up.Body.Close()
@@ -2776,11 +2731,31 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
-				noteExit429(proxy)
+				noteExit429(proxy, zenModel)
 				if zenLastRetry(zenRetries) {
-					// exhausted: fall through to the forward with a
-					// synthesized body, never the closed empty one.
-					up = exhausted429(clientModel, st)
+					// the ladder is spent: the client hears about the proxy
+					// pool, never the 429 we just absorbed.
+					up, gaveUp = exhaustedExits(clientModel, st), true
+				} else {
+					lane = laneHandoff(lane, laneFailover(lane))
+					sessionID = laneRotate(lane, zenModel)
+					rotating = true
+					zenBackoffCtx(r.Context(), zenRetries)
+					continue
+				}
+			}
+
+			if !gaveUp && zenRetryableStatus(up.StatusCode) {
+				// the exit (or a proxy in front of it) failed at transport
+				// level: same treatment as a rate limit, so a client never
+				// sees our plumbing break.
+				st := up.StatusCode
+				up.Body.Close()
+				acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
+					st, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
+				dropProxy(proxy)
+				if zenLastRetry(zenRetries) {
+					up, gaveUp = exhaustedExits(clientModel, st), true
 				} else {
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
@@ -2812,7 +2787,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					rotating = true
 					if noteZenGeoErr() {
 						acclog.Printf("  %d+ geo-blocks, refreshing proxy pool", zenErrorThreshold())
-						refreshZenProxiesAsync()
+						refreshZenProxiesAsync(false)
 						resetZenGeoErrs()
 					}
 					if !zenLastRetry(zenRetries) {
@@ -2828,7 +2803,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					rotating = true
 					if noteZenBlockErr() {
 						acclog.Printf("  %d+ user-blocks, refreshing proxy pool", zenErrorThreshold())
-						refreshZenProxiesAsync()
+						refreshZenProxiesAsync(false)
 						resetZenBlockErrs()
 					}
 					if !zenLastRetry(zenRetries) {
@@ -2839,8 +2814,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenFreeTierBlocked(eb) {
 					acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, switching lane",
 						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
-					dropProxy(proxy)
-					burnExit(proxy, zenModel)
+					// per-model refusal, not a dead exit: it still serves other
+					// models, so it stays in the pool and the lane rotates off it.
+					noteExitModelBurned(proxy, zenModel)
 					if proxy == "" {
 						laneEscalate(lane, zenModel) // direct is flagged: give the lane an exit
 					}
@@ -2849,7 +2825,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					rotating = true
 					if noteZenFreeTierErr() {
 						acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
-						refreshZenProxiesAsync()
+						refreshZenProxiesAsync(false)
 						resetZenFreeTierErrs()
 					}
 					if !zenLastRetry(zenRetries) {
@@ -2864,7 +2840,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			resetZenNetErrs()
 			if up.StatusCode == http.StatusOK {
 				p.noteZenSuccess(sessionID, proxy)
-				noteExitOK(proxy)
+				noteExitOK(proxy, zenModel)
 				laneTouch(lane, proxy, zenModel)
 			}
 			return up
@@ -2874,7 +2850,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 	resp = zenPost(oaiBody, isStream, "")
 	if resp == nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "opencode zen: upstream unreachable")
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", proxyUnavailableMsg(zenModel))
 		return
 	}
 	defer resp.Body.Close()
@@ -2996,10 +2972,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			acclog.Printf("ZEN_DUMP nonstream folded %d bytes -> %s", len(rb), p)
 		}
 		elapsed = time.Since(start)
-		out := rb
 		prompT, compT := 0, 0
-		var errMsg string
-		out, errMsg, _ = openAIToAnthropic(rb, clientModel, tnames)
+		out, errMsg, _ := openAIToAnthropic(rb, clientModel, tnames)
 		if errMsg != "" {
 			writeAnthropicError(w, http.StatusInternalServerError, "api_error", errMsg)
 			return

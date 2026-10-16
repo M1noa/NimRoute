@@ -38,6 +38,9 @@ func validSSN(d string) bool {
 
 var digitRunRe = regexp.MustCompile(`\d(?:[ .-]?\d)*`)
 
+// maxDigitWindows caps the per-rule window slide inside one digit run.
+const maxDigitWindows = 4096
+
 type digitRule struct {
 	label   Label
 	lengths []int
@@ -72,15 +75,23 @@ func detectDigitEntities(raw string) []Span {
 	for _, r := range runs {
 		for _, rule := range digitRules {
 			// slide rule-length windows inside longer runs: an ssn glued
-			// to an extra digit (or a spaced card) must not bypass.
-			best := -1
+			// to an extra digit (or a spaced card) must not bypass. the
+			// window scan is capped: a pathological all-digit body (up to
+			// the 10MB body limit) would otherwise slide millions of
+			// windows per rule on the request path, and real identifiers
+			// sit near the start of their run.
+			best, bestS := -1, -1
 			for _, l := range rule.lengths {
 				if len(r.digits) < l {
 					continue
 				}
-				for s := 0; s+1 <= len(r.digits)-l+1; s++ {
+				limit := len(r.digits) - l + 1
+				if limit > maxDigitWindows {
+					limit = maxDigitWindows
+				}
+				for s := 0; s < limit; s++ {
 					if rule.check(r.digits[s : s+l]) {
-						best = l
+						best, bestS = l, s
 						break
 					}
 				}
@@ -91,15 +102,9 @@ func detectDigitEntities(raw string) []Span {
 			if best <= 0 {
 				continue
 			}
-			// emit the first valid window's byte range.
-			for s := 0; s+1 <= len(r.digits)-best+1; s++ {
-				if rule.check(r.digits[s : s+best]) {
-					st := r.idx[s]
-					en := r.idx[s+best-1] + 1
-					out = append(out, Span{st, en, rule.label, 1, "heuristic", raw[st:en]})
-					break
-				}
-			}
+			st := r.idx[bestS]
+			en := r.idx[bestS+best-1] + 1
+			out = append(out, Span{st, en, rule.label, 1, "heuristic", raw[st:en]})
 			break
 		}
 	}

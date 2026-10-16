@@ -88,6 +88,13 @@ def chat_once(model, stream=False):
 
 
 def main():
+    global BASE
+    argv = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in argv):
+        print("usage: python3 scripts/antseed_test.py [base_url]")
+        return 0
+    if argv:
+        BASE = argv[0].rstrip("/")
     fails = []
     print(f"== antseed smoke test vs {BASE} ==")
 

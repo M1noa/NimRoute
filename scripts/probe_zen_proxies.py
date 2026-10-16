@@ -14,6 +14,7 @@ import csv
 import itertools
 import json
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -137,6 +138,11 @@ def probe_one(proxy, country, model):
 
 
 def main():
+    # every probe shells out to curl; without it the run would look like a
+    # network failure, so fail fast and say why.
+    if shutil.which("curl") is None:
+        print("curl not found; install curl", file=sys.stderr)
+        sys.exit(1)
     args = sys.argv[1:]
     models = ["big-pickle"]
     threads = 20
