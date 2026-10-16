@@ -404,17 +404,16 @@ PROVIDER_STYLES = {"opencode": "slate_blue1", "freepi": "medium_purple3",
 
 
 def health_cell(health, model):
-    """Status cell: ✓ working, red code when broken, · when unknown."""
+    """Status cell: ✓ working, X when broken, - when unknown."""
     h = (health or {}).get(model) or {}
     state = h.get("state", "unknown")
     if state == "working":
         return Text("✓", style="green")
     if state == "rate_limited":
-        return Text("429", style="yellow")
+        return Text("X", style="yellow")
     if state == "dead":
-        code = h.get("code")
-        return Text(str(code) if code else "dead", style="red")
-    return Text("·", style="dim")
+        return Text("X", style="red")
+    return Text("-", style="dim")
 
 
 def model_totals(by_model, model):
@@ -518,8 +517,9 @@ def build_renderable(d, stats):
         by_model = (d.get("usage") or {}).get("by_model") or {}
         bench = bench_index(d)
         t = Table(show_header=True, header_style="bold", box=box.SIMPLE, pad_edge=False)
-        for label in ("model", "score", "state", "req", "err", "tokens", "tok/s*"):
-            t.add_column(label, justify="right" if label in ("score", "req", "err", "tokens", "tok/s*") else "left")
+        t.add_column("", justify="left")
+        for label in ("model", "score", "req", "tokens", "tok/s*"):
+            t.add_column(label, justify="right" if label in ("score", "req", "tokens", "tok/s*") else "left")
         for name, models in cols:
             for val in models:
                 # every row is one full id: provider and model never split,
@@ -527,10 +527,11 @@ def build_renderable(d, stats):
                 # keys usage.by_model by.
                 full = val if "/" in val else name + "/" + val
                 totals = model_totals(by_model, full) or {}
-                t.add_row(Text(full, style=PROVIDER_STYLES.get(name, "dim")),
-                          score_cell(bench(full)), health_cell(health, full),
+                t.add_row(health_cell(health, full),
+                          Text(full, style=PROVIDER_STYLES.get(name, "dim")),
+                          score_cell(bench(full)),
                           str(totals.get("requests", 0)),
-                          str(totals.get("errors", 0)), tok_cell(by_model, full), tps_cell(by_model, full))
+                          tok_cell(by_model, full), tps_cell(by_model, full))
         parts.append(t)
         parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
     bl = bench_line(d)
