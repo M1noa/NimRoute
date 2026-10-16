@@ -374,6 +374,7 @@ func refreshZenProxies(fresh bool) {
 			stopOnce.Do(func() { close(stop) })
 		}
 	}
+	var mix verifyMix
 	sem := make(chan struct{}, verifyConc)
 	for _, u := range cands {
 		wg.Add(1)
@@ -391,10 +392,15 @@ func refreshZenProxies(fresh bool) {
 				return // the wave ahead of us filled the pool
 			default:
 			}
-			if verifyProxy(u) {
-				mu.Lock()
+			r := verifyProxy(u)
+			mu.Lock()
+			mix.add(r)
+			ok := r == verifyOK
+			if ok {
 				verified = append(verified, u)
-				mu.Unlock()
+			}
+			mu.Unlock()
+			if ok {
 				publish()
 				hitTarget()
 			}
@@ -432,7 +438,10 @@ func refreshZenProxies(fresh bool) {
 	// also pre-build transports so the first send skips tls/dial setup.
 	ensureSharedLanes()
 	warmZenTransports(verified)
-	log.Printf("  zen proxies: %d verified of %d candidates dialed (target %d)", len(verified), len(cands), target)
+	// acclog, not log: stderr lands in nimroute.err.log and nothing reads it.
+	// the mix rides the summary so a gate that starts refusing the shared
+	// public key shows up as pool shrinkage with a reason attached.
+	acclog.Printf("  zen proxies: %d verified of %d candidates dialed (target %d) mix: 429=%d 403=%d other=%d dialerr=%d", len(verified), len(cands), target, mix.rateLimited, mix.freeTier, mix.other, mix.dialErr)
 }
 
 // savedPool is the last verified pool, loaded at boot so requests serve
@@ -507,30 +516,76 @@ func loadZenPool() bool {
 	return true
 }
 
+// verifyResult classifies one verification probe so a sweep can tally why
+// exits fall out. it never decides the outcome: only verifyOK verifies, and
+// every other answer is the same rejection it always was.
+type verifyResult int
+
+const (
+	verifyOK          verifyResult = iota // 200 and a model-list body
+	verifyRateLimited                     // 429 on GET /models
+	verifyFreeTier                        // 403 FreeTierError on GET /models
+	verifyOther                           // any other rejection
+	verifyDialErr                         // no response came back at all
+)
+
+// verifyMix is the per-sweep tally of why candidates fell out, logged with
+// the sweep summary. statuses and counts only: never a proxy url, so no
+// credentials can reach the log.
+type verifyMix struct {
+	rateLimited int
+	freeTier    int
+	other       int
+	dialErr     int
+}
+
+func (m *verifyMix) add(r verifyResult) {
+	switch r {
+	case verifyOK:
+	case verifyRateLimited:
+		m.rateLimited++
+	case verifyFreeTier:
+		m.freeTier++
+	case verifyDialErr:
+		m.dialErr++
+	default: // verifyOther
+		m.other++
+	}
+}
+
 // verifyProxy confirms a proxy can reach the zen API via a lightweight GET.
 // 5s is plenty: working exits answer in under a second, dead ones either
 // refuse instantly or hang to the timeout and hold a verify worker.
-func verifyProxy(proxyURL string) bool {
+func verifyProxy(proxyURL string) verifyResult {
 	cl := zenClient(proxyURL)
 	cl.Timeout = 5 * time.Second
 	req, err := http.NewRequest("GET", OpencodeBase+"/models", nil)
 	if err != nil {
-		return false
+		return verifyDialErr
 	}
 	setZenHeaders(req, zenSession())
 	resp, err := cl.Do(req)
 	if err != nil {
-		return false
+		return verifyDialErr
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			return verifyRateLimited
+		case http.StatusForbidden:
+			return verifyFreeTier
+		}
+		return verifyOther
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	if err != nil {
-		return false
+		return verifyOther
 	}
-	return strings.Contains(string(body), `"object":"list"`)
+	if !strings.Contains(string(body), `"object":"list"`) {
+		return verifyOther
+	}
+	return verifyOK
 }
 
 // setProxyLatency replaces the proxy->response-ms map after a refresh.

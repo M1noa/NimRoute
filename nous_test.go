@@ -17,6 +17,9 @@ func resetNous(t *testing.T) {
 	nousCatMu.Lock()
 	nousCat, nousCatAt = nil, time.Time{}
 	nousCatMu.Unlock()
+	nousCatalogBackoff.Lock()
+	nousCatalogBackoff.next = time.Time{}
+	nousCatalogBackoff.Unlock()
 	t.Cleanup(func() { nousSyncKeys(nil) })
 }
 
@@ -65,7 +68,7 @@ func TestNousFreeModelsFilter(t *testing.T) {
 	nousBase = srv.URL
 	t.Cleanup(func() { nousBase = old })
 
-	got := nousFreeModels()
+	got := fetchNousCatalog()
 	want := []string{
 		"inclusionai/ling-3.1-flash",
 		"meituan/longcat-2.0:free",
@@ -105,7 +108,7 @@ func TestNousFreeFilterIsNotTheFreeSuffix(t *testing.T) {
 	nousBase = srv.URL
 	t.Cleanup(func() { nousBase = old })
 
-	for _, m := range nousFreeModels() {
+	for _, m := range fetchNousCatalog() {
 		if strings.HasPrefix(m.ID, "anthropic/") || strings.Contains(m.ID, "embed") {
 			t.Errorf("paid model %q leaked into the free list", m.ID)
 		}
@@ -129,7 +132,7 @@ func TestNousCatalogKeepsLastGoodOnFailure(t *testing.T) {
 	nousBase = srv.URL
 	t.Cleanup(func() { nousBase = old })
 
-	if len(nousFreeModels()) == 0 {
+	if len(fetchNousCatalog()) == 0 {
 		t.Fatal("fixture fetch returned nothing")
 	}
 	srv.Close()
@@ -395,5 +398,33 @@ func TestNousStatusGating(t *testing.T) {
 	useConfig(t, c)
 	if p.StatusFor(true).Nous != nil {
 		t.Error("show_nous: false still emitted the section")
+	}
+}
+
+// nousFreeModels must never put a 10s upstream GET on the /status path: a
+// cold cache returns what it has and refetches in the background.
+func TestNousFreeModelsDoesNotBlock(t *testing.T) {
+	resetNous(t)
+	// unreachable base: a synchronous fetch would take the 10s client
+	// timeout, so anything under a second proves the path is async.
+	old := nousBase
+	nousBase = "http://127.0.0.1:1/v1"
+	t.Cleanup(func() { nousBase = old })
+
+	start := time.Now()
+	got := nousFreeModels()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("nousFreeModels blocked for %v on a dead portal", d)
+	}
+	if len(got) != 0 {
+		t.Fatalf("cold cache returned %d models, want 0 until the fetch lands", len(got))
+	}
+	// the backoff gate holds: a second call does not kick another fetch.
+	done := make(chan struct{})
+	go func() { nousFreeModels(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second nousFreeModels call blocked")
 	}
 }

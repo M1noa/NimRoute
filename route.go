@@ -70,6 +70,53 @@ func routeBackendLive(backend string, p *Pool) bool {
 // routeTable maps route key -> backend -> exact backend model id.
 type routeTable map[string]map[string]string
 
+// routeTableTTL is how long one built table stays fresh. /status polls at 1hz
+// and every build unions each live backend's catalog, so the table is reused
+// instead of rebuilt per request.
+const routeTableTTL = 2 * time.Second
+
+// routeTableCache holds the last built table per pool. the entry is pinned to
+// the config pointer, so a hot reload rebuilds at once.
+var routeTableCache struct {
+	sync.Mutex
+	t   routeTable
+	cfg *appConfig
+	p   *Pool
+	at  time.Time
+}
+
+// routeTableFor returns the cached table, rebuilding at most once per ttl.
+func routeTableFor(p *Pool) routeTable {
+	c := cfg()
+	routeTableCache.Lock()
+	if t := routeTableCache.t; t != nil && routeTableCache.p == p && routeTableCache.cfg == c && time.Since(routeTableCache.at) < routeTableTTL {
+		routeTableCache.Unlock()
+		return t
+	}
+	routeTableCache.Unlock()
+	t := buildRouteTable(p)
+	routeTableCache.Lock()
+	routeTableCache.t, routeTableCache.p, routeTableCache.cfg, routeTableCache.at = t, p, c, time.Now()
+	routeTableCache.Unlock()
+	return t
+}
+
+// zenListRefresh admits one background listing refresh at a time: an
+// unreachable upstream must not stack goroutines on the 10s client timeout.
+var zenListRefresh = make(chan struct{}, 1)
+
+// kickZenListRefresh refreshes the cached zen listing off the request path.
+func kickZenListRefresh() {
+	select {
+	case zenListRefresh <- struct{}{}:
+		go func() {
+			defer func() { <-zenListRefresh }()
+			refreshOpencodeModels()
+		}()
+	default:
+	}
+}
+
 // buildRouteTable unions every live backend's catalog. min counts distinct
 // backends per key; excluded backends and models never enter. freepi joins
 // only when route.include_freepi is set (its window is smaller).
@@ -98,7 +145,9 @@ func buildRouteTable(p *Pool) routeTable {
 			}
 		}
 		if len(zenIDs) == 0 {
-			zenIDs = fetchZenModelIDs()
+			// never fetch on the request path: serve what is cached and let
+			// the background refresh fill the listing.
+			kickZenListRefresh()
 		}
 		for _, m := range zenIDs {
 			// same free filter as the /v1/models listing
@@ -161,7 +210,7 @@ func routeCandidates(p *Pool, key string) []string {
 	if !routeEnabled() {
 		return nil
 	}
-	t := buildRouteTable(p)
+	t := routeTableFor(p)
 	m, ok := t[strings.ToLower(strings.TrimSpace(key))]
 	if !ok {
 		return nil
@@ -421,7 +470,12 @@ func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body
 				rr := r.WithContext(ctx)
 				t0 := time.Now()
 				p.dispatchRouteAnthropic(rw, rr, body, nb, clientModel, cand, backend, id, tnames, isStream, start, reqID)
-				noteRouteLatency(backend, time.Since(t0))
+				// only the winner's latency is recorded: a loser's pollutes
+				// the ranking, and which attempt won is not known until the
+				// race settles.
+				if rec, ok := rw.(*routeRecorder); ok && rec.won() {
+					rec.label, rec.elapsed = backend, time.Since(t0)
+				}
 				return true
 			})
 		}
@@ -467,7 +521,7 @@ func appendRouteModels(p *Pool, out *struct {
 	if !routeEnabled() {
 		return
 	}
-	t := buildRouteTable(p)
+	t := routeTableFor(p)
 	keys := make([]string, 0, len(t))
 	for k := range t {
 		keys = append(keys, k)
@@ -523,7 +577,7 @@ func routeSnapshot(p *Pool) *routeSummary {
 	if !routeEnabled() {
 		return sum
 	}
-	t := buildRouteTable(p)
+	t := routeTableFor(p)
 	keys := make([]string, 0, len(t))
 	for k := range t {
 		keys = append(keys, k)

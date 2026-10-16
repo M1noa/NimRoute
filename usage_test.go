@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +105,108 @@ func TestStatusUsage(t *testing.T) {
 	useConfig(t, off)
 	if sr := p.StatusFor(true); sr.Usage != nil {
 		t.Fatalf("usage shown while disabled: %+v", sr.Usage)
+	}
+}
+
+// outcomesByModel folds overflow into (other) exactly like totals does, so
+// a loop of unique client-chosen model ids stops growing model health (and
+// the /status health payload) instead of leaking a ring per id forever.
+func TestOutcomesByModelCapped(t *testing.T) {
+	dir := t.TempDir()
+	c := testConfig()
+	c.Usage.Enabled = true
+	c.Usage.Path = filepath.Join(dir, "u.jsonl")
+	useConfig(t, c)
+	initUsageLog()
+	t.Cleanup(closeUsageLog)
+	totalsMu.Lock()
+	oldT, oldO, oldR := totals, outcomesByModel, removedByModel
+	totals, outcomesByModel, removedByModel =
+		map[string]*usageTotals{}, map[string][]modelOutcome{}, map[string]string{}
+	totalsMu.Unlock()
+	t.Cleanup(func() {
+		totalsMu.Lock()
+		totals, outcomesByModel, removedByModel = oldT, oldO, oldR
+		totalsMu.Unlock()
+	})
+
+	hammer := func(from, to int) {
+		for i := from; i < to; i++ {
+			logUsage(UsageRecord{
+				Model: fmt.Sprintf("nvidia/x%d", i), StatusCode: 500,
+				KeyName: "k", DurationMs: 1,
+			})
+		}
+	}
+	over := usageModelCap + 250
+	hammer(0, over)
+
+	totalsMu.Lock()
+	gotTotals, gotOutcomes := len(totals), len(outcomesByModel)
+	totalsMu.Unlock()
+	if gotTotals > usageModelCap+1 {
+		t.Fatalf("totals grew past the cap: %d entries, want <= %d", gotTotals, usageModelCap+1)
+	}
+	if gotOutcomes > usageModelCap+1 {
+		t.Fatalf("outcomesByModel grew past the cap: %d entries, want <= %d", gotOutcomes, usageModelCap+1)
+	}
+	if _, ok := outcomesByModel["(other)"]; !ok {
+		t.Fatal("overflow ids did not fold into the (other) health bucket")
+	}
+	if _, ok := totals["nvidia/x0"]; !ok {
+		t.Fatal("ids under the cap must stay individually tracked")
+	}
+
+	// /status serializes modelHealthSnapshot: past the cap the payload must
+	// stay flat while more unique ids arrive.
+	before, err := json.Marshal(modelHealthSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hammer(over, over+250)
+	after, err := json.Marshal(modelHealthSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("health payload grew: %d -> %d bytes after 250 more unique ids", len(before), len(after))
+	}
+	totalsMu.Lock()
+	late := len(outcomesByModel)
+	totalsMu.Unlock()
+	if late != gotOutcomes {
+		t.Fatalf("outcomesByModel kept growing: %d -> %d entries", gotOutcomes, late)
+	}
+}
+
+// the ring map caps itself: unique ids recorded straight through
+// noteModelOutcome (no totals fold to lean on) stop adding entries and fold
+// into (other), so one ring per id never accumulates.
+func TestNoteModelOutcomeCap(t *testing.T) {
+	totalsMu.Lock()
+	old := outcomesByModel
+	outcomesByModel = map[string][]modelOutcome{}
+	totalsMu.Unlock()
+	t.Cleanup(func() {
+		totalsMu.Lock()
+		outcomesByModel = old
+		totalsMu.Unlock()
+	})
+
+	for i := 0; i < usageModelCap+50; i++ {
+		noteModelOutcome(fmt.Sprintf("nvidia/y%d", i), false, 500, "s1")
+	}
+	totalsMu.Lock()
+	got := len(outcomesByModel)
+	totalsMu.Unlock()
+	if got > usageModelCap+1 {
+		t.Fatalf("outcomesByModel grew to %d entries, want <= %d", got, usageModelCap+1)
+	}
+	if _, ok := outcomesByModel["(other)"]; !ok {
+		t.Fatal("overflow ids did not fold into the (other) health bucket")
+	}
+	if n := len(outcomesByModel["(other)"]); n == 0 {
+		t.Fatal("folded bucket carries no outcomes")
 	}
 }
 

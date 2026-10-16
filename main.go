@@ -27,8 +27,10 @@ import (
 	"nimroute/pii"
 )
 
+// nvidiaBase is a var so a test can point it at a slow fake upstream.
+var nvidiaBase = "https://integrate.api.nvidia.com/v1"
+
 const (
-	nvidiaBase    = "https://integrate.api.nvidia.com/v1"
 	cooldown429   = 1 * time.Minute
 	maxBackoff    = 16 * time.Minute
 	failWindow    = 50 * time.Minute
@@ -37,10 +39,12 @@ const (
 	burstCooldown = 5 * time.Second
 	bodyLimit     = 10 << 20
 	checkInterval = 5 * time.Second
-	// upstreamBodyLimit caps buffered upstream bodies: 300s of even a
-	// hostile exit stays well under this, and it bounds per-request ram
-	// (x16 concurrent slots) against memory exhaustion.
-	upstreamBodyLimit = 128 << 20
+	// upstreamBodyLimit caps bodies read fully into memory (non-streamed
+	// completions, error bodies, nudges) and a single SSE line for the
+	// scanners. streams are piped and never buffered, so the only bodies
+	// that hit this are ones a client asked for whole: 8mb is orders past
+	// a legitimate completion and bounds per-request ram (x16 slots).
+	upstreamBodyLimit = 8 << 20
 )
 
 // versionStr is overridden at build time via -ldflags "-X main.versionStr=x.y.z".
@@ -116,6 +120,13 @@ func (m *ModelLock) lockedModels(key string) []string {
 	return out
 }
 
+// lastKeyEntry is one model's pinned key plus a write sequence. seq breaks
+// ties inside a single clock tick so eviction is deterministic.
+type lastKeyEntry struct {
+	key string
+	seq uint64
+}
+
 type Pool struct {
 	keys  []*Key
 	mu    sync.RWMutex
@@ -128,9 +139,13 @@ type Pool struct {
 	semUsed    int
 	semLimit   int
 	concurrent atomic.Int64
-	// lastKey pins a model to the key that last served it, so a conversation
-	// stays on one key and NIM's per-key prompt cache stays warm.
-	lastKey map[string]string
+	// lastKey pins a model to the key that last served it, so a
+	// conversation stays on one key and NIM's per-key prompt cache stays
+	// warm. the entry's seq is what lets noteKey evict the stalest one
+	// instead of refusing every new id once the map is full.
+	lastKey    map[string]lastKeyEntry
+	lastKeySeq uint64
+
 	// lastZen records the most recent zen upstream session/proxy for /status.
 	lastZenSession string
 	lastZenProxy   string
@@ -141,7 +156,7 @@ type Pool struct {
 }
 
 func newPool(entries map[string]string) *Pool {
-	p := &Pool{start: time.Now(), lastKey: make(map[string]string)}
+	p := &Pool{start: time.Now(), lastKey: make(map[string]lastKeyEntry)}
 	p.semCond.L = &p.semMu
 	for name, k := range entries {
 		p.keys = append(p.keys, &Key{Name: name, Key: k})
@@ -366,16 +381,33 @@ func (p *Pool) noteKey(model, name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.lastKey[model]; !ok && len(p.lastKey) >= 4096 {
-		return
+		evictStalestKeyLocked(p)
 	}
-	p.lastKey[model] = name
+	p.lastKeySeq++
+	p.lastKey[model] = lastKeyEntry{key: name, seq: p.lastKeySeq}
+}
+
+// evictStalestKeyLocked drops the map's oldest write so a model loop past
+// the cap keeps working instead of silently pinning nothing. caller holds p.mu.
+func evictStalestKeyLocked(p *Pool) {
+	var worst string
+	var worstSeq uint64
+	first := true
+	for model, e := range p.lastKey {
+		if first || e.seq < worstSeq {
+			worst, worstSeq, first = model, e.seq, false
+		}
+	}
+	if !first {
+		delete(p.lastKey, worst)
+	}
 }
 
 // stickyKey returns the name of the key that last served model, if any.
 func (p *Pool) stickyKey(model string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.lastKey[model]
+	return p.lastKey[model].key
 }
 
 // idleWeight scores a key 0..1: more idle -> higher, failed within window -> crushed.
@@ -3649,8 +3681,18 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 			continue
 		}
 
-		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
-		resp.Body.Close()
+		// a streamed 200 hands the body to the client live. buffering it
+		// costs the caller the whole generation before its first byte, and
+		// the usage tail is teed off the passthrough anyway, so nothing
+		// downstream needs the bytes here.
+		streamedOK := isStream && resp.StatusCode == http.StatusOK
+		var rb []byte
+		nextBody := resp.Body
+		if !streamedOK {
+			rb, _ = io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))
+			resp.Body.Close()
+			nextBody = io.NopCloser(bytes.NewReader(rb))
+		}
 
 		bodyStr := string(rb)
 		if resp.StatusCode == http.StatusForbidden || (resp.StatusCode != http.StatusOK && strings.Contains(bodyStr, "ResourceExhausted")) {
@@ -3672,7 +3714,7 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 		lastResp = &http.Response{
 			StatusCode: resp.StatusCode,
 			Header:     resp.Header.Clone(),
-			Body:       io.NopCloser(bytes.NewReader(rb)),
+			Body:       nextBody,
 		}
 		break
 	}
@@ -3702,6 +3744,7 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 
 	var prompT, compT, totalT int
 	var recErr string
+	streamed := isStream && lastResp.StatusCode == http.StatusOK
 	if lastResp.StatusCode != http.StatusOK {
 		rb2, _ := io.ReadAll(io.LimitReader(lastResp.Body, upstreamBodyLimit))
 		lastResp.Body.Close()
@@ -3711,13 +3754,14 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 			recErr = recErr[:200]
 		}
 		acclog.Printf("!! upstream %d [%s] model=%s err=%q", lastResp.StatusCode, used.Name, model, recErr)
+	} else if streamed {
+		// usage is teed off the passthrough below, so the body is never read
+		// here: a second ReadAll would re-buffer what streams.
 	} else {
 		bodyCopy, _ := io.ReadAll(io.LimitReader(lastResp.Body, upstreamBodyLimit))
 		lastResp.Body.Close()
 		lastResp.Body = io.NopCloser(bytes.NewReader(bodyCopy))
-		if !isStream {
-			prompT, compT, totalT = respTokens(bodyCopy)
-		}
+		prompT, compT, totalT = respTokens(bodyCopy)
 	}
 
 	respHeaders := rlHeaders(lastResp.Header)
@@ -3736,7 +3780,6 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 		ContentBytes: int64(len(body)),
 		Headers:      respHeaders,
 	}
-	streamed := isStream && lastResp.StatusCode == http.StatusOK
 	if !streamed {
 		record.PromptTokens = prompT
 		record.CompletionTokens = compT

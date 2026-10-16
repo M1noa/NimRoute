@@ -151,7 +151,7 @@ func TestPickSticky(t *testing.T) {
 	now := time.Now()
 	a := &Key{Name: "a", LastUsed: now.Add(-30 * time.Minute)}
 	b := &Key{Name: "b", LastUsed: now.Add(-30 * time.Minute)}
-	p := &Pool{keys: []*Key{a, b}, lastKey: make(map[string]string)}
+	p := &Pool{keys: []*Key{a, b}, lastKey: make(map[string]lastKeyEntry)}
 
 	// no sticky: weighted pick returns one of them
 	if k := p.PickSticky(nil, "m", ""); k == nil {
@@ -159,7 +159,7 @@ func TestPickSticky(t *testing.T) {
 	}
 
 	// sticky set to a: always picks a
-	p.lastKey["m"] = "a"
+	p.lastKey["m"] = lastKeyEntry{key: "a"}
 	for i := 0; i < 100; i++ {
 		if k := p.PickSticky(nil, "m", p.stickyKey("m")); k.Name != "a" {
 			t.Fatalf("sticky pick = %s, want a", k.Name)
@@ -168,7 +168,7 @@ func TestPickSticky(t *testing.T) {
 
 	// sticky key on cooldown: falls back to the other available key
 	b.CooldownUntil = now.Add(time.Minute)
-	p.lastKey["m"] = "b"
+	p.lastKey["m"] = lastKeyEntry{key: "b"}
 	for i := 0; i < 100; i++ {
 		k := p.PickSticky(nil, "m", p.stickyKey("m"))
 		if k == nil {
@@ -634,10 +634,13 @@ func TestZenServiceOverloaded(t *testing.T) {
 }
 
 func TestConvertResponsesFlatToolsPreserved(t *testing.T) {
-	body, err := os.ReadFile("/tmp/zenin_1789086077017333000.json")
-	if err != nil {
-		t.Skip("no dump file")
-	}
+	// fixture owned by the test: the old one read a /tmp dump from whoever
+	// last ran the binary with ZEN_DUMP, so it silently passed everywhere else.
+	body := []byte(`{"model":"claude-sonnet-4-20250514","max_tokens":256,` +
+		`"tools":[` +
+		`{"name":"get_weather","description":"Get the weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}},` +
+		`{"name":"read_file","description":"Read a file from disk","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}` +
+		`],"messages":[{"role":"user","content":[{"type":"text","text":"weather in paris?"}]}]}`)
 	oaiBody, _, upstream, _, _, err := anthropicRequestToOpenAI(body)
 	if err != nil {
 		t.Fatalf("anthroToOAI: %v", err)
@@ -2565,9 +2568,11 @@ func TestLaneEscalateFromDirect(t *testing.T) {
 		t.Fatalf("cold lane must be direct with always_proxy off, got %q", p)
 	}
 	// escalation pins a distinct exit, and it is honored afterward.
+	// the pool above was seeded by this test, so a miss is a broken
+	// escalation, not a missing environment.
 	got := laneEscalate(l, "")
 	if got == "" {
-		t.Skip("no verified pool available to escalate onto")
+		t.Fatal("laneEscalate pinned nothing from the pool this test seeded")
 	}
 	if p := laneProxyFor(l, ""); p == "" {
 		t.Fatal("escalated lane must keep its pinned proxy")
@@ -2854,7 +2859,7 @@ func TestRaceProbeSkipsDead(t *testing.T) {
 	// local CONNECT stub answers 200: proves the http probe path works.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skip("no listen")
+		t.Fatalf("cannot listen on loopback: %v", err)
 	}
 	defer ln.Close()
 	go func() {
@@ -3759,9 +3764,11 @@ func zenOCNames() []string {
 }
 
 func TestZenBallastMatchesScript(t *testing.T) {
+	// committed fixture: its absence is a broken checkout, so a skip here
+	// would read the drift check as a pass.
 	raw, err := os.ReadFile("scripts/opencode_ballast.json")
 	if err != nil {
-		t.Skipf("ballast script copy missing: %v", err)
+		t.Fatalf("scripts/opencode_ballast.json: %v", err)
 	}
 	var scriptDefs []any
 	if err := json.Unmarshal(raw, &scriptDefs); err != nil {

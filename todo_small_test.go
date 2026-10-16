@@ -110,7 +110,7 @@ func TestMergeMissingKeys(t *testing.T) {
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)
 	if err := os.Chdir(filepath.Dir(user)); err != nil {
-		t.Skip("cannot chdir")
+		t.Fatalf("cannot chdir into the test dir: %v", err)
 	}
 	// example must be reachable: copy it next to the temp config.
 	seed, err := os.ReadFile(filepath.Join(cwd, "config.yml.example"))

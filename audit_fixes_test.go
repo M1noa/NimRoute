@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,5 +136,181 @@ func TestZenHeaderForwardingDropsCredentials(t *testing.T) {
 	}
 	if out.Get("X-Custom") != "keepme" {
 		t.Fatalf("custom headers must survive forwarding, got %v", out)
+	}
+}
+
+// a nim stream must reach the client while the upstream is still writing.
+// the bug: handleNvidia ReadAll'd the 200 body into memory (twice — once
+// for the read, once for the token/debug tee) and re-wrapped it, so the
+// first byte a streaming caller saw landed after generation finished. the
+// upstream here holds the stream open until the first byte is observed.
+func TestNvidiaStreamFirstByteBeforeBodyComplete(t *testing.T) {
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		select {
+		case <-release:
+		case <-time.After(5 * time.Second):
+			// the proxy buffered the whole body: it can never deliver the
+			// first byte while this write is still open.
+			t.Error("upstream held open 5s: the proxy buffered the body instead of streaming it")
+		}
+		io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"second\"}}]}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		close(finished)
+	}))
+	defer srv.Close()
+
+	oldBase := nvidiaBase
+	nvidiaBase = srv.URL
+	t.Cleanup(func() { nvidiaBase = oldBase })
+
+	c := testConfig()
+	c.Nvidia.Enabled = true
+	c.NvidiaKeys = map[string]string{"nv1": "k"}
+	useConfig(t, c)
+	p := newPool(c.NvidiaKeys)
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte(`{"model":"nvidia/x","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		p.handleNvidia(w, r, body, "nvidia/x", true, time.Now(), "test-nvstream")
+	}))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"nvidia/x","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("stream request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("client status = %d, want 200", resp.StatusCode)
+	}
+
+	// the byte that has to arrive early, and the signal that lets the
+	// upstream finish.
+	buf := make([]byte, 4096)
+	n, err := resp.Body.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("no first byte delivered (n=%d err=%v)", n, err)
+	}
+	if !strings.Contains(string(buf[:n]), "first") {
+		t.Fatalf("first delivered payload = %q, want the opening chunk", string(buf[:n]))
+	}
+	select {
+	case <-finished:
+		t.Fatal("upstream finished generating before the proxy delivered its first chunk")
+	default:
+	}
+	close(release)
+	<-finished
+}
+
+// the 4096 cap must not silently stop pinning new models: past the cap the
+// oldest write is dropped so the next id still lands.
+func TestNoteKeyEvictsInsteadOfRefusing(t *testing.T) {
+	c := testConfig()
+	applyConfig(c)
+	defer applyConfig(testConfig())
+	p := newPool(map[string]string{"nv1": "k1", "nv2": "k2"})
+
+	for i := 0; i < 4096; i++ {
+		p.noteKey("model-old-"+strconv.Itoa(i), "nv1")
+	}
+	p.mu.RLock()
+	n := len(p.lastKey)
+	p.mu.RUnlock()
+	if n != 4096 {
+		t.Fatalf("map grew to %d, want it held at the cap", n)
+	}
+	// a brand-new id must still pin, not be refused.
+	p.noteKey("model-fresh", "nv2")
+	if got := p.stickyKey("model-fresh"); got != "nv2" {
+		t.Fatalf("fresh model pinned to %q, want nv2", got)
+	}
+	p.mu.RLock()
+	n = len(p.lastKey)
+	p.mu.RUnlock()
+	if n != 4096 {
+		t.Fatalf("map grew to %d after eviction, want it held at the cap", n)
+	}
+	// and the oldest pin is the one that went.
+	if got := p.stickyKey("model-old-0"); got != "" {
+		t.Fatalf("oldest model still pinned to %q, want it evicted", got)
+	}
+}
+
+// uint16be is the length prefix for every framed field. it panics past
+// 0xffff, so the invariant the framer depends on is pinned here rather than
+// discovered in a panic on the live path.
+func TestUint16beBoundary(t *testing.T) {
+	for _, n := range []int{0, 1, 0x00ff, 0x0100, 0x7fff, 0xfffe, 0xffff} {
+		got := uint16be(n)
+		if len(got) != 2 {
+			t.Fatalf("uint16be(%d) = %d bytes, want 2", n, len(got))
+		}
+		if int(binary.BigEndian.Uint16(got)) != n {
+			t.Fatalf("uint16be(%d) round-tripped to %d", n, binary.BigEndian.Uint16(got))
+		}
+	}
+	for _, n := range []int{0x10000, 0x10001, 1 << 20, -1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("uint16be(%d) did not panic", n)
+				}
+			}()
+			uint16be(n)
+		}()
+	}
+}
+
+// the frame carries the body as uint32, so an upload larger than the
+// uint16 ceiling still round-trips whole: this is what keeps the
+// uint16be panic unreachable on the live path.
+func TestAntEncodeHTTPReqCarriesBodyAsUint32(t *testing.T) {
+	small := []byte(`{"n":1}`)
+	q := antHTTPReq{
+		id:      "req-1",
+		method:  http.MethodPost,
+		path:    "/v1/chat/completions",
+		headers: map[string]string{"content-type": "application/json"},
+		body:    small,
+	}
+	enc := antEncodeHTTPReq(q)
+	off := 2 + len(q.id) + 1 + len(q.method)
+	if got := binary.BigEndian.Uint16(enc[off : off+2]); got != uint16(len(q.path)) {
+		t.Fatalf("path length prefix = %d, want %d", got, len(q.path))
+	}
+	off += 2 + len(q.path)
+	if got := int(binary.BigEndian.Uint16(enc[off : off+2])); got != len(q.headers) {
+		t.Fatalf("header count prefix = %d, want %d", got, len(q.headers))
+	}
+	off += 2
+	for k, v := range q.headers {
+		if got := int(binary.BigEndian.Uint16(enc[off : off+2])); got != len(k) {
+			t.Fatalf("header key length prefix = %d, want %d", got, len(k))
+		}
+		off += 2 + len(k)
+		if got := int(binary.BigEndian.Uint16(enc[off : off+2])); got != len(v) {
+			t.Fatalf("header value length prefix = %d, want %d", got, len(v))
+		}
+		off += 2 + len(v)
+	}
+	if got := int(binary.BigEndian.Uint32(enc[off : off+4])); got != len(small) {
+		t.Fatalf("body length prefix = %d, want %d", got, len(small))
+	}
+	if !bytes.Equal(enc[off+4:], small) {
+		t.Fatal("body bytes were not carried verbatim")
 	}
 }

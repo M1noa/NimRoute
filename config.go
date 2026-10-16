@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -547,6 +548,12 @@ func loadConfigFile(path string) (*appConfig, error) {
 	if err := yaml.Unmarshal(raw, &c); err != nil {
 		return nil, err
 	}
+	// a typo'd key is silent otherwise: yaml.v3 drops whatever the schema
+	// does not know, so the user believes they enabled something they did
+	// not. warn, never fail. the example is the schema source of truth, so
+	// it joins the struct tags as known keys.
+	ex, _ := os.ReadFile("config.yml.example")
+	warnUnknownTopKeys(path, raw, ex)
 	// no raw-doc presence checks for the true-by-default bools: c starts
 	// from defaultConfig(), and yaml.v3 leaves an absent or null key
 	// untouched, so only an explicit `enabled: false` flips a default.
@@ -560,6 +567,64 @@ func loadConfigFile(path string) (*appConfig, error) {
 		c.NousKeys = map[string]string{}
 	}
 	return &c, nil
+}
+
+// knownTopKeys is the top-level schema: appConfig's yaml tags plus every
+// top-level key example documents (it names sections ahead of defaultConfig()
+// catching up). nil example = struct tags only.
+func knownTopKeys(example []byte) map[string]bool {
+	keys := map[string]bool{}
+	t := reflect.TypeOf(appConfig{})
+	for i := 0; i < t.NumField(); i++ {
+		if tag := strings.Split(t.Field(i).Tag.Get("yaml"), ",")[0]; tag != "" && tag != "-" {
+			keys[tag] = true
+		}
+	}
+	var doc yaml.Node
+	if yaml.Unmarshal(example, &doc) != nil {
+		return keys
+	}
+	for _, k := range topLevelKeys(&doc) {
+		keys[k] = true
+	}
+	return keys
+}
+
+// warnUnknownTopKeys names top-level yaml keys the schema does not know. warn
+// only: a typo must not take the proxy down. nested keys stay quiet, they are
+// the section owner's business, and a warning per leaf is noise.
+func warnUnknownTopKeys(path string, raw, example []byte) {
+	var doc yaml.Node
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return
+	}
+	known := knownTopKeys(example)
+	var unknown []string
+	for _, k := range topLevelKeys(&doc) {
+		if k != "" && !known[k] {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		log.Printf("WARN: %s: unknown top-level key(s) %s (typo? not in the schema, ignored)",
+			path, strings.Join(unknown, ", "))
+	}
+}
+
+// topLevelKeys lists a doc's top-level mapping keys in document order.
+func topLevelKeys(node *yaml.Node) []string {
+	if len(node.Content) == 0 {
+		return nil
+	}
+	m := node.Content[0]
+	if m.Kind != yaml.MappingNode {
+		return nil
+	}
+	var keys []string
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		keys = append(keys, m.Content[i].Value)
+	}
+	return keys
 }
 
 // nvidiaEnabled reports whether nim requests are served: flag on and keys set.

@@ -11,6 +11,11 @@ import (
 // usage tracking: per-request jsonl + in-memory totals for /status.
 // disabled when usage.enabled is false (zero file, zero counters).
 
+// usageModelCap bounds the client-keyed maps below. model ids are chosen
+// by the caller, so past this many distinct ids the rest fold into (other)
+// instead of growing forever.
+const usageModelCap = 4096
+
 var (
 	usageMu   sync.Mutex
 	usageOut  *json.Encoder
@@ -105,6 +110,11 @@ func noteModelOutcomeLocked(model string, ok bool, code int, key string) {
 		// the listing is not the truth, a working request is.
 		delete(removedByModel, model)
 	}
+	// same cap as totals, owned here so the ring map cannot outgrow it:
+	// these ids are client-chosen and this map reaches /status.
+	if _, seen := outcomesByModel[model]; !seen && len(outcomesByModel) >= usageModelCap {
+		model = "(other)"
+	}
 	o := modelOutcome{key: key}
 	if !ok {
 		o.code = code
@@ -197,7 +207,7 @@ func logUsage(r UsageRecord) {
 	// client-supplied model ids are unbounded: cap the map and fold
 	// overflow into one bucket, or unique-model loops OOM the proxy.
 	model := r.Model
-	if t := totals[model]; t == nil && len(totals) >= 4096 {
+	if t := totals[model]; t == nil && len(totals) >= usageModelCap {
 		model = "(other)"
 	}
 	if model == "" {

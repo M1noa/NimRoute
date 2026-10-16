@@ -178,13 +178,40 @@ func nousCached() []nousModel {
 // completion exactly 0, and those are not free.
 func nousFreeModels() []nousModel {
 	nousCatMu.RLock()
-	if len(nousCat) > 0 && time.Since(nousCatAt) < nousCatalogTTL {
-		out := nousCat
-		nousCatMu.RUnlock()
-		return out
-	}
+	cached, at := nousCat, nousCatAt
 	nousCatMu.RUnlock()
+	if len(cached) > 0 && time.Since(at) < nousCatalogTTL {
+		return cached
+	}
+	// stale or cold. /status polls this once a second (status-tail), so the
+	// fetch goes to the background and the caller gets the cached copy: a
+	// 10s upstream GET must never sit on the status path. the listing
+	// catches up when the fetch lands.
+	tryRefreshNousCatalog()
+	return cached
+}
 
+// nousCatalogBackoff gates background refetches. a 30s floor keeps a
+// failing portal from refetching on every poll; a success re-arms the
+// 6h ttl through nousCatAt instead.
+var nousCatalogBackoff struct {
+	sync.Mutex
+	next time.Time
+}
+
+func tryRefreshNousCatalog() {
+	nousCatalogBackoff.Lock()
+	defer nousCatalogBackoff.Unlock()
+	if time.Now().Before(nousCatalogBackoff.next) {
+		return
+	}
+	nousCatalogBackoff.next = time.Now().Add(30 * time.Second)
+	go fetchNousCatalog()
+}
+
+// fetchNousCatalog pulls the portal listing and swaps it in on success,
+// keeping the previous list on any failure.
+func fetchNousCatalog() []nousModel {
 	req, err := http.NewRequest("GET", nousBase+"/models", nil)
 	if err != nil {
 		acclog.Printf("!! nous catalog: bad request: %v", err)
