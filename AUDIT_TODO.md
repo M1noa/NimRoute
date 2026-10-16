@@ -29,9 +29,10 @@ box per fix. Audit coverage is complete; the boxes below are the work.
 
 - [ ] **Q1 MEDIUM** — `config.go:547`: warn on config keys that are not in
       `config.yml.example` (warn only, never fail the load).
-- [ ] **Q2 LOW** — `main_test.go:2570`/`:2857`/`:639`, `todo_small_test.go:113`:
-      make these tests build their own fixtures instead of skipping; leave the
-      env-gated skips (native model files, live quota probe) as they are.
+- [ ] **Q2 LOW** — `main_test.go:2570`/`:2857`/`:639`/`:3764`,
+      `todo_small_test.go:113` (5 of the 10 `t.Skip` sites): make these tests
+      build their own fixtures instead of skipping; leave the five env-gated
+      skips (native model files, live quota probe) as they are.
 
 ## Sloppy code
 
@@ -75,7 +76,8 @@ box per fix. Audit coverage is complete; the boxes below are the work.
 ### Scanned
 - [x] `benchmarks.go`, `pii/fetch_model.sh`, `nim`, `docs/**`,
       `config.yml.example`.
-- [x] The 27 Go test files (353 test funcs, 11 skip sites classified).
+- [x] The 27 Go test files (353 test funcs, 10 skip sites classified: 5
+      env-gated, 5 fixture-missing).
 
 ### Skipped (vendored / data)
 - [x] `system-prompts/**`, `guardrails.json`, `aa_benchmarks.json`,

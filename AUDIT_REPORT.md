@@ -32,10 +32,15 @@ end, `dumpIfErr`, redaction), `modelinfo.go` (`globMatch`, lookup),
 `config.yml.example`, and the 27 Go test files (skip inventory, assertion
 strength).
 
+**Config / meta** — `config.yml` (gitignored; live config, reviewed for schema
+and redaction facts), `model_info.jsonc` (tracked catalog data), `.gitignore`,
+`go.sum`.
+
 **Skipped (vendored / data, not project code)** — `system-prompts/**`,
 `guardrails.json`, `aa_benchmarks.json`, `openrouter_models.json`,
 `keys.jsonc`, `.zenpool.json`, `testdata/*.json`,
-`scripts/opencode_ballast.json`.
+`scripts/opencode_ballast.json` (16KB of tool definitions; its shape is pinned
+by `TestZenBallastMatchesScript`, which is how it was reviewed).
 
 Nothing in the tree is unaccounted for: every file is in one of those buckets.
 
@@ -166,15 +171,19 @@ does nothing. The file already appends commented defaults for *missing* keys
 (`mergeMissingKeys`); an unknown-key warning would catch the other half of the
 same mistake class.
 
-**Q2 — several tests pass by skipping when their fixture is missing. LOW.** `main_test.go:2570`, `main_test.go:2857`, `main_test.go:639`, `todo_small_test.go:113`
-353 test functions across 27 files, 11 `t.Skip` sites. Most are correctly
-environment-gated (`pii/ner_ort_test.go` on `RAMPART_MODEL`/`ORT_LIB`,
-`zen_schema_test.go` on `ZEN_CALIBRATE`, the live-quota probe on `-short`).
-Four are not: "no verified pool available to escalate onto", "no listen", "no
-dump file", "cannot chdir" skip when a fixture the test could own did not
-materialize, so a broken fixture reads as a pass. The pool one guards the
-pin/rotation invariant this whole project rests on — that test should build the
-pool it needs (or `t.Fatal`) rather than skip.
+**Q2 — several tests pass by skipping when their fixture is missing. LOW.** `main_test.go:2570`, `:2857`, `:639`, `:3764`, `todo_small_test.go:113`
+353 test functions across 27 files, 10 `t.Skip` sites. Five are correctly
+environment-gated: `pii/ner_ort_test.go:14` on
+`RAMPART_MODEL`/`ORT_LIB`, `pii/wordpiece_ref_test.go:13,17` on
+`TOK_REF`/`RAMPART_VOCAB`, `zen_schema_test.go:265,268` on `-short` and
+`ZEN_CALIBRATE`. The other five skip when a fixture the test could own did not
+materialize — "no verified pool available to escalate onto", "no listen", "no
+dump file", "cannot chdir", and "ballast script copy missing" — so a broken
+fixture reads as a pass. The last one is committed
+(`scripts/opencode_ballast.json`), so it only fires in a source-less checkout,
+but it still turns the embedded-ballast drift check into a pass; the pool one
+guards the pin/rotation invariant this whole project rests on and should build
+the pool it needs (or `t.Fatal`) rather than skip.
 
 ### Dependency
 

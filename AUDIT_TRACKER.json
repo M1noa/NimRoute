@@ -859,7 +859,7 @@
       "loc": 63,
       "status": "done",
       "priority": 11,
-      "notes": "targeted review of the invariant-carrying regions",
+      "notes": "config/meta file: read for ignore coverage, no logic",
       "findings": [],
       "doneAt": null,
       "skipReason": null
@@ -889,7 +889,7 @@
       "loc": 392,
       "status": "done",
       "priority": 11,
-      "notes": "targeted review of the invariant-carrying regions",
+      "notes": "config/meta file: live config, reviewed for schema/redaction facts (not committed: gitignored)",
       "findings": [],
       "doneAt": null,
       "skipReason": null
@@ -899,7 +899,7 @@
       "loc": 17,
       "status": "done",
       "priority": 11,
-      "notes": "targeted review of the invariant-carrying regions",
+      "notes": "config/meta file: generated lockfile, not source",
       "findings": [],
       "doneAt": null,
       "skipReason": null
@@ -929,7 +929,7 @@
       "loc": 140,
       "status": "done",
       "priority": 11,
-      "notes": "targeted review of the invariant-carrying regions",
+      "notes": "config/meta file: catalog data read for schema and fallback facts",
       "findings": [],
       "doneAt": null,
       "skipReason": null

@@ -77,12 +77,15 @@ item names the owner file, the effort, and what it blocks or depends on.
 
 ## 8. Q2 — make the four silent-skip tests own their fixtures (LOW)
 
-- **File:** `main_test.go:2570`, `:2857`, `:639`, `todo_small_test.go:113`.
+- **File:** `main_test.go:2570`, `:2857`, `:639`, `:3764`,
+  `todo_small_test.go:113` (5 of the 10 `t.Skip` sites).
 - **Effort:** ~1h (the pool one is the real work).
 - **Change:** build the pool the pin/rotation test needs instead of skipping
   when there is none; `t.Fatal` when a fixture the test itself created is
-  missing. Leave the correctly env-gated skips (native model files, live
-  quota probes) alone.
+  missing (including the `scripts/opencode_ballast.json` copy, which is
+  committed, so its absence is a broken checkout, not a missing environment).
+  Leave the five correctly env-gated skips (native model files, live quota
+  probes) alone.
 
 ## 9. I4 — winner-only latency on the anthropic race path (LOW)
 
