@@ -3006,25 +3006,46 @@ func isStopword(w string) bool {
 	return false
 }
 
-// guardrailPrefixes holds the normalized distinct guardrails, longest first.
+// guardrailPat is one precomputed guardrail: its normalized form, its
+// significant tokens, and the plain token count. computing these once at
+// reload keeps the request path allocation-free.
+type guardrailPat struct {
+	norm  string
+	sig   []string
+	gnLen int
+}
+
+// guardrailPats holds the normalized distinct guardrails, longest first.
 // rebuilt by dedupeGuardrails on config reload and read on the request path,
 // so it is swapped under guardrailMu.
 var (
-	guardrailMu       sync.RWMutex
-	guardrailPrefixes []string
+	guardrailMu     sync.RWMutex
+	guardrailPats   []guardrailPat
+	guardrailAnchor map[string][]int // core token -> indices into guardrailPats
+	guardrailAlways []int            // patterns with no usable anchor: always tested
 )
 
-func guardrailPrefixSnapshot() []string {
+func guardrailPrefixSnapshot() []guardrailPat {
 	guardrailMu.RLock()
 	defer guardrailMu.RUnlock()
-	return guardrailPrefixes
+	return guardrailPats
+}
+
+// guardrailSnapshot returns the pattern list plus the index the request path
+// needs: which patterns can start on a given core token, and which carry no
+// usable anchor so must always be tested.
+func guardrailSnapshot() ([]guardrailPat, map[string][]int, []int) {
+	guardrailMu.RLock()
+	defer guardrailMu.RUnlock()
+	return guardrailPats, guardrailAnchor, guardrailAlways
 }
 
 // dedupeGuardrails collapses near-equal entries (same first 60 normalized
 // chars) in one pass over guardrailList, so removal is not O(N^2) at 455.
+// the per-pattern tokens are prepared here, once, not per request.
 func dedupeGuardrails() {
 	seen := map[string]bool{}
-	var out []string
+	var out []guardrailPat
 	for _, g := range guardrailList {
 		gn := normGuardrail(g)
 		if gn == "" || len(gn) < 20 {
@@ -3036,12 +3057,52 @@ func dedupeGuardrails() {
 		}
 		if !seen[key] {
 			seen[key] = true
-			out = append(out, gn)
+			out = append(out, guardrailPat{
+				norm:  gn,
+				sig:   sigTokens(gn),
+				gnLen: len(strings.Fields(gn)),
+			})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	sort.Slice(out, func(i, j int) bool { return len(out[i].norm) > len(out[j].norm) })
+	// index each pattern by the plain token a window could start on, so the
+	// request path can rule out most patterns in one pass over the body's
+	// tokens instead of rescanning the body once per pattern. keys are edge
+	// markdown stripped ("**never**" and "never**" both key "never") because
+	// normSpans skips leading markdown only at the start of a string, so a
+	// guardrail embedded mid-prompt keeps its own markers.
+	anchor := make(map[string][]int)
+	var always []int
+	for i := range out {
+		f := strings.Fields(out[i].norm)
+		// a single-token pattern can sit inside a longer body token; keep it
+		// always-tested rather than trust a token anchor.
+		if len(f) < 2 {
+			always = append(always, i)
+			continue
+		}
+		if len(out[i].sig) < minSigTokens {
+			always = append(always, i) // no fuzzy path: exact-only, no anchor
+			continue
+		}
+		keys := map[string]bool{}
+		for _, t := range []string{f[0], out[i].sig[0]} {
+			if k := coreToken(t); k != "" {
+				keys[k] = true
+			}
+		}
+		if len(keys) == 0 {
+			always = append(always, i)
+			continue
+		}
+		for k := range keys {
+			anchor[k] = append(anchor[k], i)
+		}
+	}
 	guardrailMu.Lock()
-	guardrailPrefixes = out
+	guardrailPats = out
+	guardrailAnchor = anchor
+	guardrailAlways = always
 	guardrailMu.Unlock()
 }
 
@@ -3052,8 +3113,8 @@ func dedupeGuardrails() {
 // sentence holding the last matched token. Returns the cleaned text and a
 // removal count.
 func stripSomeGuardrails(text string) (string, int) {
-	prefixes := guardrailPrefixSnapshot()
-	if !cfg().Guardrails.Enabled || text == "" || len(prefixes) == 0 {
+	pats, anchorOn, alwaysOn := guardrailSnapshot()
+	if !cfg().Guardrails.Enabled || text == "" || len(pats) == 0 {
 		return text, 0
 	}
 	norm, spans := normSpans(text)
@@ -3062,13 +3123,38 @@ func stripSomeGuardrails(text string) (string, int) {
 	}
 	words := strings.Fields(norm)
 
+	// one pass over the body's tokens rules out every pattern whose anchor
+	// token is absent, so matching costs one walk of the text rather than one
+	// per pattern. each core token is also tried as a suffix, since a match
+	// is a plain substring: a guardrail glued to the word before it ("unNever
+	// ...") still matches and must stay live.
+	live := make([]bool, len(pats))
+	mark := func(ws []string) {
+		for i := range live {
+			live[i] = false
+		}
+		for _, w := range ws {
+			for c := coreToken(w); c != ""; {
+				for _, i := range anchorOn[c] {
+					live[i] = true
+				}
+				_, sz := utf8.DecodeRuneInString(c)
+				c = c[sz:]
+			}
+		}
+		for _, i := range alwaysOn {
+			live[i] = true
+		}
+	}
+	mark(words)
+
 	n := 0
-	for _, gn := range prefixes {
-		if !guardrailMatchNorm(norm, words, gn) {
+	for i, p := range pats {
+		if !live[i] {
 			continue
 		}
-		score, first, last := guardrailScore(norm, words, gn)
-		if first < 0 || last < first || first >= len(spans) {
+		score, first, last := guardrailScorePat(norm, words, p)
+		if first < 0 || last < first || first >= len(spans) || score < guardrailThreshold() {
 			continue
 		}
 		if last >= len(spans) {
@@ -3123,6 +3209,7 @@ func stripSomeGuardrails(text string) (string, int) {
 			break
 		}
 		words = strings.Fields(norm)
+		mark(words)
 	}
 	return text, n
 }
@@ -3166,6 +3253,28 @@ func sigTokens(gn string) []string {
 	return sig
 }
 
+// coreToken strips leading and trailing non-alphanumeric runes so a token
+// compares independent of surrounding markdown ("**never**" -> "never").
+func coreToken(w string) string {
+	start := 0
+	for start < len(w) {
+		r, sz := utf8.DecodeRuneInString(w[start:])
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			break
+		}
+		start += sz
+	}
+	end := len(w)
+	for end > start {
+		r, sz := utf8.DecodeLastRuneInString(w[:end])
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			break
+		}
+		end -= sz
+	}
+	return w[start:end]
+}
+
 // tokenAt returns the word index containing byte pos in a normalized string
 // whose tokens are separated by single spaces.
 func tokenAt(norm string, pos int) int {
@@ -3178,18 +3287,18 @@ func tokenAt(norm string, pos int) int {
 	return strings.Count(norm[:pos], " ")
 }
 
-// guardrailScore scores a guardrail against a pre-normalized token stream.
-// Returns 1.0 for exact substring, else coverage*density of the best window,
-// or 0 when no window qualifies. Also returns the word range [first,last]
-// covered by the match in the text (for exact spans as well), so removals can
-// cut precisely what matched instead of rounding to a sentence.
+// guardrailScorePat scores one precomputed guardrail against a pre-normalized
+// token stream. Returns 1.0 for exact substring, else coverage*density of the
+// best window, or 0 when no window qualifies. Also returns the word range
+// [first,last] covered by the match in the text (for exact spans as well), so
+// removals can cut precisely what matched instead of rounding to a sentence.
 // Partial matches count: a paraphrase dropping the tail still scores via
 // coverage, but the window constraint, threshold, and tail weight keep
 // scattered or coincidental tokens out.
-func guardrailScore(norm string, words []string, gn string) (float64, int, int) {
-	if ci := strings.Index(norm, gn); ci >= 0 {
+func guardrailScorePat(norm string, words []string, p guardrailPat) (float64, int, int) {
+	if ci := strings.Index(norm, p.norm); ci >= 0 {
 		first := tokenAt(norm, ci)
-		last := tokenAt(norm, ci+len(gn)-1)
+		last := tokenAt(norm, ci+len(p.norm)-1)
 		if first < 0 {
 			first = 0
 		}
@@ -3198,11 +3307,11 @@ func guardrailScore(norm string, words []string, gn string) (float64, int, int) 
 		}
 		return 1.0, first, last
 	}
-	sig := sigTokens(gn)
-	gnLen := len(strings.Fields(gn))
+	sig := p.sig
 	if len(sig) < minSigTokens {
-		return 0, -1, -1 // too few distinguishing tokens: exact only (checked above)
+		return 0, -1, -1 // too few distinguishing tokens: exact only
 	}
+	gnLen := p.gnLen
 	// candidate starts: every occurrence of sig[0]
 	best, bestFirst, bestLast := 0.0, -1, -1
 	for s := 0; s < len(words); s++ {
@@ -3256,15 +3365,6 @@ func guardrailScore(norm string, words []string, gn string) (float64, int, int) 
 		}
 	}
 	return best, bestFirst, bestLast
-}
-
-// guardrailMatchNorm reports a hit when the score clears the threshold.
-func guardrailMatchNorm(norm string, words []string, gn string) bool {
-	if strings.Contains(norm, gn) {
-		return true
-	}
-	s, _, _ := guardrailScore(norm, words, gn)
-	return s >= guardrailThreshold()
 }
 
 func respTokens(body []byte) (prompt, completion, total int) {
