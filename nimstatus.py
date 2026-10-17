@@ -282,35 +282,44 @@ def fmt_ms(ms):
 
 
 def merged_table(d, limit=8):
-    """One table: lane + its exit (host, cc) + api latency + req."""
+    """One table: lane + its exit (host, cc) + api latency + req. the cc
+    column drops out when no lane carries a country, i.e. custom proxies
+    with no geo data."""
     lanes = d.get("zen_lanes") or []
     pool = d.get("pool") or {}
     exits = {e.get("proxy"): e for e in (pool.get("exits") or [])}
+    lanes = sorted(lanes, key=lambda l: (-l.get("requests", 0), l.get("id", "")))
+    shown = lanes[:limit] if limit else lanes
+    rows, any_cc = [], False
+    for l in shown:
+        proxy = l.get("proxy") or ""
+        e = exits.get(proxy, {})
+        if proxy:
+            exit_t = Text(proxy.split("://", 1)[-1])
+        else:
+            exit_t = Text("—", style="dim")
+        cc = str(e.get("country") or l.get("country") or "").strip()
+        if cc in ("", "??"):
+            cc = "·"
+        else:
+            any_cc = True
+        rows.append(((l.get("id") or "?")[:14], exit_t, cc,
+                     fmt_ms(e.get("avg_ms")),
+                     str(l.get("requests", 0)), str(l.get("rate_limited", 0)),
+                     fmt_ms(l.get("avg_ms")), fmt_tok(l.get("total_tokens", 0))))
     t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
               pad_edge=False)
     t.add_column("lane", style="slate_blue1")
     t.add_column("exit")
-    t.add_column("cc")
+    if any_cc:
+        t.add_column("cc")
     t.add_column("ttfb", justify="right")
     t.add_column("req", justify="right")
     t.add_column("429", justify="right", style="yellow")
     t.add_column("avg turn", justify="right")
     t.add_column("tokens", justify="right")
-    lanes = sorted(lanes, key=lambda l: (-l.get("requests", 0), l.get("id", "")))
-    shown = lanes[:limit] if limit else lanes
-    for l in shown:
-        proxy = l.get("proxy") or ""
-        e = exits.get(proxy, {})
-        if proxy:
-            host = proxy.split("://", 1)[-1]
-            exit_t = Text(host)
-        else:
-            exit_t = Text("—", style="dim")
-        t.add_row((l.get("id") or "?")[:14], exit_t,
-                  str(e.get("country", "·")),
-                  fmt_ms(e.get("avg_ms")),
-                  str(l.get("requests", 0)), str(l.get("rate_limited", 0)),
-                  fmt_ms(l.get("avg_ms")), fmt_tok(l.get("total_tokens", 0)))
+    for r in rows:
+        t.add_row(*(r if any_cc else r[:2] + r[3:]))
     if len(shown) < len(lanes):
         t.caption = "%d more lanes · nim status shows the busiest 8" % (len(lanes) - len(shown))
     return t

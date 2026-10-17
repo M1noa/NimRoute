@@ -191,11 +191,16 @@ zen:
   # use this when direct zen access is blocked or rate-limited for you.
   always_proxy: false
   # your own proxies, tried before the auto pool. any order, deduped.
-  # http(s) proxies may embed credentials: http://user:pass@host:port
+  # one of: a full url (http/https/socks4/socks5, credentials as
+  # user:pass@host), a bare host:port (http assumed), user:pass@host:port,
+  # or the vendor host:port:user:pass form.
   proxies:
     # - "socks5://127.0.0.1:1080"
     # - "http://user:pass@10.0.0.5:8080"
-  # ...or one proxy url per line in a file (# comments and blanks skipped):
+    # - "10.0.0.5:8080"
+    # - "10.0.0.5:8080:user:pass"
+  # ...or one proxy per line in a file. same formats. blank lines and
+  # lines starting with # are skipped; a # after a space ends the line.
   # proxy_file: "proxies.txt"
   proxy_file: ""
   # api-reported exit countries that zen geo-blocks (muse-spark RegionError).

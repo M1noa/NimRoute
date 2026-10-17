@@ -118,6 +118,30 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn("backend", text)
         self.assertNotIn("\n step-5-preview-free", text)
 
+    def _lane_table(self, d):
+        from rich.console import Console
+        out = io.StringIO()
+        Console(file=out, width=120, color_system=None).print(status.merged_table(d))
+        return out.getvalue()
+
+    def test_cc_column_present_for_pool_exits(self):
+        if not status.RICH:
+            self.skipTest("rich optional dependency unavailable")
+        d = {"zen_lanes": [{"id": "shared:00", "proxy": "http://1.2.3.4:8080",
+                            "country": "DE", "requests": 1}],
+             "pool": {"exits": [{"proxy": "http://1.2.3.4:8080", "country": "DE"}]}}
+        self.assertIn("cc", self._lane_table(d))
+
+    def test_cc_column_dropped_for_custom_proxies(self):
+        if not status.RICH:
+            self.skipTest("rich optional dependency unavailable")
+        # custom exit has no pool row and no country from the probe sweep
+        d = {"zen_lanes": [{"id": "shared:00", "proxy": "http://10.0.0.5:8080",
+                            "country": "??", "requests": 1}], "pool": {}}
+        table = self._lane_table(d)
+        self.assertNotIn("cc", table)
+        self.assertIn("10.0.0.5:8080", table)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -1124,10 +1125,18 @@ var (
 func setCustomProxies(px []string) {
 	seen := map[string]bool{}
 	var out []string
+	var skipped int
 	for _, p := range px {
-		if p = strings.TrimSpace(p); p != "" && !seen[p] {
-			seen[p] = true
-			out = append(out, p)
+		n := normalizeProxy(strings.TrimSpace(p))
+		if n == "" {
+			if strings.TrimSpace(p) != "" {
+				skipped++
+			}
+			continue
+		}
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
 		}
 	}
 	customProxyMu.Lock()
@@ -1135,6 +1144,9 @@ func setCustomProxies(px []string) {
 	customProxyMu.Unlock()
 	if len(out) > 0 {
 		log.Printf("  custom zen proxies: %d", len(out))
+	}
+	if skipped > 0 {
+		log.Printf("WARN: skipped %d unparsable proxy entries (want host:port, user:pass@host:port, host:port:user:pass, or a full url)", skipped)
 	}
 }
 
@@ -1144,8 +1156,9 @@ func getCustomProxies() []string {
 	return append([]string(nil), customProxies...)
 }
 
-// readProxyFile loads one proxy URL per line; # comments and blanks skipped.
-// http(s) proxies may embed credentials: http://user:pass@host:port
+// readProxyFile loads one proxy per line. blank lines and lines beginning
+// with # are skipped; a # preceded by whitespace ends the line, so a
+// password may contain #. entries are normalized by setCustomProxies.
 func readProxyFile(path string) []string {
 	if path == "" {
 		return nil
@@ -1157,12 +1170,54 @@ func readProxyFile(path string) []string {
 	}
 	var out []string
 	for _, line := range strings.Split(string(raw), "\n") {
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = line[:i]
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		if p := strings.TrimSpace(line); p != "" {
-			out = append(out, p)
+		for _, sep := range []string{" #", "\t#"} {
+			if i := strings.Index(line, sep); i >= 0 {
+				line = strings.TrimSpace(line[:i])
+			}
+		}
+		if line != "" {
+			out = append(out, line)
 		}
 	}
 	return out
+}
+
+// normalizeProxy turns one user-supplied proxy entry into a url the pool
+// can dial. accepts a full url (http/https/socks4/socks5), a bare
+// host:port, credentials as user:pass@host:port, or the vendor
+// host:port:user:pass form. "" means the entry is unusable.
+func normalizeProxy(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "://") {
+		return ifParsableURL(s)
+	}
+	if strings.ContainsAny(s, "[]") { // ipv6 literal, needs a scheme
+		return ifParsableURL("http://" + s)
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 { // user:pass@host:port
+		return ifParsableURL("http://" + s)
+	}
+	switch parts := strings.Split(s, ":"); len(parts) {
+	case 1, 2: // host or host:port
+		return ifParsableURL("http://" + s)
+	case 4: // host:port:user:pass
+		return ifParsableURL("http://" + parts[2] + ":" + parts[3] + "@" + parts[0] + ":" + parts[1])
+	default:
+		return ""
+	}
+}
+
+// ifParsableURL returns s only if it parses and carries a host.
+func ifParsableURL(s string) string {
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return s
+	}
+	return ""
 }
