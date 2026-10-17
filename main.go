@@ -1329,6 +1329,34 @@ func chatFromResponses(m map[string]any) {
 					pt, _ := pm["type"].(string)
 					if t, ok := pm["text"].(string); ok && (pt == "input_text" || pt == "output_text" || pt == "text") {
 						parts = append(parts, map[string]any{"type": "text", "text": t})
+					} else if pt == "input_image" {
+						// mirror of normalizeResponsesContent: responses
+						// input_image back to a chat image_url part.
+						u, _ := pm["image_url"].(string)
+						if u == "" {
+							continue
+						}
+						iu := map[string]any{"url": u}
+						if d, _ := pm["detail"].(string); d != "" {
+							iu["detail"] = d
+						}
+						parts = append(parts, map[string]any{"type": "image_url", "image_url": iu})
+					} else if pt == "input_file" {
+						// same, back to a chat file part. a bare file
+						// id has no bytes to forward, so it is skipped.
+						if u, _ := pm["file_url"].(string); u != "" {
+							f := map[string]any{"file_url": u}
+							if n, _ := pm["filename"].(string); n != "" {
+								f["filename"] = n
+							}
+							parts = append(parts, map[string]any{"type": "file", "file": f})
+						} else if d, _ := pm["file_data"].(string); d != "" {
+							f := map[string]any{"file_data": d}
+							if n, _ := pm["filename"].(string); n != "" {
+								f["filename"] = n
+							}
+							parts = append(parts, map[string]any{"type": "file", "file": f})
+						}
 					}
 				}
 				msg["content"] = parts
