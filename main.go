@@ -3007,8 +3007,10 @@ func isStopword(w string) bool {
 }
 
 // guardrailPat is one precomputed guardrail: its normalized form, its
-// significant tokens, and the plain token count. computing these once at
-// reload keeps the request path allocation-free.
+// significant tokens, and the plain token count. norm is a view into the
+// dedupe blob and sig a view into the shared token slice, so a pattern owns no
+// memory of its own. computing these once at reload keeps the request path
+// allocation-free.
 type guardrailPat struct {
 	norm  string
 	sig   []string
@@ -3042,10 +3044,11 @@ func guardrailSnapshot() ([]guardrailPat, map[string][]int, []int) {
 
 // dedupeGuardrails collapses near-equal entries (same first 60 normalized
 // chars) in one pass over guardrailList, so removal is not O(N^2) at 455.
-// the per-pattern tokens are prepared here, once, not per request.
+// called on config reload, never per request.
 func dedupeGuardrails() {
 	seen := map[string]bool{}
-	var out []guardrailPat
+	var raws [][2]int
+	var blob strings.Builder
 	for _, g := range guardrailList {
 		gn := normGuardrail(g)
 		if gn == "" || len(gn) < 20 {
@@ -3055,16 +3058,34 @@ func dedupeGuardrails() {
 		if len(key) > 60 {
 			key = key[:60]
 		}
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, guardrailPat{
-				norm:  gn,
-				sig:   sigTokens(gn),
-				gnLen: len(strings.Fields(gn)),
-			})
+		if seen[key] {
+			continue
 		}
+		seen[key] = true
+		start := blob.Len()
+		blob.WriteString(gn)
+		raws = append(raws, [2]int{start, blob.Len()})
 	}
-	sort.Slice(out, func(i, j int) bool { return len(out[i].norm) > len(out[j].norm) })
+	// longest first: the longest pattern wins a shared span.
+	sort.Slice(raws, func(i, j int) bool {
+		return raws[i][1]-raws[i][0] > raws[j][1]-raws[j][0]
+	})
+	// every pattern is a view into one blob, its tokens a view into one
+	// slice, so a pattern allocates nothing of its own. views survive the
+	// later appends: a subslice keeps its own header when the parent grows.
+	blobStr := blob.String()
+	out := make([]guardrailPat, 0, len(raws))
+	var sigAll []string
+	for _, r := range raws {
+		gn := blobStr[r[0]:r[1]]
+		at := len(sigAll)
+		sigAll = append(sigAll, sigTokens(gn)...)
+		out = append(out, guardrailPat{
+			norm:  gn,
+			sig:   sigAll[at:len(sigAll)],
+			gnLen: len(strings.Fields(gn)),
+		})
+	}
 	// index each pattern by the plain token a window could start on, so the
 	// request path can rule out most patterns in one pass over the body's
 	// tokens instead of rescanning the body once per pattern. keys are edge
@@ -3074,19 +3095,16 @@ func dedupeGuardrails() {
 	anchor := make(map[string][]int)
 	var always []int
 	for i := range out {
-		f := strings.Fields(out[i].norm)
+		gn := out[i].norm
+		sp := strings.IndexByte(gn, ' ')
 		// a single-token pattern can sit inside a longer body token; keep it
 		// always-tested rather than trust a token anchor.
-		if len(f) < 2 {
+		if sp < 0 || len(out[i].sig) < minSigTokens {
 			always = append(always, i)
 			continue
 		}
-		if len(out[i].sig) < minSigTokens {
-			always = append(always, i) // no fuzzy path: exact-only, no anchor
-			continue
-		}
 		keys := map[string]bool{}
-		for _, t := range []string{f[0], out[i].sig[0]} {
+		for _, t := range []string{gn[:sp], out[i].sig[0]} {
 			if k := coreToken(t); k != "" {
 				keys[k] = true
 			}

@@ -924,6 +924,9 @@ func applyConfig(c *appConfig) {
 		}
 	}
 	dedupeGuardrails()
+	// the raw entries are not needed past dedupe; the patterns now live as
+	// views into its blob. reload repopulates this from the file.
+	guardrailList = nil
 
 	// zen blocked countries
 	zenBlockedMu.Lock()
