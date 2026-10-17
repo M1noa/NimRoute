@@ -155,7 +155,7 @@ incidental machinery.
 
 | signal | meaning | action |
 |---|---|---|
-| 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15) and ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for the cycle (`noteExit429`), cleared by the next refresh. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
+| 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15), extends itself when the pool itself is written off (below), and only then ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for the cycle (`noteExit429`), cleared by the next refresh. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
 | 403 FreeTierError | per-exit-per-model refusal for the cycle (`noteExitModelBurned`). the exit stays poolable for other models; lane rotates away | normal, no fix. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
 | 502/503/504 from an exit | dead exit or a proxy in front of it failing (`zenRetryableStatus`). rotated like a 429, also never forwarded | normal noise, no fix |
 | 403 geo (`not available in your country`) / `[user_blocked]` | exit banned or region-blocked. `dropProxy` + failover; threshold (`error_threshold`, default 3) refreshes pool | normal, no fix |
@@ -169,6 +169,20 @@ an exit returns is absorbed by rotation, and a spent ladder answers
 caller retries against us instead of waiting us out. `ProxyUnavailableMsg`
 is the shared text for the other "could not place this request on an exit"
 exits (dial-dead, no pin under `always_proxy`, empty pool).
+
+two rules keep that 503 rare, both in zenlanes.go:
+- no lane ever sends without an exit. a lane that draws none waits
+  (`laneProxyWait`) while `dryPoolRefill` sweeps, then hands the request to a
+  lane that owns one; it never falls through to direct under `always_proxy`
+  or on an escalated lane (`laneNeedsProxy`). a pin collision re-pins
+  (`laneTouch` → `laneReproxy`) rather than leaving the lane pinless.
+- a spent ladder asks whether the *pool* was written off, not just the model
+  (`marksOut`: half the serving exits marked 429/dead). if so it forces a
+  sweep that clears the marks and buys extra hops (`ladderExtend`), so the
+  request rides fresh exits instead of 503ing. bounded by one per-request
+  `poolRecoverWait` (20s) budget, shared with the dry-pick wait, so a truly
+  dead pool still fails honestly instead of stalling. a merely busy model
+  (mostly clean pool) does not extend, and never waits.
 
 exit states live in one registry (`exitState` in zenlanes.go):
 `rate_limited` keyed by exit+model (2 in a row or 6 a cycle, expires at the

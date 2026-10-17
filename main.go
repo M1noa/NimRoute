@@ -51,7 +51,14 @@ const (
 var versionStr = "2.6.0"
 
 // OpencodeBase is a var so tests can point the zen path at a fake upstream.
+// ZEN_BASE_URL overrides it for benchmarking against a local mock.
 var OpencodeBase = "https://opencode.ai/inference/v1"
+
+func init() {
+	if u := os.Getenv("ZEN_BASE_URL"); u != "" {
+		OpencodeBase = strings.TrimRight(u, "/")
+	}
+}
 
 type Key struct {
 	Name           string
@@ -2142,7 +2149,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			}
 			if proxy == "" && cfg().Zen.AlwaysProxy {
 				// dry pool: back off instead of hot-spinning the loop.
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, zenMaxRetries()) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -2192,7 +2199,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			}
 			rotating = true
 			acclog.Printf("!! opencode zen error (retry %d/%d) nudge country=%s proxy=%s %s: %v", zenRetries, zenRetryLabel(), proxyCountry(proxy), redactProxyUserinfo(proxy), target, err)
-			if !zenLastRetry(zenRetries) {
+			if !zenLastRetry(zenRetries, zenMaxRetries()) {
 				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
@@ -2213,7 +2220,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 				lane = laneHandoff(lane, laneFailover(lane))
 				*sessionID = laneRotate(lane, nbModel)
 				rotating = true
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, zenMaxRetries()) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -2223,7 +2230,7 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 					up.StatusCode, proxyCountry(proxy), redactProxyUserinfo(proxy), errSnippet(eb, 160))
 				dropProxy(proxy)
 				rotating = true
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, zenMaxRetries()) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -3939,7 +3946,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	var dialDeadErr error
 	dialDeadProxy := ""
 	rotating := true
-	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
+	// attempts is the ladder bound: a hop that finds the pool written off buys
+	// extra hops once a refill clears the marks (ladderExtend), so it grows.
+	attempts := zenMaxRetries()
+	// poolRecoverUntil is this request's pool-recovery budget: it starts on the
+	// first wait and every later wait (dry pick, spent ladder) draws on it.
+	poolRecoverUntil := time.Time{}
+	for zenRetries := 0; zenRetries < attempts; zenRetries++ {
 		// pace only: lanes never cool, a limit rotates the exit instead.
 		// maybeRefreshStalePool trips only when this lane has been limited
 		// 15s+ with no global success (stale pool/sessions).
@@ -3960,27 +3973,33 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		proxy := ""
 		if zenRetries == 0 {
 			proxy = laneProxyFor(lane, realModel)
-			if proxy == "" && cfg().Zen.AlwaysProxy {
-				// pool dry: fail over once instead of burning a retry
-				// on direct, which always_proxy already ruled out.
-				lane = laneHandoff(lane, laneFailover(lane))
-				sessionID = laneSession(lane)
-				proxy = laneProxyFor(lane, realModel)
-				if proxy == "" {
+			if proxy == "" && laneNeedsProxy(lane) {
+				// this lane holds no exit: wait for one to be drawable
+				// instead of going direct, which always_proxy already ruled
+				// out and an escalated lane already proved burned.
+				nl, p := laneProxyWait(r.Context(), lane, realModel, &poolRecoverUntil)
+				if nl != lane {
+					lane = laneHandoff(lane, nl)
+					sessionID = laneSession(lane)
+				}
+				if p == "" {
 					continue
 				}
+				proxy = p
 			}
 			cl = zenClient(proxy)
 			usedProxy = proxy
 		} else if rotating {
 			proxy = laneProxyFor(lane, realModel)
-			if proxy == "" && cfg().Zen.AlwaysProxy {
-				// pool dry and proxied mode: try another lane's exit.
-				lane = laneHandoff(lane, laneFailover(lane))
-				sessionID = laneSession(lane)
-				proxy = laneProxyFor(lane, realModel)
+			if proxy == "" && laneNeedsProxy(lane) {
+				nl, p := laneProxyWait(r.Context(), lane, realModel, &poolRecoverUntil)
+				if nl != lane {
+					lane = laneHandoff(lane, nl)
+					sessionID = laneSession(lane)
+				}
+				proxy = p
 			}
-			if proxy == "" && cfg().Zen.AlwaysProxy {
+			if proxy == "" && laneNeedsProxy(lane) {
 				// no exit left to hand out (every one taken, written off,
 				// or the pool drained). when the last attempt was a
 				// refused dial, that error is the honest answer: a bare
@@ -4118,7 +4137,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			rotating = true
 			logZenNetErr(zenRetries, model, proxy, target, err)
 			maybeRefreshNetErr()
-			if !zenLastRetry(zenRetries) {
+			if !zenLastRetry(zenRetries, attempts) {
 				zenBackoffCtx(r.Context(), zenRetries)
 				continue
 			}
@@ -4141,9 +4160,19 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
 			noteExit429(proxy, realModel)
-			if zenLastRetry(zenRetries) {
-				// the 15-retry ladder is spent: the client hears about the
-				// proxy pool, never the 429 we just absorbed.
+			if zenLastRetry(zenRetries, attempts) {
+				// the ladder is spent on a written-off pool: refill and buy
+				// more hops instead of handing the caller a 503, as long as
+				// the marks (not a merely busy model) are what bounded it.
+				if ladderExtend(r.Context(), &poolRecoverUntil) {
+					attempts++
+					lane = laneHandoff(lane, laneFailover(lane))
+					sessionID = laneRotate(lane, realModel)
+					rotating = true
+					continue
+				}
+				// the client hears about the proxy pool, never the 429 we
+				// just absorbed.
 				resp, gaveUp = exhaustedExits(model, st), true
 			} else {
 				lane = laneHandoff(lane, laneFailover(lane))
@@ -4163,7 +4192,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, rotating exit+session",
 				st, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
 			dropProxy(proxy)
-			if zenLastRetry(zenRetries) {
+			if zenLastRetry(zenRetries, attempts) {
+				// same extension as the 429 path: a refill replaces the dead
+				// exits the ladder just spent itself on.
+				if ladderExtend(r.Context(), &poolRecoverUntil) {
+					attempts++
+					lane = laneHandoff(lane, laneFailover(lane))
+					sessionID = laneRotate(lane, realModel)
+					rotating = true
+					continue
+				}
 				resp, gaveUp = exhaustedExits(model, st), true
 			} else {
 				lane = laneHandoff(lane, laneFailover(lane))
@@ -4183,7 +4221,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, attempts) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -4199,7 +4237,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					refreshZenProxiesAsync(false)
 					resetZenGeoErrs()
 				}
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, attempts) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -4215,7 +4253,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					refreshZenProxiesAsync(false)
 					resetZenBlockErrs()
 				}
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, attempts) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -4237,7 +4275,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					refreshZenProxiesAsync(false)
 					resetZenFreeTierErrs()
 				}
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, attempts) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}

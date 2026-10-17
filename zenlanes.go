@@ -865,8 +865,11 @@ func zenMaxRetries() int {
 
 func zenRetryLabel() int { return zenMaxRetries() - 1 }
 
-// zenLastRetry reports whether retry index is the final attempt.
-func zenLastRetry(retry int) bool { return retry+1 >= zenMaxRetries() }
+// zenLastRetry reports whether retry index is the final attempt of a ladder
+// whose bound is attempts. the bound is not always zenMaxRetries(): a hop that
+// finds the pool written off can buy extra hops (ladderExtend), so each ladder
+// passes its own bound.
+func zenLastRetry(retry, attempts int) bool { return retry+1 >= attempts }
 
 // laneGate blocks until the lane may send: pacing gap since its previous
 // send only, never a cooldown. the slot is claimed under the lane lock
@@ -1271,31 +1274,44 @@ func poolRefreshDue() bool {
 	return true
 }
 
-// waitZenPool blocks until the pool holds an exit or maxWait elapses,
-// polling every 100ms. an empty pool means the verify sweep is still
-// running (cold start or refresh gap), not that exits are dead: callers
-// with an exit budget to spend wait instead of burning retries in ms.
-// false on client cancel or timeout.
-func waitZenPool(ctx context.Context, maxWait time.Duration) bool {
-	t := time.NewTimer(maxWait)
-	defer t.Stop()
-	tick := time.NewTicker(100 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		zenProxiesMu.RLock()
-		n := len(zenProxies)
-		zenProxiesMu.RUnlock()
-		if n > 0 {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-t.C:
-			return false
-		case <-tick.C:
-		}
+// poolRecoverWait is the whole-request budget for waiting on pool recovery.
+// every lane holds a working exit, so when one cannot be drawn the only honest
+// move is to wait for the sweep, not to hand the client a proxyless request.
+// the clock starts at the first wait, covers every later one (a dry pick and a
+// spent ladder draw from the same budget), and a live sweep lands in ~7s, so
+// this covers a couple of tries. past it the pool really cannot serve and the
+// ladder fails honestly instead of stalling the caller further.
+func poolRecoverWait() time.Duration { return 20 * time.Second }
+
+// dryRefillCooldown paces the dry-pool refill. the 429/geo trips sit behind
+// poolRefreshCooldown (~120s) because the pool is still serving when they fire;
+// a dry pick is the pool serving nobody, so the gap here is short enough that a
+// waiting lane sees the next sweep land in seconds.
+const dryRefillCooldown = 15 * time.Second
+
+var (
+	dryRefillMu sync.Mutex
+	dryRefillAt time.Time
+)
+
+// dryPoolRefill sweeps for exits when the pool hands none out: thin pool, every
+// exit taken by a lane, or every exit written off for this model. single-flight
+// (refreshZenProxiesAsync) plus dryRefillCooldown keep a burst of dry requests
+// from stacking sweeps. fresh: the exits in the pool are the ones that just
+// failed to serve, so re-verifying them first buys nothing. force skips the
+// pacing, for a caller that is already waiting on the sweep to land.
+func dryPoolRefill(force bool) {
+	dryRefillMu.Lock()
+	due := force || time.Since(dryRefillAt) >= dryRefillCooldown
+	if due {
+		dryRefillAt = time.Now()
 	}
+	dryRefillMu.Unlock()
+	if !due {
+		return
+	}
+	acclog.Printf("  zen pool dry: no exit drawable, sweeping for fresh exits")
+	refreshZenProxiesAsync(true)
 }
 
 // poolRefreshCooldown is the minimum gap between 429-triggered refreshes.
@@ -1343,6 +1359,69 @@ func maybeRefreshPoolThin() {
 	refreshZenProxiesAsync(false)
 }
 
+// marksOut reports whether the ladder spent its attempts on exits that were
+// already written off rather than on clean ones. most of the pool carrying a
+// mark (or a dead stamp) means the picker had nothing healthy left to hand out
+// and the write-offs are what bounds the request, so clearing them is the fix.
+// a pool that is mostly clean means the ladder rode fresh exits that all
+// answered 429: the model is saturated right now and a sweep buys nothing but
+// latency, so the ladder should fail honestly instead of waiting.
+func marksOut() bool {
+	off := countRateLimited() + countDeadExits()
+	if off == 0 {
+		return false
+	}
+	zenProxiesMu.RLock()
+	pool := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	// custom proxies count: with a configured list the picker only hands
+	// those out, so a pool that is empty behind them is not the serving set.
+	total := pool + len(getCustomProxies())
+	return total > 0 && off*2 >= total
+}
+
+// recoverDeadline returns this request's pool-recovery deadline, starting the
+// clock on the first wait. every wait of one request (a dry pick, a spent
+// ladder) draws on the same budget, so a request never stacks waits into a
+// stall: it waits at most poolRecoverWait once, then fails honestly.
+func recoverDeadline(until *time.Time) time.Time {
+	if until.IsZero() {
+		*until = time.Now().Add(poolRecoverWait())
+	}
+	return *until
+}
+
+// ladderExtend is the last hop's ask for a pool that is written off, never for
+// one that is merely busy: a completed sweep clears every 429 mark (and
+// replaces dead exits), so the extra hops draw clean exits instead of re-rolling
+// the set the ladder just spent itself on. fires the sweep, then waits for the
+// marks to go, bounded by the request's recovery budget. false means "spend no
+// more hops": nothing written off, budget gone, or the client left.
+func ladderExtend(ctx context.Context, until *time.Time) bool {
+	if !marksOut() {
+		return false
+	}
+	deadline := recoverDeadline(until)
+	if !time.Now().Before(deadline) {
+		return false
+	}
+	// forced: the ladder is spent, so the sweep is what everything is
+	// waiting on, and the pacing window must not sit on it.
+	dryPoolRefill(true)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(150 * time.Millisecond):
+		}
+		if countRateLimited() == 0 {
+			acclog.Printf("  zen pool written off: refilled, extending retry ladder")
+			return true
+		}
+	}
+	return false
+}
+
 func resetPoolRefresh429s() {
 	poolRefresh429Mu.Lock()
 	poolRefresh429s = 0
@@ -1360,37 +1439,42 @@ var (
 // the body), so laneTokensAdd folds those in once the turn is parsed.
 func laneTouch(l *zenLane, proxy, model string) {
 	lanesMu.Lock()
-	defer lanesMu.Unlock()
 	l.lastUsed = time.Now()
 	l.limitedSince = time.Time{}
 	l.consec429 = 0
 	l.requests++
+	collided := false
 	if proxy != "" {
 		// one exit per lane: the observed exit is this lane's only while
-		// another lane does not already hold it. a colliding stamp drops
-		// the pin instead of letting two lanes ride one exit.
-		held := false
+		// another lane does not already hold it. a colliding stamp must not
+		// leave this lane pinless, so the exit is dropped here and a distinct
+		// one is picked below.
 		for _, o := range lanes {
 			if o != l && o.proxy == proxy {
-				held = true
+				collided = true
 				break
 			}
 		}
-		if held {
-			stampLaneProxy(l, "")
-		} else {
+		if !collided {
 			stampLaneProxy(l, proxy)
 		}
 	}
-	if model == "" {
-		return
+	if model != "" {
+		if l.tokens == nil {
+			l.tokens = map[string]laneTokens{}
+		}
+		m := l.tokens[model]
+		m.Requests++
+		l.tokens[model] = m
 	}
-	if l.tokens == nil {
-		l.tokens = map[string]laneTokens{}
+	lanesMu.Unlock()
+	if collided {
+		// a shared exit: give this lane one of its own so a working lane
+		// never idles without one. pinUniqueProxy never hands out an exit
+		// another lane holds, so a dry pool leaves the lane pinless until
+		// its next request waits for a refill (laneExitWait).
+		laneReproxy(l, model)
 	}
-	m := l.tokens[model]
-	m.Requests++
-	l.tokens[model] = m
 }
 
 // laneTokensAdd folds one turn's upstream token counts into the lane's
@@ -2095,6 +2179,51 @@ func laneProxyFor(l *zenLane, model string) string {
 		return ""
 	}
 	return laneReproxy(l, model)
+}
+
+// laneNeedsProxy reports whether this lane may not send direct: always_proxy
+// pins every request to an exit, and an escalated lane proved direct was burned
+// for it (its own 403/429 came from the home ip). both mean a dry pool is a
+// reason to wait for exits, never a reason to go direct.
+func laneNeedsProxy(l *zenLane) bool {
+	if cfg().Zen.AlwaysProxy {
+		return true
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	return l.escalated
+}
+
+// laneProxyWait hands the request an exit when the pool is dry, instead of
+// dropping the ladder into its dry branch: it re-tries this lane's own pin, then
+// tries a peer lane (a lane that already holds an exit answers instantly), and
+// keeps a refill sweeping while it polls. one exit per lane stays absolute, so a
+// lane wider than the pool waits here rather than sharing an exit or sending
+// direct. returns the lane to send on: a peer, when that is where the free exit
+// is. "" only when the budget runs out with the pool still unable to supply one,
+// or the client goes away.
+func laneProxyWait(ctx context.Context, l *zenLane, model string, until *time.Time) (*zenLane, string) {
+	for {
+		if p := laneProxyFor(l, model); p != "" {
+			return l, p
+		}
+		dryPoolRefill(false)
+		if hl := laneFailover(l); hl != l {
+			if p := laneProxyFor(hl, model); p != "" {
+				return hl, p
+			}
+		}
+		// only a wait starts the clock: a request served on the first try
+		// draws no budget, so a later wait keeps all of it.
+		if !time.Now().Before(recoverDeadline(until)) {
+			return l, ""
+		}
+		select {
+		case <-ctx.Done():
+			return l, ""
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // lanePinnedElsewhere reports whether another lane holds pin. one exit per

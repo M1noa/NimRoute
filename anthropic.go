@@ -2557,7 +2557,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		var dialDeadErr error
 		dialDeadProxy := ""
 		rotating := true
-		for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
+		// attempts is the ladder bound: a hop that finds the pool written off
+		// buys extra hops once a refill clears the marks (ladderExtend).
+		attempts := zenMaxRetries()
+		// poolRecoverUntil is this request's pool-recovery budget: it starts on
+		// the first wait, and every later wait draws on the same one.
+		poolRecoverUntil := time.Time{}
+		for zenRetries := 0; zenRetries < attempts; zenRetries++ {
 			// pace only: lanes never cool, a limit rotates the exit instead.
 			if zenRetries > 0 && maybeRefreshStalePool(lane) {
 				sessionID = laneSession(lane)
@@ -2575,40 +2581,38 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			proxy := ""
 			if zenRetries == 0 {
 				proxy = laneProxyFor(lane, zenModel)
-				if proxy == "" && cfg().Zen.AlwaysProxy {
-					// cold pool: the verify sweep publishes exits as they
-					// land, so wait for it instead of failing instantly.
-					// bounded by the retry budget below, not forever.
-					if waitZenPool(r.Context(), 8*time.Second) {
-						lane = laneHandoff(lane, laneFailover(lane))
+				if proxy == "" && laneNeedsProxy(lane) {
+					// cold or dry pool: the sweep publishes exits as they
+					// land, so wait for one instead of failing instantly or
+					// handing the lane a request with no exit.
+					nl, p := laneProxyWait(r.Context(), lane, zenModel, &poolRecoverUntil)
+					if nl != lane {
+						lane = laneHandoff(lane, nl)
 						sessionID = laneSession(lane)
-						proxy = laneProxyFor(lane, zenModel)
-						// pool is up but this lane drew no free exit (every
-						// one taken or written off): another lane is the
-						// answer, not a proxy_exhausted 503 from hop 0.
-						if proxy == "" {
-							continue
-						}
-					} else {
-						return nil
 					}
+					// pool is up but this lane drew no free exit (every one
+					// taken or written off): another lane is the answer, not
+					// a proxy_exhausted 503 from hop 0.
+					if p == "" {
+						continue
+					}
+					proxy = p
 				}
 				cl = zenClient(proxy)
 				lastProxy = proxy
 			} else if rotating {
 				proxy = laneProxyFor(lane, zenModel)
-				if proxy == "" && cfg().Zen.AlwaysProxy {
-					lane = laneHandoff(lane, laneFailover(lane))
-					sessionID = laneSession(lane)
-					proxy = laneProxyFor(lane, zenModel)
-				}
-				if proxy == "" && cfg().Zen.AlwaysProxy {
-					// same cold-pool wait as retry 0: an empty pool means
-					// the sweep is still verifying, not that exits are
-					// dead. without the sleep all retries burn in ms.
-					if !waitZenPool(r.Context(), 8*time.Second) {
-						return nil
+				if proxy == "" && laneNeedsProxy(lane) {
+					// same wait as retry 0: an empty or written-off pool
+					// means exits are still coming, not that they are dead.
+					nl, p := laneProxyWait(r.Context(), lane, zenModel, &poolRecoverUntil)
+					if nl != lane {
+						lane = laneHandoff(lane, nl)
+						sessionID = laneSession(lane)
 					}
+					proxy = p
+				}
+				if proxy == "" && laneNeedsProxy(lane) {
 					continue
 				}
 				// rotation handed back the exit whose dial just failed: a
@@ -2713,7 +2717,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				rotating = true
 				logZenNetErr(zenRetries, clientModel, proxy, tag+" "+target, err)
 				maybeRefreshNetErr()
-				if !zenLastRetry(zenRetries) {
+				if !zenLastRetry(zenRetries, attempts) {
 					zenBackoffCtx(r.Context(), zenRetries)
 					continue
 				}
@@ -2732,9 +2736,19 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
 				noteExit429(proxy, zenModel)
-				if zenLastRetry(zenRetries) {
-					// the ladder is spent: the client hears about the proxy
-					// pool, never the 429 we just absorbed.
+				if zenLastRetry(zenRetries, attempts) {
+					// the ladder is spent on a written-off pool: refill and buy
+					// more hops instead of handing the caller a 503, as long as
+					// the marks (not a merely busy model) are what bounded it.
+					if ladderExtend(r.Context(), &poolRecoverUntil) {
+						attempts++
+						lane = laneHandoff(lane, laneFailover(lane))
+						sessionID = laneRotate(lane, zenModel)
+						rotating = true
+						continue
+					}
+					// the client hears about the proxy pool, never the 429 we
+					// just absorbed.
 					up, gaveUp = exhaustedExits(clientModel, st), true
 				} else {
 					lane = laneHandoff(lane, laneFailover(lane))
@@ -2754,7 +2768,16 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
 					st, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
 				dropProxy(proxy)
-				if zenLastRetry(zenRetries) {
+				if zenLastRetry(zenRetries, attempts) {
+					// same extension as the 429 path: a refill replaces the
+					// dead exits the ladder just spent itself on.
+					if ladderExtend(r.Context(), &poolRecoverUntil) {
+						attempts++
+						lane = laneHandoff(lane, laneFailover(lane))
+						sessionID = laneRotate(lane, zenModel)
+						rotating = true
+						continue
+					}
 					up, gaveUp = exhaustedExits(clientModel, st), true
 				} else {
 					lane = laneHandoff(lane, laneFailover(lane))
@@ -2774,7 +2797,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
-					if !zenLastRetry(zenRetries) {
+					if !zenLastRetry(zenRetries, attempts) {
 						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
@@ -2790,7 +2813,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						refreshZenProxiesAsync(false)
 						resetZenGeoErrs()
 					}
-					if !zenLastRetry(zenRetries) {
+					if !zenLastRetry(zenRetries, attempts) {
 						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
@@ -2806,7 +2829,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						refreshZenProxiesAsync(false)
 						resetZenBlockErrs()
 					}
-					if !zenLastRetry(zenRetries) {
+					if !zenLastRetry(zenRetries, attempts) {
 						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
@@ -2828,7 +2851,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						refreshZenProxiesAsync(false)
 						resetZenFreeTierErrs()
 					}
-					if !zenLastRetry(zenRetries) {
+					if !zenLastRetry(zenRetries, attempts) {
 						zenBackoffCtx(r.Context(), zenRetries)
 						continue
 					}
