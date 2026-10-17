@@ -1368,7 +1368,18 @@ func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
 	// ResponseHeaderTimeout fires per stream against that same connection.
 	// inherited true from DefaultTransport, never chosen. the direct client
 	// (no exit) keeps h2: it shows no such stalls.
+	//
+	// ForceAttemptHTTP2 alone is not enough: the clone also inherits
+	// DefaultTransport's TLS NextProtos (["h2","http/1.1"]) but not its h2
+	// round tripper, so it offers h2, the server answers in h2 frames, and the
+	// h1 parser calls every response malformed. protocols http/1 + no ALPN
+	// keeps the tunnel on the wire format this transport can actually read.
 	tr.ForceAttemptHTTP2 = false
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetHTTP1(true)
+	if tr.TLSClientConfig != nil {
+		tr.TLSClientConfig.NextProtos = nil
+	}
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	tr.ExpectContinueTimeout = 1 * time.Second
