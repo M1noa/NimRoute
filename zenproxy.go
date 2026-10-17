@@ -1363,6 +1363,12 @@ func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
 		return tr
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// http/1.1 only over the tunnel. http2 multiplexes every stream to zen on
+	// one connection per transport, so one dead exit stalls them all and
+	// ResponseHeaderTimeout fires per stream against that same connection.
+	// inherited true from DefaultTransport, never chosen. the direct client
+	// (no exit) keeps h2: it shows no such stalls.
+	tr.ForceAttemptHTTP2 = false
 	tr.TLSHandshakeTimeout = 10 * time.Second
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	tr.ExpectContinueTimeout = 1 * time.Second
