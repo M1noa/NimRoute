@@ -58,6 +58,21 @@ nous_keys:
   # main: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
   # backup-1: "sk-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
 
+# --- uno router backend (https://api.unorouter.com) ---
+# master switch. false = uno/* 503 and hidden from /v1/models.
+uno:
+  enabled: true
+# --- uno router keys (required) ---
+# format: any name you like -> key. names show up in logs and /status.
+# requests use the uno/ prefixed form (uno/deepseek-ai/deepseek-v3.1:free);
+# the prefix names the backend and never reaches the router.
+# only chat-capable models are served and listed: the filter is the
+# unauthenticated /models listing itself, ":free" id suffix AND the
+# "openai" endpoint type. embedding, image-generation and aihorde rows
+# drop out. cache lives 6h, last good list kept on fetch failure.
+uno_keys:
+  # main: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
 # --- guardrails (recommended): strip baked-in system-prompt refusals ---
 # recommended, on by default: upstream free tiers inject refusal lines
 # into the system prompt, which degrades answers on benign requests.
@@ -367,7 +382,7 @@ zen:
 # impressions); nothing is displayed. jwt never leaves this file.
 freepi:
   enabled: false
-  client_version: "0.2.19"  # below server min = 426 on completions
+  client_version: "0.4.7"  # server rejects anything below its own min with 426
   ad_inline_every: 5        # inline impression every Nth turn
   # how long a request waits for a busy account to free up (one live
   # stream per jwt). 0 = 60. default 60.
@@ -442,6 +457,19 @@ openrouter:
   url: ""                # override the models endpoint. "" = openrouter.ai
   refresh_hours: 6
 
+# --- openrouter chat backend (https://openrouter.ai/api/v1) ---
+# master switch for keyed chat requests is the key count below: no keys
+# = openrouter/* 503 and hidden from /v1/models (the catalog section
+# above is independent and untouched).
+# requests use the openrouter/ prefixed form
+# (openrouter/deepseek/deepseek-chat-v3.1:free); the prefix names the
+# backend and never reaches the router. only ":free" ids are served and
+# listed. keys rotate per request; a 429 cools one key, doubles on
+# repeats, and streams pick a fresh one. the /models list doubles as
+# the catalog fetch above: one fetch, two jobs.
+openrouter_keys:
+  # main: "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
 # --- status: what /status shows ---
 # when auth.tokens is set AND the /status request has no valid token,
 # keys, locks, zen session and proxy are hidden no matter what these say.
@@ -456,6 +484,8 @@ status:
   show_antseed: false         # antseed section: peers, free models, identity age
   show_freepi: true           # freepi section: accounts, tiers, credit spend
   show_nous: true             # nous section: portal keys, free models served
+  show_uno: true              # uno section: keys, free models served
+  show_openrouter: true       # openrouter section: keys, free models served
   show_route: true            # route section: strategy, latency, route ids
   show_benchmarks: true       # aa scores per model, best first
 

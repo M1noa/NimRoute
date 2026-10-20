@@ -232,6 +232,10 @@ type nousConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+type unoConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 // routeConfig gates cross-provider route/<model> ids: one name that fans
 // out across backends in strategy order.
 type routeConfig struct {
@@ -337,6 +341,8 @@ type statusConfig struct {
 	ShowAntseed        bool `yaml:"show_antseed"`
 	ShowFreepi         bool `yaml:"show_freepi"`
 	ShowNous           bool `yaml:"show_nous"`
+	ShowUno            bool `yaml:"show_uno"`
+	ShowOpenRouter     bool `yaml:"show_openrouter"`
 	ShowRoute          bool `yaml:"show_route"`
 	ShowBenchmarks     bool `yaml:"show_benchmarks"`
 }
@@ -363,27 +369,30 @@ type modelsConfig struct {
 }
 
 type appConfig struct {
-	Server     serverConfig      `yaml:"server"`
-	Auth       authConfig        `yaml:"auth"`
-	Nvidia     nvidiaConfig      `yaml:"nvidia"`
-	NvidiaKeys map[string]string `yaml:"nvidia_keys"`
-	Nous       nousConfig        `yaml:"nous"`
-	NousKeys   map[string]string `yaml:"nous_keys"`
-	Guardrails guardrailsConfig  `yaml:"guardrails"`
-	Inject     injectConfig      `yaml:"inject"`
-	Anonymize  anonymizeConfig   `yaml:"anonymize"`
-	Nudge      nudgeConfig       `yaml:"nudge"`
-	Rtk        rtkConfig         `yaml:"rtk"`
-	Translate  translateConfig   `yaml:"translate"`
-	Zen        zenConfig         `yaml:"zen"`
-	Freepi     freepiConfig      `yaml:"freepi"`
-	Antseed    antseedConfig     `yaml:"antseed"`
-	Route      routeConfig       `yaml:"route"`
-	Benchmarks benchmarksConfig  `yaml:"benchmarks"`
-	OpenRouter openrouterConfig  `yaml:"openrouter"`
-	Status     statusConfig      `yaml:"status"`
-	Usage      usageConfig       `yaml:"usage"`
-	Models     modelsConfig      `yaml:"models"`
+	Server         serverConfig      `yaml:"server"`
+	Auth           authConfig        `yaml:"auth"`
+	Nvidia         nvidiaConfig      `yaml:"nvidia"`
+	NvidiaKeys     map[string]string `yaml:"nvidia_keys"`
+	Nous           nousConfig        `yaml:"nous"`
+	NousKeys       map[string]string `yaml:"nous_keys"`
+	Uno            unoConfig         `yaml:"uno"`
+	UnoKeys        map[string]string `yaml:"uno_keys"`
+	Guardrails     guardrailsConfig  `yaml:"guardrails"`
+	Inject         injectConfig      `yaml:"inject"`
+	Anonymize      anonymizeConfig   `yaml:"anonymize"`
+	Nudge          nudgeConfig       `yaml:"nudge"`
+	Rtk            rtkConfig         `yaml:"rtk"`
+	Translate      translateConfig   `yaml:"translate"`
+	Zen            zenConfig         `yaml:"zen"`
+	Freepi         freepiConfig      `yaml:"freepi"`
+	Antseed        antseedConfig     `yaml:"antseed"`
+	Route          routeConfig       `yaml:"route"`
+	Benchmarks     benchmarksConfig  `yaml:"benchmarks"`
+	OpenRouter     openrouterConfig  `yaml:"openrouter"`
+	OpenRouterKeys map[string]string `yaml:"openrouter_keys"`
+	Status         statusConfig      `yaml:"status"`
+	Usage          usageConfig       `yaml:"usage"`
+	Models         modelsConfig      `yaml:"models"`
 }
 
 // cfg snapshot, swapped atomically on reload so requests never race it.
@@ -437,7 +446,7 @@ func defaultConfig() appConfig {
 			Enabled: true,
 		},
 		Freepi: freepiConfig{
-			ClientVersion: "0.2.19",
+			ClientVersion: "0.4.7",
 			AdInlineEvery: 5,
 		},
 		Antseed: antseedConfig{
@@ -458,6 +467,9 @@ func defaultConfig() appConfig {
 			RefreshHours: 6,
 		},
 		Nous: nousConfig{
+			Enabled: true,
+		},
+		Uno: unoConfig{
 			Enabled: true,
 		},
 		Zen: zenConfig{
@@ -502,6 +514,8 @@ func defaultConfig() appConfig {
 			ShowRoute:          true,
 			ShowFreepi:         true,
 			ShowNous:           true,
+			ShowUno:            true,
+			ShowOpenRouter:     true,
 			ShowBenchmarks:     true,
 		},
 		Usage: usageConfig{
@@ -553,6 +567,12 @@ func loadConfigFile(path string) (*appConfig, error) {
 	}
 	if c.NousKeys == nil {
 		c.NousKeys = map[string]string{}
+	}
+	if c.UnoKeys == nil {
+		c.UnoKeys = map[string]string{}
+	}
+	if c.OpenRouterKeys == nil {
+		c.OpenRouterKeys = map[string]string{}
 	}
 	return &c, nil
 }
@@ -855,6 +875,12 @@ func applyConfig(c *appConfig) {
 	if c.NousKeys == nil {
 		c.NousKeys = map[string]string{}
 	}
+	if c.UnoKeys == nil {
+		c.UnoKeys = map[string]string{}
+	}
+	if c.OpenRouterKeys == nil {
+		c.OpenRouterKeys = map[string]string{}
+	}
 	appCfg.Store(c)
 
 	// model catalog (hot-reloaded with the config). a broken catalog
@@ -970,6 +996,9 @@ func watchConfig(p *Pool, path string) {
 			added, removed := p.Reload(c.NvidiaKeys)
 			// portal keys are a separate pool: the reload rebuilds it too.
 			nousSyncKeys(c.NousKeys)
+			// keyed openai backends swap their pools the same way.
+			unoSyncKeys(c.UnoKeys)
+			orChatSyncKeys(c.OpenRouterKeys)
 			// keyless cap follows zen lanes, so a lanes edit takes
 			// effect here without a restart.
 			p.syncSemLimit(c.NvidiaKeys)
@@ -1081,6 +1110,12 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowNous {
 		sr.Nous = nil
 	}
+	if !c.Status.ShowUno {
+		sr.Uno = nil
+	}
+	if !c.Status.ShowOpenRouter {
+		sr.OpenRouter = nil
+	}
 	if !c.Status.ShowRoute {
 		sr.Route = nil
 	}
@@ -1094,6 +1129,8 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.Freepi = nil
 		sr.Antseed = nil
 		sr.Nous = nil
+		sr.Uno = nil
+		sr.OpenRouter = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Health = nil

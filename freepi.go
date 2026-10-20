@@ -52,7 +52,7 @@ func freepiVersion() string {
 	if v := cfg().Freepi.ClientVersion; v != "" {
 		return v
 	}
-	return "0.2.19"
+	return "0.4.7"
 }
 
 func freepiInlineEvery() int {

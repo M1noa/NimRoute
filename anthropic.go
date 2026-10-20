@@ -2048,6 +2048,32 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 	}
 
 	// nvidia/ prefix is the listed form; bare ids stay nvidia for compat.
+	if strings.HasPrefix(upstreamModel, "uno/") {
+		if !unoEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (uno disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "uno is disabled or has no keys; set uno.enabled: true and add uno_keys to config.yml")
+			return
+		}
+		upstreamModel = strings.TrimPrefix(upstreamModel, "uno/")
+		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {
+			oaiBody = b
+		}
+		p.keyedChatAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID, unoBackend)
+		return
+	}
+	if strings.HasPrefix(upstreamModel, "openrouter/") {
+		if !orChatEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (openrouter chat disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "openrouter chat is disabled or has no keys; set openrouter.enabled: true and add openrouter_keys to config.yml")
+			return
+		}
+		upstreamModel = strings.TrimPrefix(upstreamModel, "openrouter/")
+		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {
+			oaiBody = b
+		}
+		p.keyedChatAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID, orChatBackend)
+		return
+	}
 	if strings.HasPrefix(upstreamModel, "nvidia/") {
 		upstreamModel = strings.TrimPrefix(upstreamModel, "nvidia/")
 		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {

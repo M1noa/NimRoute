@@ -638,6 +638,8 @@ type StatusResponse struct {
 	Freepi        *freepiSummary         `json:"freepi,omitempty"`
 	Antseed       *antseedSummary        `json:"antseed,omitempty"`
 	Nous          *nousSummary           `json:"nous,omitempty"`
+	Uno           *keyedSummary          `json:"uno,omitempty"`
+	OpenRouter    *keyedSummary          `json:"openrouter,omitempty"`
 	Route         *routeSummary          `json:"route,omitempty"`
 	Benchmarks    *benchSummary          `json:"benchmarks,omitempty"`
 }
@@ -762,6 +764,12 @@ func (p *Pool) Status() StatusResponse {
 	}
 	if nousEnabled() && cfg().Status.ShowNous {
 		sr.Nous = nousSnapshot()
+	}
+	if unoBackend.enabled() && cfg().Status.ShowUno {
+		sr.Uno = keyedSnapshot(unoBackend)
+	}
+	if orChatBackend.enabled() && cfg().Status.ShowOpenRouter {
+		sr.OpenRouter = keyedSnapshot(orChatBackend)
 	}
 	if cfg().Status.ShowRoute {
 		sr.Route = routeSnapshot(p)
@@ -2414,6 +2422,8 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	appendFreepiModels(&out, seenIDs)
 	appendAntseedModels(&out, seenIDs)
 	appendNousModels(&out, seenIDs)
+	appendKeyedModels(unoBackend, &out, seenIDs)
+	appendKeyedModels(orChatBackend, &out, seenIDs)
 	appendRouteModels(p, &out, seenIDs)
 	sortModelsByBench(out.Data)
 
@@ -3731,6 +3741,36 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		acclog.Printf("%s routed to nous model=%s", reqID, model)
 		p.handleNous(w, r, body, model, isStream, start, reqID)
+		return
+	}
+
+	// uno/<model> is the listed form; uno takes plain openai chat.
+	if strings.HasPrefix(model, "uno/") {
+		if !unoEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (uno disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"uno is disabled or has no keys; set uno.enabled: true and add uno_keys to config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		model = strings.TrimPrefix(model, "uno/")
+		if b, err := setReqModel(body, model); err == nil {
+			body = b
+		}
+		p.keyedChat(w, r, body, model, isStream, start, reqID, unoBackend)
+		return
+	}
+
+	// openrouter/<model> is the listed form; one leading prefix is stripped.
+	if strings.HasPrefix(model, "openrouter/") {
+		if !orChatEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (openrouter chat disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"openrouter chat is disabled or has no keys; set openrouter.enabled: true and add openrouter_keys to config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		model = strings.TrimPrefix(model, "openrouter/")
+		if b, err := setReqModel(body, model); err == nil {
+			body = b
+		}
+		p.keyedChat(w, r, body, model, isStream, start, reqID, orChatBackend)
 		return
 	}
 
@@ -5476,6 +5516,8 @@ func serverMainFlags(f cliFlags) {
 
 	pool := newPool(c.NvidiaKeys)
 	nousSyncKeys(c.NousKeys)
+	unoSyncKeys(c.UnoKeys)
+	orChatSyncKeys(c.OpenRouterKeys)
 	go watchConfig(pool, cpath)
 
 	port := c.Server.Port
