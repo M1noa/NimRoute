@@ -158,7 +158,6 @@ type zenConfig struct {
 	// racing. 0 = both fire at once, which is what a race wants.
 	RaceHedgeAfterMs int `yaml:"race_hedge_after_ms"`
 	LaneTTLMinutes   int `yaml:"lane_ttl_minutes"`
-	LaneCooldownSecs int `yaml:"lane_cooldown_secs"`
 	// SessionIdleMinutes drops lanes idle past this (minutes) on the pool
 	// sweep, clearing the session hash/id from cache. lane_ttl_minutes
 	// stays the hard cap. 0 disables (ttl only).
@@ -168,11 +167,9 @@ type zenConfig struct {
 	// busy shared lanes keep the TTLs above. 0 disables.
 	ConvoIdleMinutes int `yaml:"convo_idle_minutes"`
 	// LaneMinGapMs paces a lane: a request waits until this long since the
-	// lane's previous send. 0 disables pacing (reactive cooldown only).
+	// lane's previous send. zen's gate needs ~1.5s per exit, so values
+	// below 1500 are raised to 1500; 0 = 1500.
 	LaneMinGapMs int `yaml:"lane_min_gap_ms"`
-	// LaneReleaseSecs frees a lane's pinned exit after this idle time, so
-	// a long-cold lane resumes on a fresh one. 0 disables.
-	LaneReleaseSecs int `yaml:"lane_release_secs"`
 	// PoolRefresh429s triggers a full pool refresh once this many lanes
 	// have been rate-limited since the last one. 0 disables.
 	PoolRefresh429s int `yaml:"pool_refresh_429s"`
@@ -180,10 +177,11 @@ type zenConfig struct {
 	// refreshes: a trip inside the window skips (logged at debug) and the
 	// counter resets. 0 = 120, negative disables (every trip refreshes).
 	PoolRefreshCooldownSecs int `yaml:"pool_refresh_cooldown_secs"`
-	// ExitBurnMinutes keeps an exit that 403s FreeTierError for a model
-	// out of that model's rotation until the next pool refresh, and is the
-	// ttl for a dead exit (transport/tls failure). per (exit, model) for
-	// the free-tier case: the exit still serves other models. 0 = 30.
+	// ExitBurnMinutes parks an exit after a free-tier IP 403 (daily cap or
+	// abusive-traffic block) for the whole pool: the block is a fact about
+	// the IP, not the model. it is also the ttl for a dead exit
+	// (transport/tls failure) and for the shape-refusal burn of one
+	// (exit, model) pair, which leaves the exit serving other models. 0 = 30.
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
 	// Exit429Streak 429s in a row, or Exit429Total 429s since the last
 	// refresh, retires an exit until the next refresh. 0 disables either
@@ -196,15 +194,8 @@ type zenConfig struct {
 	// is absorbed across lanes and never returned to the client: the
 	// ladder ends in a proxy-capacity error instead.
 	MaxRetries int `yaml:"max_retries"`
-	// ProbeTimeoutMs verifies a lane's pinned exit before reuse. 0 = 1000.
-	ProbeTimeoutMs int `yaml:"probe_timeout_ms"`
-	// RaceTimeoutMs caps the parallel exit race when picking a proxy.
-	// 0 = 3000.
-	RaceTimeoutMs int `yaml:"race_timeout_ms"`
-	// LaneGateMaxSecs caps pacing+cooldown wait per send. 0 = 10.
+	// LaneGateMaxSecs caps pacing wait per send. 0 = 30.
 	LaneGateMaxSecs int `yaml:"lane_gate_max_secs"`
-	// LaneWaitMaxSecs clamps the all-lanes-cooling wait. 0 = 3.
-	LaneWaitMaxSecs int `yaml:"lane_wait_max_secs"`
 	// StalePoolSecs fires pool refresh + session rotation after this long
 	// with every lane cooling and no success. 0 = 15.
 	StalePoolSecs int `yaml:"stale_pool_secs"`
@@ -472,25 +463,20 @@ func defaultConfig() appConfig {
 		Zen: zenConfig{
 			Enabled:                  true,
 			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
-			MaxResponseMs:            2000,
-			PoolSize:                 800,
+			MaxResponseMs:            30000,
+			PoolSize:                 0,
 			Lanes:                    25,
 			LaneTTLMinutes:           30,
-			LaneCooldownSecs:         60,
 			SessionIdleMinutes:       6,
 			ConvoIdleMinutes:         1,
 			LaneMinGapMs:             1500,
-			LaneReleaseSecs:          90,
 			PoolRefresh429s:          4,
 			PoolRefreshCooldownSecs:  120,
 			ExitBurnMinutes:          30,
 			Exit429Streak:            2,
 			Exit429Total:             6,
 			MaxRetries:               15,
-			ProbeTimeoutMs:           1000,
-			RaceTimeoutMs:            3000,
 			LaneGateMaxSecs:          10,
-			LaneWaitMaxSecs:          3,
 			StalePoolSecs:            15,
 			ZenTimeoutSecs:           120,
 			ZenDirectTimeoutSecs:     300,

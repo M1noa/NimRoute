@@ -62,7 +62,7 @@ func routeBackendLive(backend string, p *Pool) bool {
 	case "freepi":
 		return freepiEnabled()
 	case "nvidia":
-		return cfg().Nvidia.Enabled && len(p.keys) > 0
+		return cfg().Nvidia.Enabled && p.keyCount() > 0
 	}
 	return false
 }

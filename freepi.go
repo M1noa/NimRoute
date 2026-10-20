@@ -80,7 +80,6 @@ type freepiAcct struct {
 	inflight  int
 	turns     int
 	lastAd    time.Time
-	claimedAt time.Time // when inflight went 0->1
 	catalog   []freepiCatalogEntry
 	catalogAt time.Time
 	stats     freepiStats
@@ -596,12 +595,6 @@ func freepiClientStatus(fault freepiFault) (int, string) {
 		return http.StatusServiceUnavailable, fault.Msg + " (proxy: every freeepi account is busy or limited)"
 	}
 	return fault.Status, fault.Msg
-}
-
-// freepiRetry counts attempts and stops hard-failed accounts.
-type freepiRetry struct {
-	fails map[string]int // account -> failures this fetch
-	cap   int            // per-account hard cap (1 = one strike then out)
 }
 
 // freepiFetch performs one inference against a free account. the server

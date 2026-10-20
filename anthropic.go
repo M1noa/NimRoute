@@ -460,6 +460,14 @@ func convertAssistantMessage(raw json.RawMessage) []map[string]any {
 	}
 	if len(thinkingParts) > 0 {
 		msg["reasoning_content"] = strings.Join(thinkingParts, "\n")
+	} else if len(toolCalls) > 0 || thinkingRedacted || len(thinkingSigs) > 0 {
+		// thinking-mode models (deepseek-v4.1-flash-free, minimax-m3.1-flash-free,
+		// space-bunny-free, glm-5.3-flash-free) require reasoning_content on
+		// assistant turns in multi-turn conversations (especially tool-call turns)
+		// and 400 when the field is absent. Claude Code strips unsigned thinking
+		// blocks from history, so always include reasoning_content (empty when
+		// stripped) and emit a synthetic signature on outgoing thinking blocks.
+		msg["reasoning_content"] = ""
 	}
 	// preserve the provider signature chain and the redacted marker so
 	// verified-reasoning providers keep working across the conversion.
@@ -674,7 +682,7 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 
 	content := make([]map[string]any, 0)
 
-	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 {
+	if len(oaiResp.Choices) > 0 {
 		msg := oaiResp.Choices[0].Message
 
 		// thinking block first, then the answer. reasoning and
@@ -686,7 +694,11 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 			thinking = *msg.ReasoningContent
 		}
 		if thinking = stripWaitSentinel(thinking); thinking != "" {
-			content = append(content, map[string]any{"type": "thinking", "thinking": thinking})
+			content = append(content, map[string]any{
+				"type":      "thinking",
+				"thinking":  thinking,
+				"signature": "nim_" + randHex(32),
+			})
 		}
 
 		text := ""
@@ -722,7 +734,7 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 	}
 
 	stopReason := "end_turn"
-	if oaiResp.Choices != nil && len(oaiResp.Choices) > 0 && oaiResp.Choices[0].FinishReason != nil {
+	if len(oaiResp.Choices) > 0 && oaiResp.Choices[0].FinishReason != nil {
 		switch *oaiResp.Choices[0].FinishReason {
 		case "stop":
 			stopReason = "end_turn"
@@ -790,6 +802,7 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 	thinkClosed := false
 	closeThinking := func() {
 		if thinkIdx >= 0 && !thinkClosed {
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":%s}}`, thinkIdx, jsonStr("nim_"+randHex(32))))
 			written += writeSSE(w, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, thinkIdx))
 			thinkClosed = true
 		}
@@ -1018,7 +1031,7 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 		stopReason = "tool_use"
 	}
 
-	written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, compT))
+	written += writeSSE(w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":"%s","stop_sequence":null},"usage":{"input_tokens":%d,"output_tokens":%d}}`, stopReason, promptT, compT))
 	written += writeSSE(w, "message_stop", `{"type":"message_stop"}`)
 	n, _ := w.Write([]byte("data: [DONE]\n\n"))
 	written += int64(n)
@@ -1113,7 +1126,7 @@ func (s *respStreamer) finish() {
 	if s.hasToolUse {
 		stopReason = "tool_use"
 	}
-	s.written += writeSSE(s.w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%s,"stop_sequence":null},"usage":{"output_tokens":%d}}`, jsonStr(stopReason), s.compT))
+	s.written += writeSSE(s.w, "message_delta", fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%s,"stop_sequence":null},"usage":{"input_tokens":%d,"output_tokens":%d}}`, jsonStr(stopReason), s.promptT, s.compT))
 	s.written += writeSSE(s.w, "message_stop", `{"type":"message_stop"}`)
 	n, _ := s.w.Write([]byte("data: [DONE]\n\n"))
 	s.written += int64(n)
@@ -1223,14 +1236,6 @@ func (s *respStreamer) feed(body []byte, last bool) {
 	}
 }
 
-// streamResponsesLiveAnthropic converts an upstream /responses SSE body to
-// Anthropic events while reading: preamble + first delta flush on zen's
-// first byte, so client TTFT is upstream TTFT. ctx aborts the read and the
-// upstream body close cancels the in-flight request.
-func streamResponsesLiveAnthropic(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
-	return streamResponsesAnthropicReader(ctx, w, body, clientModel, tnames, nil)
-}
-
 func streamResponsesAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.Reader, clientModel string, tnames toolNames, next func(string, bool) io.ReadCloser) (written int64, promptT, compT int) {
 	fl, _ := w.(http.Flusher)
 	s := &respStreamer{w: w, clientModel: clientModel, tnames: tnames, toolIdx: map[string]int{}, textIdx: -1}
@@ -1281,29 +1286,6 @@ func streamResponsesAnthropicReader(ctx context.Context, w http.ResponseWriter, 
 			}
 		}
 		break
-	}
-	s.finish()
-	return s.written, s.promptT, s.compT
-}
-
-// streamResponsesMerged emits several buffered /responses SSE bodies as one
-// Anthropic turn: one preamble, continuous block indices, one stop.
-func streamResponsesMerged(w http.ResponseWriter, bodies [][]byte, clientModel string, tnames toolNames) (written int64, promptT, compT int) {
-	fl, _ := w.(http.Flusher)
-	s := &respStreamer{w: w, clientModel: clientModel, tnames: tnames, toolIdx: map[string]int{}, textIdx: -1}
-	if fl != nil {
-		s.fl = fl
-		s.hasFlusher = true
-	}
-
-	msgID := "msg_" + randHex(24)
-	preamble := fmt.Sprintf(`{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","model":%s,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}`, msgID, jsonStr(clientModel))
-	s.written += writeSSE(w, "message_start", preamble)
-	s.written += writeSSE(w, "ping", `{"type":"ping"}`)
-	s.flush()
-
-	for i, b := range bodies {
-		s.feed(b, i == len(bodies)-1)
 	}
 	s.finish()
 	return s.written, s.promptT, s.compT
@@ -1470,7 +1452,7 @@ func nudgeContinuationChat(oaiBody []byte, priorText string) []byte {
 		return nil
 	}
 	msgs, _ := m["messages"].([]any)
-	msgs = append(msgs, map[string]any{"role": "assistant", "content": priorText})
+	msgs = append(msgs, map[string]any{"role": "assistant", "content": priorText, "reasoning_content": ""})
 	msgs = append(msgs, map[string]any{"role": "user", "content": nudgeReprompt()})
 	m["messages"] = msgs
 	delete(m, "nudge_no_tools")
@@ -1921,6 +1903,13 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	// reject oversized bodies before reading: a truncated read would only
+	// surface as a confusing json parse error.
+	if r.ContentLength > bodyLimit {
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 10MB)")
+		return
+	}
+
 	// bound the body read: a client that stalls mid-upload otherwise pins
 	// this goroutine before the "-> POST" log, which reads as a hang with
 	// no trace past "--> POST". closing the body unblocks the stalled read.
@@ -1930,7 +1919,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		<-readCtx.Done()
 		r.Body.Close()
 	}()
-	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
+	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit+1))
 	if err != nil {
 		if readCtx.Err() != nil {
 			writeAnthropicError(w, http.StatusRequestTimeout, "invalid_request_error", "request body read timed out")
@@ -1940,6 +1929,10 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 	r.Body.Close()
+	if len(body) > bodyLimit {
+		writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 10MB)")
+		return
+	}
 
 	// RTK: compress tool_result text before the PII guard masks, so filters
 	// see original bytes and vault placeholders are never chopped.
@@ -2068,7 +2061,7 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "nvidia backend is disabled; set nvidia.enabled: true in config.yml")
 		return
 	}
-	if len(p.keys) == 0 {
+	if p.keyCount() == 0 {
 		acclog.Printf("<- 503 POST /v1/messages model=%s (keyless: no nvidia keys)", clientModel)
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "no nvidia keys configured; use an opencode/<model> free model or add nvidia_keys to config.yml")
 		return
@@ -2372,6 +2365,12 @@ func zenSession() string {
 	return "ses_" + zenID(true)
 }
 
+// zenMessageID mirrors opencode's user message id: msg_ + ascending(). the
+// client sends it as x-opencode-request on every model call.
+func zenMessageID() string {
+	return "msg_" + zenID(false)
+}
+
 // setZenHeaders applies the header set the real opencode client sends to zen.
 // source of truth is the live client capture (packages/core/src/session/
 // model-request.ts): authorization Bearer public, x-opencode-client: cli,
@@ -2389,6 +2388,7 @@ func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sessionID)
 	req.Header.Set("x-session-affinity", sessionID)
+	req.Header.Set("x-opencode-request", zenMessageID())
 	req.Header.Set("x-opencode-project", "global")
 	req.Header.Set("User-Agent", zenUserAgent())
 	req.Header.Set("Accept", "*/*")
@@ -2434,21 +2434,17 @@ func zenDebugCapture(tag string, v any) {
 // dropped; accept-encoding must stay off so the response body stays plain.
 func zenApplyHeaders(req *http.Request, sessionID string, client http.Header, reqID string, attempt any, target, proxy, model string) {
 	passthrough := os.Getenv("ZEN_PASSTHROUGH") != "" && len(client["X-Opencode-Session"]) > 0
+	// the proxy's own client identity is always the base; passthrough only
+	// overlays the client headers the deny-list allows. dropping the base
+	// left the request with no authorization at all, which zen rejects.
+	setZenHeaders(req, sessionID)
 	if passthrough {
-		h := client.Clone()
-		for _, k := range []string{"Connection", "Accept-Encoding", "Content-Length", "Transfer-Encoding", "Te"} {
-			h.Del(k)
-		}
-		// client credentials and spoofable opencode identity never ride
-		// along, even in debug passthrough: the proxy sets its own.
-		for k := range h {
+		for k, v := range client {
 			if !zenHeaderForwarded(k) {
-				h.Del(k)
+				continue
 			}
+			req.Header[k] = v
 		}
-		req.Header = h
-	} else {
-		setZenHeaders(req, sessionID)
 	}
 	if zenDebugDir() != "" {
 		zenDebugCapture("out", map[string]any{
@@ -2568,32 +2564,22 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if zenRetries > 0 && maybeRefreshStalePool(lane) {
 				sessionID = laneSession(lane)
 			}
-			// retries always land on a fresh lane (failover/rotate above),
-			// so re-pacing against it only stacks the first send's gap
-			// onto the retry. the first attempt still paces.
-			if zenRetries == 0 {
-				laneGate(r.Context(), lane)
-			}
-			// client gone while pacing: stop before burning an exit.
-			if r.Context().Err() != nil {
-				return nil
-			}
 			proxy := ""
 			if zenRetries == 0 {
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && laneNeedsProxy(lane) {
 					// cold or dry pool: the sweep publishes exits as they
-					// land, so wait for one instead of failing instantly or
-					// handing the lane a request with no exit.
+					// land, so wait for one (up to 30s) instead of failing
+					// instantly or handing the lane a request with no exit.
 					nl, p := laneProxyWait(r.Context(), lane, zenModel, &poolRecoverUntil)
 					if nl != lane {
 						lane = laneHandoff(lane, nl)
 						sessionID = laneSession(lane)
 					}
-					// pool is up but this lane drew no free exit (every one
-					// taken or written off): another lane is the answer, not
-					// a proxy_exhausted 503 from hop 0.
 					if p == "" {
+						if !time.Now().Before(recoverDeadline(&poolRecoverUntil)) {
+							return nil
+						}
 						continue
 					}
 					proxy = p
@@ -2604,7 +2590,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				proxy = laneProxyFor(lane, zenModel)
 				if proxy == "" && laneNeedsProxy(lane) {
 					// same wait as retry 0: an empty or written-off pool
-					// means exits are still coming, not that they are dead.
+					// means exits are still coming, so wait up to the 30s
+					// recovery budget before giving up.
 					nl, p := laneProxyWait(r.Context(), lane, zenModel, &poolRecoverUntil)
 					if nl != lane {
 						lane = laneHandoff(lane, nl)
@@ -2613,6 +2600,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					proxy = p
 				}
 				if proxy == "" && laneNeedsProxy(lane) {
+					if !time.Now().Before(recoverDeadline(&poolRecoverUntil)) {
+						return nil
+					}
 					continue
 				}
 				// rotation handed back the exit whose dial just failed: a
@@ -2637,6 +2627,12 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				}
 				cl = zenClient(proxy)
 			}
+			// enforce 1.5s minimum gap per exit and lane on every send
+			// (including retries, failovers, and nudges).
+			exitGate(r.Context(), lane, proxy)
+			if r.Context().Err() != nil {
+				return nil
+			}
 			req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 			if err != nil {
 				return nil
@@ -2659,6 +2655,10 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					hp := laneProxyFor(hl, zenModel)
 					if hp == "" || hp == proxy {
 						return nil, fmt.Errorf("no distinct zen hedge exit")
+					}
+					exitGate(hctx, hl, hp)
+					if hctx.Err() != nil {
+						return nil, hctx.Err()
 					}
 					hcl := zenClient(hp)
 					hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
@@ -2686,7 +2686,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			if err == nil && !firstByteAt.IsZero() {
 				fb := firstByteAt.Sub(sendStart)
 				noteExitRTT(proxy, float64(fb.Milliseconds()))
-				if fb > 6*time.Second {
+				if fb > 15*time.Second {
 					noteExitSlow(proxy)
 				}
 			}
@@ -2698,8 +2698,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					// mitm exit: ban it pool-wide and evacuate every
 					// pinned lane, not just this one.
 					banTLSExit(proxy)
-				} else {
-					dropProxy(proxy)
+				} else if noteExitTransportErr(proxy) {
 					// the dropped exit may still be pinned here when the
 					// rest of the pool is held by other lanes: re-dialing
 					// it burns every retry on a corpse, so move lanes the
@@ -2708,6 +2707,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						lane = laneHandoff(lane, laneFailover(lane))
 						sessionID = laneRotate(lane, zenModel)
 					}
+				} else {
+					// first transient error on this exit: rotate this request
+					// to another lane/exit without killing the exit pool-wide.
+					lane = laneHandoff(lane, laneFailover(lane))
+					sessionID = laneSession(lane)
 				}
 				if zenDialDead(err) {
 					dialDeadErr, dialDeadProxy = err, proxy
@@ -2767,7 +2771,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				up.Body.Close()
 				acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
 					st, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
-				dropProxy(proxy)
+				if noteExitTransportErr(proxy) {
+					dropProxy(proxy)
+				}
 				if zenLastRetry(zenRetries, attempts) {
 					// same extension as the 429 path: a refill replaces the
 					// dead exits the ladder just spent itself on.
@@ -2837,15 +2843,25 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if zenFreeTierBlocked(eb) {
 					acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, switching lane",
 						up.StatusCode, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
-					// per-model refusal, not a dead exit: it still serves other
-					// models, so it stays in the pool and the lane rotates off it.
-					noteExitModelBurned(proxy, zenModel)
+					if zenGateIPBlocked(eb) {
+						// the IP itself is capped/blocked: park the exit for a
+						// cooldown and rotate the lane onto a fresh one.
+						noteExitGate(proxy)
+					} else {
+						// request-shape refusal: the exit still serves other
+						// shapes, so it keeps its seat and only this model is burnt.
+						noteExitModelBurned(proxy, zenModel)
+					}
 					if proxy == "" {
 						laneEscalate(lane, zenModel) // direct is flagged: give the lane an exit
 					}
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
+					// keep the refusal body: the branch continues with the
+					// body closed, and a ladder that ends here must still hand
+					// the caller zen's own answer.
+					up.Body = io.NopCloser(bytes.NewReader(eb))
 					if noteZenFreeTierErr() {
 						acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
 						refreshZenProxiesAsync(false)
@@ -2878,7 +2894,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 	defer resp.Body.Close()
 
-	elapsed := time.Since(start)
+	var elapsed time.Duration
 
 	if resp.StatusCode != http.StatusOK {
 		rb, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamBodyLimit))

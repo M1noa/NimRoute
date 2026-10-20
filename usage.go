@@ -91,20 +91,10 @@ var (
 	removedByModel = map[string]string{}
 )
 
-// noteModelOutcome records one finished request for health. ok =
-// upstream 2xx; code = upstream status on failure; key = seller,
-// account, or key name ("" when unknown).
-func noteModelOutcome(model string, ok bool, code int, key string) {
-	if model == "" {
-		return
-	}
-	totalsMu.Lock()
-	defer totalsMu.Unlock()
-	noteModelOutcomeLocked(model, ok, code, key)
-}
-
-// noteModelOutcomeLocked is noteModelOutcome with the lock held
-// (logUsage folds it in without re-locking).
+// noteModelOutcomeLocked records one finished request for health; the
+// caller holds totalsMu (logUsage folds it in). ok = upstream 2xx; code =
+// upstream status on failure; key = seller, account, or key name ("" when
+// unknown).
 func noteModelOutcomeLocked(model string, ok bool, code int, key string) {
 	if ok {
 		// the listing is not the truth, a working request is.
@@ -132,18 +122,6 @@ func noteModelRemoved(model, reason string) {
 	totalsMu.Lock()
 	defer totalsMu.Unlock()
 	removedByModel[model] = reason
-}
-
-// modelHealthFor folds a model's recent outcomes: any success in the
-// window = working. else the last 3 failures with the same code across
-// 2+ sellers = rate_limited for a 429/529 streak, dead for anything else
-// (single-seller streaks are proxy trouble, not a dead model). a model the
-// upstream listing dropped reports dead with that reason. anything less
-// = unknown.
-func modelHealthFor(model string) modelHealth {
-	totalsMu.Lock()
-	defer totalsMu.Unlock()
-	return modelHealthLocked(model)
 }
 
 func modelHealthLocked(model string) modelHealth {

@@ -31,18 +31,28 @@ incidental machinery.
   `x-opencode-session: ses_*` + `x-opencode-session-id` (same descending
   id) + `x-session-affinity`, `x-opencode-project: global`,
   `User-Agent: opencode/<version> ai-sdk/provider-utils/4.0.23
-  runtime/bun/1.3.14` (live tag from sst/opencode releases, refreshed every
-  6h, default in zenproxy.go). `x-opencode-request` is NOT
-  sent: the current client dropped it. (`anthropic-version` is NOT
+  runtime/bun/1.3.14` (live tag from anomalyco/opencode releases — the
+  repo moved off sst/ — refreshed every 6h, default in zenproxy.go).
+  `x-opencode-request` carries a fresh descending-id message id per
+  attempt (`zenMessageID`), as the installed 1.19.x client does.
+  (`anthropic-version` is NOT
   sent; an earlier doc revision claimed it.) muse-spark models use
   `/responses`, everything else `/chat/completions`; shape follows the
   model, converted both ways (`convertToResponses` / `chatFromResponses`).
   the free-tier gate fingerprints the body's tools array (verified live:
   the system prompt is unconstrained once `ensureZenTools`' embedded
-  opencode toolset — `zenOCDefsJSON` in zentools.go, 12 real CLI tools —
-  is present; fewer than six of the exact definitions 403s FreeTierError,
-  and client tool name spoofing/extra client tools pass). upstream tool
-  call names pointing at the ballast (`shell`, `subagent`, ...) map back
+  opencode toolset — `zenOCDefsJSON` in zentools.go, the 11 tools the
+  1.19.3 CLI sends (bash, edit, glob, grep, read, skill, task, todowrite,
+  webfetch, websearch, write) — is present; the previous 12-tool set
+  (shell/subagent/execute) is stale and 403s FreeTierError). zen also
+  enforces a per-IP reputation check and ~50-100 req/day cap (~1.5s
+  between requests): GET `/models` does not run the IP reputation gate, so
+  `verifyProxy` probes `POST /chat/completions` with an invalid message
+  role (`verifyProbeBody` — 0 tokens/0 inference cost, returns 400 when
+  the IP passes the gate and 403 FreeTierError when the IP is blocked or
+  daily-capped). a working exit stays pinned to its lane across turns
+  until it actually hits a 429 or 403 cap (`noteExitGate` parks + drops
+  the exit and evacuates its lane onto a fresh one). upstream tool call names pointing at the ballast map back
   via `zenToolAliases` in `toolNames.resolve`.- **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
   one live stream per account jwt (server 409s a second); accounts rotate
   on failure, queue up to `freepi.queue_wait_secs` (default 60s). jwt only
@@ -156,7 +166,8 @@ incidental machinery.
 | signal | meaning | action |
 |---|---|---|
 | 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15), extends itself when the pool itself is written off (below), and only then ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for the cycle (`noteExit429`), cleared by the next refresh. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
-| 403 FreeTierError | per-exit-per-model refusal for the cycle (`noteExitModelBurned`). the exit stays poolable for other models; lane rotates away | normal, no fix. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
+| 403 FreeTierError, "current network"/"abusive traffic" | the exit IP hit its daily cap or was flagged (`zenGateIPBlocked`). parked for `exit_burn_minutes` (`noteExitGate`) and dropped from the pool; the lane rotates onto a fresh exit and the request still succeeds | normal, no fix — this is the everyday churn: ~50-100 requests per IP, then move to the next one |
+| 403 FreeTierError, "can only be used from within OpenCode" | the request shape itself was refused, so the IP is fine. burns that exit+model for the cycle (`noteExitModelBurned`) and rotates, but never parks the exit | fix the shape (headers/tools/stream), not the pool. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
 | 502/503/504 from an exit | dead exit or a proxy in front of it failing (`zenRetryableStatus`). rotated like a 429, also never forwarded | normal noise, no fix |
 | 403 geo (`not available in your country`) / `[user_blocked]` | exit banned or region-blocked. `dropProxy` + failover; threshold (`error_threshold`, default 3) refreshes pool | normal, no fix |
 | 502 / transport error | dead exit, dropped from pool (`dropProxy`, transport closed) | normal noise, no fix |
@@ -186,24 +197,45 @@ two rules keep that 503 rare, both in zenlanes.go:
 
 exit states live in one registry (`exitState` in zenlanes.go):
 `rate_limited` keyed by exit+model (2 in a row or 6 a cycle, expires at the
-refresh), `dead` (transport/tls, `deadTTL`). both are cleared by
+refresh), `dead` (transport/tls, `deadTTL`), and `gate_parked` (per exit IP,
+the free-tier daily cap). rate/dead are cleared by
 `clearExitRateLimits` when a sweep completes, and *only* there: a dry pick
 must never clear marks. it used to, which put the exits that had just 429'd
 straight back at the front of the rotation and made the same few exits
 ping-pong between limited and usable while the pool looked permanently
 dry. instead, a dry pick fires a fresh sweep (cooldown-gated, skipping the
 current exits) and hands out the least-recently-marked one
-(`secondChancePick`).
+(`secondChancePick`). the one exception is a pool that can serve nobody at
+all (`poolUnusable`: empty, or every member dead/parked/limited): then
+every mark is dropped (`clearAllExitMarks`) and the sweep re-probes the
+whole list, live pool members first (`recheckEveryExit`, `zenRefreshFull`).
+marks are what a sweep skips, so keeping them there is what left a dead
+pool dead; the probe still decides who comes back.
 
-pool sizing is what keeps that path rare: one sweep aims for 3 exits per
+pool sizing is what keeps that path rare: one sweep aims for 8 exits per
 lane (`poolTarget`, floor 24) and stops as soon as it holds them, so the
-pool is bigger than the lane table and rotation has spares. `max_response_ms`
+pool is bigger than the lane table and rotation has spares — each exit is
+only good for ~50-100 requests, so a thin bench turns a busy morning into a
+parked pool. a pool whose every exit is parked answers the 503 immediately
+(`poolAllGateParked`) instead of waiting out the 30s recovery budget. `max_response_ms`
 is a coarse pre-filter on the list's own noisy figure, not a latency
-promise — tightening it is what starves the pool (only ~1 in 10 candidates
-dials at any claimed speed). lanes are capped at the pool size
-(`laneCapFor`) so every lane can hold its own exit; a 30m refresh
+promise — tightening it is what starves the pool (only ~1 in 100 candidates
+dials at any claimed speed, and the list's own figure tops out around
+6.5s, so 10000 admits the whole file). `pool_size` caps candidates per
+sweep; 0 (the default) dials the filtered list and fans out to 200 verify
+workers, which is what an uncapped pool needs to finish in under a minute.
+lanes are capped at the pool size (`laneCapFor`) so every lane can hold
+its own exit; a 30m refresh
 (`refresh_interval_minutes`) refills the table and re-pins idle lanes
-(`ensureLanePins`).
+(`ensureLanePins`). the sweep fetches `proxyListURL` and falls back to the
+same json straight from the repo (`proxyListFallback`) when the site is
+unreachable — a home line that blocks the domain (comcast advanced security
+serves a block page for it) would otherwise leave the pool empty forever.
+configured `zen.proxies` are still preferred, but the picker falls through
+to the pool once they are all taken/dead (`pickLaneProxyExcluding`), and a
+transport failure marks a configured exit dead like a pool exit — bare
+`dropProxy` is a no-op for one, so it used to be re-picked on every
+request.
 
 Investigate only when rotation stops working: same rate-limited exit
 reused, sessions never refreshing, refresh storms (see docs/TODO.md item
@@ -245,10 +277,12 @@ retry logic).
   headers, same reason: authorization is the proxy's own credential there and
   x-session-id would link the client upstream). zen has its own blocklist in
   `zenHeaderForwarded`
-  (also drops `content-type`, `accept`, `user-agent` and the four
-  `x-opencode-*` the proxy sets itself: client, session, request,
-  project; `x-opencode-session-id` is deliberately ALLOWED and set by the
-  proxy). `ZEN_PASSTHROUGH=1` still runs the deny-list over the clone.
+  (also drops `content-type`, `accept`, `user-agent`, `accept-encoding`,
+  `connection`, `content-length`, `x-forwarded-host`, and every opencode
+  identity header the proxy sets itself: client, session, session-id,
+  request, project, session-affinity). `ZEN_PASSTHROUGH=1` layers the
+  allowed client headers over the proxy's own base set and still runs the
+  deny-list, so authorization and the session id stay the proxy's.
   new forwarded headers must pass both lists.
 - several upstream reads are uncapped (`io.ReadAll` on response bodies
   in NIM/zen paths). cap any new read with `io.LimitReader`.

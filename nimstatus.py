@@ -351,7 +351,7 @@ def usage_bar(pct, width=10):
 # the rest of its row stays dim.
 PROVIDER_STYLES = {"opencode": "slate_blue1", "freepi": "medium_purple3",
                    "antseed": "steel_blue", "nvidia": "dark_sea_green",
-                   "nous": "medium_spring_green"}
+                   "nous": "medium_spring_green", "route": "gold1"}
 
 
 def health_cell(health, model):
@@ -463,6 +463,20 @@ def build_renderable(d, stats):
         # so the generic name+"/"+val prefixing below would leave them bare
         # and miss the usage.by_model key. prefix them here.
         cols.append(("nous", ["nous/" + m for m in nous_models]))
+    # route ids last: one stable id per model that 2+ backends serve.
+    rt = d.get("route") or {}
+    rt_via = {}
+    if rt.get("enabled"):
+        route_ids = []
+        for row in rt.get("routes") or []:
+            if isinstance(row, dict):
+                rid, via = row.get("id", "?"), row.get("via") or []
+            else:  # older server shape: bare id strings
+                rid, via = row, []
+            route_ids.append(rid)
+            rt_via[rid] = via
+        if route_ids:
+            cols.append(("route", route_ids))
     if cols:
         by_model = (d.get("usage") or {}).get("by_model") or {}
         bench = bench_index(d)
@@ -480,17 +494,19 @@ def build_renderable(d, stats):
                 # keys usage.by_model by.
                 full = val if "/" in val else name + "/" + val
                 totals = model_totals(by_model, full) or {}
-                # the trailing column is freepi-only: usage multiplier on
-                # freepi rows, empty everywhere else.
-                mult = ""
+                # trailing column: usage multiplier on freepi rows, serving
+                # backends on route rows, empty everywhere else.
+                tail = ""
                 if name == "freepi":
-                    mult = mults.get(full.split("/", 1)[-1], "")
+                    tail = mults.get(full.split("/", 1)[-1], "")
+                elif name == "route":
+                    tail = " · ".join(rt_via.get(full) or [])
                 t.add_row(health_cell(health, full),
                           Text(full, style=PROVIDER_STYLES.get(name, "dim")),
                           score_cell(bench(full)),
                           str(totals.get("requests", 0)),
                           tok_cell(by_model, full), tps_cell(by_model, full),
-                          Text(mult, style="dim") if mult else Text(""))
+                          Text(tail, style="dim") if tail else Text(""))
         parts.append(t)
         parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
     bl = bench_line(d)
@@ -518,28 +534,6 @@ def build_renderable(d, stats):
                 "%s %s" % (k.get("name", "?"), k.get("cooldown", "?"))
                 for k in cooling), style="dim")
         parts.append(line)
-    rt = d.get("route") or {}
-    if rt.get("enabled") and rt.get("routes"):
-        rt_t = Table(show_header=True, header_style="bold", box=box.SIMPLE,
-                     pad_edge=False)
-        rt_t.add_column("route", style="gold1")
-        rt_t.add_column("via", style="dim")
-        lat = rt.get("latency_ms") or {}
-        order = {"opencode": 0, "antseed": 1, "freepi": 2, "nvidia": 3}
-        for row in rt.get("routes") or []:
-            if isinstance(row, dict):
-                rid, via = row.get("id", "?"), row.get("via") or []
-            else:  # older server shape: bare id strings
-                rid, via = row, []
-            via = [b for b in sorted(via, key=lambda b: order.get(b, 9))]
-            rt_t.add_row(rid, " · ".join(via) or "·")
-        lat_s = "  ".join("%s %sms" % (b, lat[b]) for b in
-                           sorted(lat, key=lambda b: order.get(b, 9)))
-        cap = "route [%s] %d ids" % (rt.get("strategy", "?"), rt.get("count", 0))
-        if lat_s:
-            cap += "  ·  fastest: " + lat_s
-        parts.append(Text(cap, style="dim"))
-        parts.append(rt_t)
     p = d.get("pool") or {}
     pool_t = Text()
     pool_t.append("pool  ", style="dim")

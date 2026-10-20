@@ -121,20 +121,15 @@ func (ix *orIndex) get(id string) *orModel {
 }
 
 var (
-	orMu      sync.RWMutex
-	orLive    *orIndex
-	orLastErr string
+	orMu   sync.RWMutex
+	orLive *orIndex
 )
 
-func setORIndex(ix *orIndex, err error) {
+func setORIndex(ix *orIndex) {
 	orMu.Lock()
 	defer orMu.Unlock()
 	if ix != nil {
 		orLive = ix
-	}
-	orLastErr = ""
-	if err != nil {
-		orLastErr = err.Error()
 	}
 }
 
@@ -143,12 +138,6 @@ func openRouterIndex() *orIndex {
 	orMu.RLock()
 	defer orMu.RUnlock()
 	return orLive
-}
-
-func openRouterError() string {
-	orMu.RLock()
-	defer orMu.RUnlock()
-	return orLastErr
 }
 
 func openRouterEnabled() bool { return cfg().OpenRouter.Enabled }
@@ -236,7 +225,7 @@ func refreshOpenRouter() {
 	}
 	path := orCachePath()
 	if ix := readORCache(path, time.Duration(cfg().OpenRouter.RefreshHours)*time.Hour); ix != nil {
-		setORIndex(ix, nil)
+		setORIndex(ix)
 		log.Printf("  openrouter: %d models from cache", ix.count)
 		return
 	}
@@ -246,17 +235,17 @@ func refreshOpenRouter() {
 		// nothing to keep, and a slow openrouter must not empty the
 		// models listing.
 		if ix := readORCache(path, 0); ix != nil {
-			setORIndex(ix, err)
+			setORIndex(ix)
 			log.Printf("WARN: openrouter fetch failed, using stale cache: %v", err)
 			return
 		}
-		setORIndex(nil, err)
+		setORIndex(nil)
 		log.Printf("WARN: openrouter fetch failed, keeping previous: %v", err)
 		return
 	}
 	ix := buildORIndex(models)
 	writeORCache(path, models)
-	setORIndex(ix, nil)
+	setORIndex(ix)
 	log.Printf("  openrouter: %d models", ix.count)
 }
 

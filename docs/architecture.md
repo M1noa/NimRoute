@@ -26,7 +26,9 @@ OpenCode Zen enforces rate limits per IP exit and per session. NimRoute spreads 
 - **One exit per lane**: Each lane owns a distinct verified proxy exit and `ses_*` session ID. Two lanes never share the same proxy exit (`lanePinnedElsewhere`, `pinUniqueProxy`).
 - **Instant rotation**: On a `429`, `529`, or `403 FreeTierError`, the request hands off to another lane (`laneFailover`, preferring lanes that already hold a working exit) and rotates exit + session immediately (`laneRotate`).
 - **Burn tracking**:
-  - `403 FreeTierError` burns that `(exit, model)` pair for `exit_burn_minutes` (default 30m).
+  - `403 FreeTierError` for the IP (daily cap, "abusive traffic") parks the whole exit for `exit_burn_minutes` (default 30m) and rotates the lane onto a fresh exit — the everyday churn, since an IP serves ~50-100 requests before the cap.
+  - A `403` refusing the request shape ("can only be used from within OpenCode") burns that `(exit, model)` pair for the same window; the exit keeps serving other models.
+  - A pool whose every exit is parked answers a `503 proxy_exhausted` immediately and asks for a fresh sweep, instead of waiting out the recovery budget.
   - Repeated `429` streaks with no recent success long-burn the exit across all models for 12h (`noteExit429`) and drop it from the pool.
   - TLS MITM errors ban the exit for 1h (`banTLSExit`).
   - When all pool exits are taken or burned, `recheckAllExits` clears transient burns and triggers an async pool refresh.

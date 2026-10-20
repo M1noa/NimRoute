@@ -84,7 +84,6 @@ var (
 	antModels   []string // free text model ids, first-seen order
 	antFetched  time.Time
 	antFetching bool
-	antDHTSeen  time.Time // last successful dht crawl
 	antDHTTried time.Time // last crawl attempt (success or fail)
 	antDHTBusy  bool      // crawl in flight: one at a time
 	antDHTPeers []antPeer // dht-found peers merged into the offer loop
@@ -450,7 +449,6 @@ func antDHTCrawl(topics []string, budget time.Duration, meta func(string) *antPe
 	antDHTMu.Lock()
 	if len(peers) > 0 {
 		antDHTPeers = peers
-		antDHTSeen = time.Now()
 	}
 	antDHTTried = time.Now()
 	antDHTBusy = false

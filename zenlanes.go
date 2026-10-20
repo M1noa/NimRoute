@@ -162,6 +162,19 @@ func countDeadExits() int {
 	return n
 }
 
+func countGateParked() int {
+	exitStateMu.Lock()
+	defer exitStateMu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, st := range exitStates {
+		if now.Before(st.gateUntil) {
+			n++
+		}
+	}
+	return n
+}
+
 // exitMark is one marked exit as /status reports it.
 type exitMark struct {
 	Proxy  string
@@ -242,12 +255,15 @@ func dropConvoSeen(k string) {
 type exitState struct {
 	// rl is the per-model 429 mark. keyed by model, cleared by the pool
 	// refresh that starts a new cycle.
-	rl        map[string]exitMark429
-	deadUntil time.Time            // dead until
-	reason    string               // last mark, for /status and logs
-	models    map[string]time.Time // model -> refusing it until (403 free-tier)
-	lastOK    time.Time
-	strikes   []time.Time // >6s first-byte stalls in the last hour
+	rl         map[string]exitMark429
+	deadUntil  time.Time            // dead until
+	gateUntil  time.Time            // free-tier IP/daily cap cooldown (per exit IP)
+	lastSend   time.Time            // per-exit pacing clock (min 1.5s between sends on this exit)
+	consecFail int                  // consecutive transport failures since last success
+	reason     string               // last mark, for /status and logs
+	models     map[string]time.Time // model -> refusing it until (403 free-tier)
+	lastOK     time.Time
+	strikes    []time.Time // >15s first-byte stalls in the last hour
 }
 
 // exitMark429 is one exit+model pair's 429 bookkeeping: the streak and cycle
@@ -362,7 +378,7 @@ func exitDead(proxy string) bool {
 // exitUsable reports whether an exit may be pinned right now. "" is never
 // usable: it means "no proxy", which is what lanes must not hold.
 func exitUsable(proxy string) bool {
-	return proxy != "" && !exitDead(proxy) && !exitRateLimited(proxy)
+	return proxy != "" && !exitDead(proxy) && !exitGateCooling(proxy) && !exitRateLimited(proxy)
 }
 
 // exitModelBurned reports whether an exit is refusing one model this cycle.
@@ -390,11 +406,109 @@ func exitModelBurned(proxy, model string) bool {
 }
 
 // exitUsableFor reports whether an exit may serve one model: not dead, not
-// marked for that model, and not refusing it this cycle. a mark for a
-// different model never blocks this one.
+// cooling off the free-tier gate, not marked for that model, and not refusing
+// it this cycle. a mark for a different model never blocks this one.
 func exitUsableFor(proxy, model string) bool {
-	return proxy != "" && !exitDead(proxy) &&
+	return proxy != "" && !exitDead(proxy) && !exitGateCooling(proxy) &&
 		!exitRateLimitedModel(proxy, model) && !exitModelBurned(proxy, model)
+}
+
+// exitGateCooling reports whether the exit IP is parked after hitting its
+// free-tier daily cap or an IP-abuse 403.
+func exitGateCooling(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	exitStateMu.Lock()
+	defer exitStateMu.Unlock()
+	st, ok := exitStates[proxy]
+	if !ok || st.gateUntil.IsZero() {
+		return false
+	}
+	if time.Now().After(st.gateUntil) {
+		st.gateUntil = time.Time{}
+		return false
+	}
+	return true
+}
+
+// poolAllGateParked reports whether the pool holds exits but every one is
+// parked by the free-tier gate (or dead). waiting for a drawable exit cannot
+// help then — only a fresh sweep can, and its exits show up as a new pool —
+// so a lane answers immediately instead of holding the client for the wait.
+func poolAllGateParked() bool {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	if len(pool) == 0 {
+		return false
+	}
+	for _, p := range pool {
+		if !exitGateCooling(p) && !exitDead(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// poolUnusable reports whether the pool can serve nobody right now: every
+// member dead, gate-parked, or rate-limited for every model. an empty pool
+// counts too: a sweep that keeps finding nothing leaves the marks behind, and
+// those marks are what stop it finding anything next time.
+func poolUnusable() bool {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	if len(pool) == 0 {
+		return true
+	}
+	for _, p := range pool {
+		if exitUsable(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// gatePoolRefill asks for a full recheck when the pool has nothing left but
+// parked exits. a capped IP never comes back inside its window, so re-probing
+// the live set buys nothing; only the rest of the list can help. paced by
+// dryRefillCooldown so waiting lanes see a fresh sweep within seconds.
+func gatePoolRefill() {
+	dryRefillMu.Lock()
+	due := time.Since(dryRefillAt) >= dryRefillCooldown
+	if due {
+		dryRefillAt = time.Now()
+	}
+	dryRefillMu.Unlock()
+	if !due {
+		return
+	}
+	zenProxiesMu.Lock()
+	zenPoolRefreshed = time.Now()
+	zenProxiesMu.Unlock()
+	recheckEveryExit("every exit free-tier parked")
+}
+
+// noteExitGate parks an exit after a free-tier 403 (daily cap or IP-abuse
+// block) and evacuates any lane pinned to it onto a fresh exit. the block is
+// per exit IP, not per model, so the whole exit sits out for the cycle while
+// other lanes keep serving on their own pins.
+func noteExitGate(proxy string) {
+	if proxy == "" {
+		return
+	}
+	park := deadTTL()
+	st := exitStateFor(proxy)
+	exitStateMu.Lock()
+	was := !st.gateUntil.IsZero() && time.Now().Before(st.gateUntil)
+	st.gateUntil = time.Now().Add(park)
+	st.reason = "free-tier 403 (ip cap/block)"
+	exitStateMu.Unlock()
+	if !was {
+		acclog.Printf("  zen exit %s parked for %v (free-tier 403)", redactProxyUserinfo(proxy), park)
+	}
+	dropProxy(proxy)
 }
 
 // noteExitModelBurned marks an exit refusing one model for the rest of the
@@ -442,6 +556,9 @@ func exitStateOf(proxy string) string {
 	}
 	if exitDead(proxy) {
 		return "dead"
+	}
+	if exitGateCooling(proxy) {
+		return "gate_blocked"
 	}
 	if exitRateLimited(proxy) {
 		return "rate_limited"
@@ -567,8 +684,34 @@ func noteExit429(proxy, model string) bool {
 	return true
 }
 
+// noteExitTransportErr records a transport failure on an exit. an exit that
+// has already served requests gets 2 strikes before being marked dead for 30m
+// (stale keep-alive or transient proxy hiccup shouldn't throw away a working
+// exit with ~50-100 daily requests left); an unproven exit dies on first fail.
+// returns true when the exit was marked dead and dropped.
+func noteExitTransportErr(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	st := exitStateFor(proxy)
+	exitStateMu.Lock()
+	st.consecFail++
+	fails := st.consecFail
+	proven := !st.lastOK.IsZero()
+	exitStateMu.Unlock()
+	if proven && fails < 2 {
+		closeZenTransport(proxy) // drop stale keep-alive conn, keep the exit
+		acclog.Printf("  zen exit %s transient transport error (%d/2), keeping exit", redactProxyUserinfo(proxy), fails)
+		return false
+	}
+	markExitDead(proxy, "transport closed")
+	return true
+}
+
 // noteExitOK clears an exit+model's 429 streak on a success. the cycle total
 // stays until the next refresh so a flapping pair still gets retired.
+// the exit stays pinned to its lane and keeps serving (~50-100 requests per IP
+// with ~1.5s pacing) until it actually hits a 429 or daily cap 403.
 func noteExitOK(proxy, model string) {
 	if proxy == "" {
 		return
@@ -579,13 +722,14 @@ func noteExitOK(proxy, model string) {
 		mk.streak = 0
 		st.rl[model] = mk
 	}
+	st.consecFail = 0
 	st.lastOK = time.Now()
 	exitStateMu.Unlock()
 }
 
-// noteExitSlow records a >6s first-byte stall on an exit. two strikes
-// within an hour marks it dead: consistently slow exits waste every request
-// they touch.
+// noteExitSlow records a >15s first-byte stall on an exit. three strikes
+// within an hour marks it dead: consistently stalled exits waste requests,
+// while large thinking-model prompts (>6s normal TTFT) do not false-trip.
 func noteExitSlow(proxy string) {
 	if proxy == "" {
 		return
@@ -603,8 +747,30 @@ func noteExitSlow(proxy string) {
 	st.strikes = kept
 	n := len(kept)
 	exitStateMu.Unlock()
-	if n >= 2 {
-		markExitDead(proxy, "2 slow strikes in 1h")
+	if n >= 3 {
+		markExitDead(proxy, "3 slow strikes in 1h")
+	}
+}
+
+// clearAllExitMarks drops rate limits, per-model burns, and dead stamps for
+// the out-of-exits recheck. gateUntil (per-IP free-tier daily cap/block) is
+// preserved: an IP that hit its daily cap is still capped, so clearing it only
+// re-admits burned exits that immediately 403 again.
+func clearAllExitMarks() {
+	exitStateMu.Lock()
+	cleared := 0
+	for _, st := range exitStates {
+		if len(st.rl) > 0 || len(st.models) > 0 || !st.deadUntil.IsZero() {
+			cleared++
+		}
+		st.rl = nil
+		st.models = nil
+		st.consecFail = 0
+		st.deadUntil = time.Time{}
+	}
+	exitStateMu.Unlock()
+	if cleared > 0 {
+		acclog.Printf("  zen proxies: %d marked exit(s) cleared for a full recheck", cleared)
 	}
 }
 
@@ -638,7 +804,7 @@ func pruneExitStates(keep map[string]bool) {
 		if keep[p] {
 			continue
 		}
-		if exitRateLimitedLocked(st, now) || now.Before(st.deadUntil) {
+		if exitRateLimitedLocked(st, now) || now.Before(st.deadUntil) || now.Before(st.gateUntil) {
 			continue // still serving its mark: /status must keep showing it
 		}
 		delete(exitStates, p)
@@ -831,11 +997,13 @@ func convoIdleTTL() time.Duration {
 }
 
 func laneMinGap() time.Duration {
-	return time.Duration(cfg().Zen.LaneMinGapMs) * time.Millisecond
-}
-
-func laneRelease() time.Duration {
-	return time.Duration(cfg().Zen.LaneReleaseSecs) * time.Second
+	if ms := cfg().Zen.LaneMinGapMs; ms > 0 {
+		if ms < 1500 {
+			ms = 1500
+		}
+		return time.Duration(ms) * time.Millisecond
+	}
+	return 1500 * time.Millisecond
 }
 
 // zenRetryableStatus reports whether an upstream status means "this exit
@@ -871,32 +1039,61 @@ func zenRetryLabel() int { return zenMaxRetries() - 1 }
 // passes its own bound.
 func zenLastRetry(retry, attempts int) bool { return retry+1 >= attempts }
 
-// laneGate blocks until the lane may send: pacing gap since its previous
-// send only, never a cooldown. the slot is claimed under the lane lock
-// before sleeping, so concurrent requests are spaced one gap apart instead
-// of all waking together and bursting the same exit. wait is capped so a
-// lane never stalls a request indefinitely. ctx-aware: a client disconnect
-// aborts the pacing sleep instead of blocking shutdown.
-func laneGate(ctx context.Context, l *zenLane) time.Duration {
-	now := time.Now()
-	maxWait := 10 * time.Second
+// exitGate blocks until the proxy exit itself has had at least laneMinGap()
+// (1.5s minimum) since its last send, and advances the lane's send clock too.
+// this guarantees that even across lane rotations, failovers, nudges, or
+// re-pins, a single exit IP never sends faster than once per 1.5s.
+func exitGate(ctx context.Context, l *zenLane, proxy string) time.Duration {
+	gap := laneMinGap()
+	if gap <= 0 {
+		return 0
+	}
+	maxWait := 30 * time.Second
 	if s := cfg().Zen.LaneGateMaxSecs; s > 0 {
 		maxWait = time.Duration(s) * time.Second
 	}
-	lanesMu.Lock()
+	now := time.Now()
+	var st *exitState
+	if proxy != "" {
+		st = exitStateFor(proxy)
+	}
+	// read, compute and claim the slot under both locks: reading the
+	// clocks in one critical section and writing them in another let two
+	// concurrent callers claim the same instant and burst the exit.
+	// lanesMu is always taken before exitStateMu (nothing else nests them).
+	if l != nil {
+		lanesMu.Lock()
+	}
+	if st != nil {
+		exitStateMu.Lock()
+	}
 	var wait time.Duration
-	if gap := laneMinGap(); gap > 0 && !l.lastSend.IsZero() {
+	if l != nil && !l.lastSend.IsZero() {
 		if w := gap - now.Sub(l.lastSend); w > 0 {
+			wait = w
+		}
+	}
+	if st != nil && !st.lastSend.IsZero() {
+		if w := gap - now.Sub(st.lastSend); w > 0 && w > wait {
 			wait = w
 		}
 	}
 	if wait > maxWait {
 		wait = maxWait
 	}
-	// claim: the next caller's gap is measured from this send's schedule,
-	// so two concurrent callers serialize one gap apart.
-	l.lastSend = now.Add(wait)
-	lanesMu.Unlock()
+	sched := now.Add(wait)
+	if l != nil && sched.After(l.lastSend) {
+		l.lastSend = sched
+	}
+	if st != nil && sched.After(st.lastSend) {
+		st.lastSend = sched
+	}
+	if st != nil {
+		exitStateMu.Unlock()
+	}
+	if l != nil {
+		lanesMu.Unlock()
+	}
 	if wait > 0 {
 		select {
 		case <-time.After(wait):
@@ -1278,16 +1475,16 @@ func poolRefreshDue() bool {
 // every lane holds a working exit, so when one cannot be drawn the only honest
 // move is to wait for the sweep, not to hand the client a proxyless request.
 // the clock starts at the first wait, covers every later one (a dry pick and a
-// spent ladder draw from the same budget), and a live sweep lands in ~7s, so
-// this covers a couple of tries. past it the pool really cannot serve and the
-// ladder fails honestly instead of stalling the caller further.
-func poolRecoverWait() time.Duration { return 20 * time.Second }
+// spent ladder draw from the same budget), and a live sweep publishes exits as
+// they verify, so 30s gives the refill sweep plenty of time to land before the
+// ladder fails honestly.
+func poolRecoverWait() time.Duration { return 30 * time.Second }
 
 // dryRefillCooldown paces the dry-pool refill. the 429/geo trips sit behind
 // poolRefreshCooldown (~120s) because the pool is still serving when they fire;
 // a dry pick is the pool serving nobody, so the gap here is short enough that a
 // waiting lane sees the next sweep land in seconds.
-const dryRefillCooldown = 15 * time.Second
+const dryRefillCooldown = 10 * time.Second
 
 var (
 	dryRefillMu sync.Mutex
@@ -1308,6 +1505,10 @@ func dryPoolRefill(force bool) {
 	}
 	dryRefillMu.Unlock()
 	if !due {
+		return
+	}
+	if poolUnusable() {
+		recheckEveryExit("no exit can serve")
 		return
 	}
 	acclog.Printf("  zen pool dry: no exit drawable, sweeping for fresh exits")
@@ -1367,7 +1568,7 @@ func maybeRefreshPoolThin() {
 // answered 429: the model is saturated right now and a sweep buys nothing but
 // latency, so the ladder should fail honestly instead of waiting.
 func marksOut() bool {
-	off := countRateLimited() + countDeadExits()
+	off := countRateLimited() + countDeadExits() + countGateParked()
 	if off == 0 {
 		return false
 	}
@@ -1377,7 +1578,7 @@ func marksOut() bool {
 	// custom proxies count: with a configured list the picker only hands
 	// those out, so a pool that is empty behind them is not the serving set.
 	total := pool + len(getCustomProxies())
-	return total > 0 && off*2 >= total
+	return total == 0 || off*2 >= total
 }
 
 // recoverDeadline returns this request's pool-recovery deadline, starting the
@@ -1398,7 +1599,7 @@ func recoverDeadline(until *time.Time) time.Time {
 // marks to go, bounded by the request's recovery budget. false means "spend no
 // more hops": nothing written off, budget gone, or the client left.
 func ladderExtend(ctx context.Context, until *time.Time) bool {
-	if !marksOut() {
+	if !marksOut() && !poolUnusable() {
 		return false
 	}
 	deadline := recoverDeadline(until)
@@ -1414,7 +1615,7 @@ func ladderExtend(ctx context.Context, until *time.Time) bool {
 			return false
 		case <-time.After(150 * time.Millisecond):
 		}
-		if countRateLimited() == 0 {
+		if countRateLimited() == 0 && !poolUnusable() {
 			acclog.Printf("  zen pool written off: refilled, extending retry ladder")
 			return true
 		}
@@ -1504,28 +1705,6 @@ func laneTokensAdd(l *zenLane, model string, prompt, completion, total int, durM
 	l.tokens[model] = m
 }
 
-// pickLaneProxy returns a verified proxy not already pinned by another
-// lane and not burned for model, so lanes actually spread across distinct
-// exits. custom proxies win; otherwise samples the latency-weighted pool
-// and excludes taken exits. "" only when every pool exit is taken or the
-// pool is empty.
-func pickLaneProxy() string { return pickLaneProxyFor("") }
-
-// pickLaneProxyFor is pickLaneProxy skipping exits burned for model.
-// exclusions are a snapshot: a pin made a moment later can still collide,
-// so pin paths re-validate under the write lock (pinUniqueProxy).
-func pickLaneProxyFor(model string) string {
-	taken := map[string]bool{}
-	lanesMu.Lock()
-	for _, l := range lanes {
-		if l.proxy != "" {
-			taken[l.proxy] = true
-		}
-	}
-	lanesMu.Unlock()
-	return pickLaneProxyExcluding(taken, model)
-}
-
 // pickLaneProxyExcluding is the picker with the taken set supplied, so a
 // pin loop can retry under the write lock without re-entering lanesMu.
 // never returns a taken exit: two lanes on one exit share its per-exit
@@ -1540,11 +1719,15 @@ func pickLaneProxyExcluding(taken map[string]bool, model string) string {
 				free = append(free, c)
 			}
 		}
-		if len(free) == 0 {
-			return ""
+		if len(free) > 0 {
+			sort.Slice(free, func(i, j int) bool { return proxyWeight(free[i]) > proxyWeight(free[j]) })
+			return sampleWeighted(free, 1)[0]
 		}
-		sort.Slice(free, func(i, j int) bool { return proxyWeight(free[i]) > proxyWeight(free[j]) })
-		return sampleWeighted(free, 1)[0]
+		// every configured exit is taken, dead, or refusing this model:
+		// fall through to the auto pool rather than starving the lane on a
+		// list that no longer answers. a configured proxy that keeps
+		// failing gets marked dead by the transport path, so this is what
+		// keeps a stale custom list from costing every request.
 	}
 
 	zenProxiesMu.RLock()
@@ -1587,7 +1770,7 @@ func pickLaneProxyExcluding(taken map[string]bool, model string) string {
 func secondChancePick(pool []string, taken map[string]bool, model string) string {
 	best, bestAt := "", time.Time{}
 	for _, p := range pool {
-		if taken[p] || exitDead(p) || exitModelBurned(p, model) {
+		if taken[p] || exitDead(p) || exitGateCooling(p) || exitModelBurned(p, model) {
 			continue
 		}
 		at := exitLimitMarkedAt(p, model) // zero when the pair is unmarked
@@ -1625,17 +1808,25 @@ func exitLimitMarkedAt(proxy, model string) time.Time {
 // the marks are deliberately not cleared here. clearing them on every dry
 // pick put the exits that had just 429'd straight back into rotation, so the
 // same few exits ping-ponged between limited and usable and the pool never
-// recovered. dead exits stay out: a mitm exit fails every real send, so
-// rechecking it only spends a request. the sweep is cooldown-gated like the
-// other refresh trips, so a saturated pool cannot fire one per retry.
+// recovered. the one exception is a pool that cannot serve anybody at all:
+// then the marks are all that is left, and the full recheck drops them, with
+// each exit's own probe deciding who comes back. the sweep is cooldown-gated
+// like the other refresh trips, so a saturated pool cannot fire one per retry.
 // returns whether the dry pick should re-filter the pool: only a sweep that
 // actually started can refill it.
 func recheckAllExits() bool {
 	marked := countRateLimited()
-	if marked == 0 {
+	out := poolUnusable()
+	if marked == 0 && !out {
 		// nothing was written off: the pool is simply thinner than the lane
 		// table, and only a refill (maybeRefreshPoolThin) can buy room.
 		return false
+	}
+	if out {
+		// no member can serve at all: the marks are not the problem, the exits
+		// are. dryPoolRefill paces the full recheck and clears them.
+		dryPoolRefill(false)
+		return true
 	}
 	if !poolRefreshDue() {
 		zenProxiesMu.RLock()
@@ -1657,6 +1848,11 @@ func recheckAllExits() bool {
 // colliding pick is retried with a fresh exclusion set a bounded number of
 // times. "" means nothing unique to pin: the caller drops its pin rather
 // than ride an exit another lane already holds.
+//
+// when every exit the picker will hand out is marked for model, the lane
+// still gets one: pinBurnedProxy ranks the marks instead of refusing. a
+// pinless lane cannot send at all (it waits on the pool, then fails), and
+// the marks are per model and die with the next refresh.
 func pinUniqueProxy(l *zenLane, model string) string {
 	for i := 0; i < 10; i++ {
 		// the picker may lock lanesMu internally (lane bookkeeping for the
@@ -1672,11 +1868,11 @@ func pinUniqueProxy(l *zenLane, model string) string {
 		lanesMu.Unlock()
 		p := pickLaneProxyExcluding(taken, model)
 		if p == "" {
-			// a pool narrower than the lane table cannot hand every lane
-			// its own exit: refill after the picker so a thin-pool stamp
-			// never starves recheckAllExits from clearing written-off exits.
+			// marks only order the pool, they never empty it: every lane
+			// keeps an exit while a unique one exists.
+			p = pinBurnedProxy(l, model)
 			maybeRefreshPoolThin()
-			return ""
+			return p
 		}
 		lanesMu.Lock()
 		conflict := false
@@ -1697,13 +1893,13 @@ func pinUniqueProxy(l *zenLane, model string) string {
 	return ""
 }
 
-// laneReproxy swaps a dead exit for a fresh verified one that is not
-// burned for model, keeping the lane session pinned (affinity survives
-// proxy churn) and every other lane's exit untouched: no exit is ever
-// held by two lanes. with nothing unique to swap to the pin is kept only
-// while it is still this lane's alone and the pool still holds it;
-// otherwise it is dropped ("" = direct, or the caller hands the request
-// to a lane that owns an exit).
+// laneReproxy swaps a dead exit for a fresh verified one, keeping the lane
+// session pinned (affinity survives proxy churn) and every other lane's exit
+// untouched: no exit is ever held by two lanes. a mark for model is not a
+// reason to drop the pin: the exit is still in the pool, still this lane's
+// alone, and still answers the other models. only a dead exit or one the
+// pool dropped costs the lane its pin ("" = direct, or the caller hands the
+// request to a lane that owns an exit).
 func laneReproxy(l *zenLane, model string) string {
 	if p := pinUniqueProxy(l, model); p != "" {
 		return p
@@ -1711,11 +1907,74 @@ func laneReproxy(l *zenLane, model string) string {
 	lanesMu.Lock()
 	p := l.proxy
 	lanesMu.Unlock()
-	if exitUsableFor(p, model) && !exitOutOfPool(p) && !lanePinnedElsewhere(p, l) {
+	if p != "" && !exitDead(p) && !exitGateCooling(p) && !exitOutOfPool(p) && !lanePinnedElsewhere(p, l) {
 		return p
 	}
 	setLaneProxy(l, "")
 	return ""
+}
+
+// poolExitsForPick is the pin source with marks ignored: custom proxies win,
+// else the verified zen pool.
+func poolExitsForPick() []string {
+	if cps := getCustomProxies(); len(cps) > 0 {
+		return append([]string(nil), cps...)
+	}
+	zenProxiesMu.RLock()
+	defer zenProxiesMu.RUnlock()
+	return append([]string(nil), zenProxies...)
+}
+
+// pinBurnedProxy is the last-resort pin: every exit the picker hands out is
+// taken by a peer or marked for model, so it picks from the whole pool and
+// lets the marks decide the order only. it prefers an exit that is neither
+// marked for model nor the one that just failed, then any unmarked spare,
+// then a marked one. dead and gate-cooled exits and exits a peer holds stay
+// excluded: those are facts about the exit, not this model's cycle. "" only
+// when the pool has nothing left but this lane's own pin, which the caller
+// keeps.
+func pinBurnedProxy(l *zenLane, model string) string {
+	pool := poolExitsForPick()
+	dead := map[string]bool{}
+	marked := map[string]bool{}
+	for _, p := range pool {
+		if exitDead(p) || exitGateCooling(p) {
+			dead[p] = true
+			continue
+		}
+		if model != "" && (exitRateLimitedModel(p, model) || exitModelBurned(p, model)) {
+			marked[p] = true
+		}
+	}
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	taken := map[string]bool{}
+	for _, o := range lanes {
+		if o != l && o.proxy != "" {
+			taken[o.proxy] = true
+		}
+	}
+	var clean, burned []string
+	for _, p := range pool {
+		if taken[p] || dead[p] || p == l.proxy {
+			continue
+		}
+		if marked[p] {
+			burned = append(burned, p)
+			continue
+		}
+		clean = append(clean, p)
+	}
+	pick := clean
+	if len(pick) == 0 {
+		pick = burned
+	}
+	if len(pick) == 0 {
+		return ""
+	}
+	sort.Slice(pick, func(i, j int) bool { return proxyWeight(pick[i]) > proxyWeight(pick[j]) })
+	stampLaneProxy(l, pick[0])
+	return pick[0]
 }
 
 // exitOutOfPool reports whether a non-empty pool has thrown pin away. an
@@ -1946,13 +2205,10 @@ func resetStaleLanes() {
 }
 
 // sweepLanes runs on the pool refresh tick: drops lanes idle past ttl and
-// releases exits idle past lane_release_secs, so a lane that has been cold
-// resumes on a fresh proxy instead of a stale one. lanes idle past
-// session_idle_minutes are evicted too, clearing the session hash/id from
-// cache while lane_ttl_minutes stays the hard cap.
+// session_idle_minutes. working exit pins stay on their lanes until the lane
+// itself is evicted or the exit fails (~50-100 requests per exit IP).
 func sweepLanes() {
 	cutoff := time.Now().Add(-laneTTL())
-	rel := laneRelease()
 	idle := sessionIdleTTL()
 	var idleCutoff time.Time
 	if idle > 0 {
@@ -1979,9 +2235,6 @@ func sweepLanes() {
 			delete(lanes, k)
 			dropConvoSeen(k)
 			continue
-		}
-		if rel > 0 && l.proxy != "" && time.Since(l.lastUsed) > rel {
-			l.proxy = ""
 		}
 	}
 	lanesMu.Unlock()
@@ -2197,17 +2450,20 @@ func laneNeedsProxy(l *zenLane) bool {
 // laneProxyWait hands the request an exit when the pool is dry, instead of
 // dropping the ladder into its dry branch: it re-tries this lane's own pin, then
 // tries a peer lane (a lane that already holds an exit answers instantly), and
-// keeps a refill sweeping while it polls. one exit per lane stays absolute, so a
-// lane wider than the pool waits here rather than sharing an exit or sending
-// direct. returns the lane to send on: a peer, when that is where the free exit
-// is. "" only when the budget runs out with the pool still unable to supply one,
-// or the client goes away.
+// keeps a refill sweeping while it polls for up to poolRecoverWait (30s). when
+// every exit in the current pool is gate-parked, gatePoolRefill triggers a
+// full sweep of the rest of the list while we wait here so newly verified
+// exits can be picked as soon as they land.
 func laneProxyWait(ctx context.Context, l *zenLane, model string, until *time.Time) (*zenLane, string) {
 	for {
 		if p := laneProxyFor(l, model); p != "" {
 			return l, p
 		}
-		dryPoolRefill(false)
+		if poolAllGateParked() {
+			gatePoolRefill()
+		} else {
+			dryPoolRefill(false)
+		}
 		if hl := laneFailover(l); hl != l {
 			if p := laneProxyFor(hl, model); p != "" {
 				return hl, p

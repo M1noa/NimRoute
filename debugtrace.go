@@ -141,15 +141,6 @@ func (t *traceRec) addHop(h *traceHop) {
 	t.Hops = append(t.Hops, h)
 }
 
-func (t *traceRec) note(s string) {
-	if s == "" {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.Notes = append(t.Notes, s)
-}
-
 func (t *traceRec) setReqID(id string) {
 	if t == nil {
 		return
@@ -508,14 +499,6 @@ func (s *snapBody) finish() {
 	s.hop.RespBody = body
 	s.hop.RespTrunc = s.truncated
 	s.tr.addHop(s.hop)
-}
-
-// traceUpstream records a hop for backends that don't speak http.Client
-// (antseed dials sellers over its own record framing).
-func traceUpstream(tr *traceRec, h *traceHop) {
-	if tr != nil {
-		tr.addHop(h)
-	}
 }
 
 // dbgClient instruments c so its upstream traffic lands in the trace. a

@@ -208,16 +208,18 @@ zen:
   blocked_countries: ["PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"]
   # drop auto-pool candidates whose list-reported time is slower than this
   # (ms). the list's figure is noisy, so this is a coarse pre-filter, not a
-  # latency promise: about one in ten candidates dials regardless of what it
-  # claims, and keeping the filter tight is what leaves fewer exits than
-  # lanes. 0 = no limit.
-  max_response_ms: 2000
+  # latency promise: roughly one candidate in a hundred dials regardless of
+  # what it claims, and the sweep dials in claimed-latency order. keeping
+  # the filter tight is what leaves fewer exits than lanes. 0 = no limit.
+  # 30000 stays under the transport's 60s response-header timeout: an exit
+  # slower than that cannot serve a request at all, so the filter stops
+  # there rather than at the source's own ceiling.
+  max_response_ms: 30000
   # candidate ceiling for one verify sweep. the sweep stops as soon as it
-  # holds 3 exits per lane (never fewer than 24), so the pool is bigger than
+  # holds 8 exits per lane (never fewer than 24), so the pool is bigger than
   # the lane table and a 429 rotation has spares to move through instead of
-  # running the pool dry. only about one in ten candidates dials, so the
-  # target needs roughly 12 candidates per exit wanted. 0 = no cap.
-  pool_size: 800
+  # running the pool dry. 0 = no cap (dial the whole list).
+  pool_size: 0
   # pinned proxy+session lanes. concurrent conversations spread across
   # lanes so they stop hammering one exit ip into 429s. lane identity
   # modes below toggle independently; shared pre-opens lanes-count lanes
@@ -268,14 +270,11 @@ zen:
   # drop lanes idle past this (minutes) on the same sweep, clearing the
   # session hash/id from cache. ttl stays the hard cap. 0 disables.
   session_idle_minutes: 6
-  # unused: limits rotate the exit+session instantly, no cooldown waits.
-  lane_cooldown_secs: 60
   # minimum gap between sends on one lane (ms). paces a single
-  # conversation's bursts so one exit never sees rapid-fire requests. 0 off.
+  # conversation's bursts so one exit never sees rapid-fire requests.
+  # zen's gate needs ~1.5s per exit, so values below 1500 are raised to
+  # 1500; 0 = 1500.
   lane_min_gap_ms: 1500
-  # release a lane's pinned exit after this idle time (seconds), so a
-  # long-cold lane resumes on a fresh proxy. 0 disables.
-  lane_release_secs: 90
   # per exit+model 429 policy: this many 429s in a row (2), or this many
   # total since the last refresh (6), retires that pair until the next
   # refresh. the mark is per model because zen limits the pair: an exit that
@@ -291,9 +290,10 @@ zen:
   # causes ~1 refresh instead of 2-3 back to back. 0 = 120, negative
   # disables (every trip refreshes).
   pool_refresh_cooldown_secs: 120
-  # an exit that 403s FreeTierError for a model is skipped for that model
-  # until the next refresh (minutes). per (exit, model): the exit keeps
-  # serving other models. also the ttl for a dead exit (transport/tls
+  # minutes an exit sits out after a refusal. a free-tier IP 403 (daily cap,
+  # abusive-traffic block) parks the whole exit: the cap is per IP, so it
+  # cannot serve any model until it resets. a shape-refusal 403 skips only
+  # that (exit, model) pair. also the ttl for a dead exit (transport/tls
   # failure): dead exits only return if a later refresh verifies them.
   # 0 = 30.
   exit_burn_minutes: 30
@@ -304,16 +304,8 @@ zen:
   # proxy pool ran out, not a rate limit. 0 = same default, negative = no
   # retry at all.
   max_retries: 15
-  # unused: exits are verified on pool refresh and by real sends, never
-  # probed on the request hot path.
-  probe_timeout_ms: 1000
-  # unused: the exit race is gone with hot-path probing; weighted picks
-  # plus hedging cover slow exits.
-  race_timeout_ms: 3000
-  # cap pacing wait per send (seconds). 0 = 10.
+  # cap pacing wait per send (seconds). 0 = 30.
   lane_gate_max_secs: 10
-  # unused: lanes never cool, nothing waits on a backoff.
-  lane_wait_max_secs: 3
   # pool refresh + session rotation after this long with no global success
   # and a lane limited the whole time (seconds). 0 = 15.
   stale_pool_secs: 15

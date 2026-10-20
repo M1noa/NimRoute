@@ -252,6 +252,14 @@ func (p *Pool) semCap() int {
 	return n
 }
 
+// keyCount snapshots the key pool size: hot reload swaps p.keys under p.mu,
+// so reading len(p.keys) directly is a data race.
+func (p *Pool) keyCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.keys)
+}
+
 // copyZenChatStream pipes an upstream zen chat SSE body to the client,
 // flushing each read. it stops as soon as the client context is done, so a
 // cancelled request closes upstream instead of draining generation nobody
@@ -503,7 +511,8 @@ func (p *Pool) callUpstream(ctx context.Context, method, target string, body []b
 	var used *Key
 
 	sticky := p.stickyKey(model)
-	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
+	keyCount := p.keyCount()
+	for attempt := 0; attempt < max(keyCount*2+2, 4); attempt++ {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -2137,17 +2146,20 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 	rotating := true
 	// hoisted: the body never changes across retries.
 	nbModel := reqModel(nb)
+	poolRecoverUntil := time.Time{}
 	for zenRetries := 0; zenRetries < zenMaxRetries(); zenRetries++ {
-		laneGate(r.Context(), lane)
 		proxy := ""
 		if rotating {
 			proxy = laneProxyFor(lane, nbModel)
-			if proxy == "" && cfg().Zen.AlwaysProxy {
-				lane = laneFailover(lane)
-				*sessionID = laneSession(lane)
-				proxy = laneProxyFor(lane, nbModel)
+			if proxy == "" && laneNeedsProxy(lane) {
+				nl, p := laneProxyWait(r.Context(), lane, nbModel, &poolRecoverUntil)
+				if nl != lane {
+					lane = nl
+					*sessionID = laneSession(lane)
+				}
+				proxy = p
 			}
-			if proxy == "" && cfg().Zen.AlwaysProxy {
+			if proxy == "" && laneNeedsProxy(lane) {
 				// dry pool: back off instead of hot-spinning the loop.
 				if !zenLastRetry(zenRetries, zenMaxRetries()) {
 					zenBackoffCtx(r.Context(), zenRetries)
@@ -2175,6 +2187,10 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 			}
 			cl = zenClient(proxy)
 		}
+		exitGate(r.Context(), lane, proxy)
+		if r.Context().Err() != nil {
+			return nil
+		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(nb))
 		if err != nil {
 			return nil
@@ -2189,8 +2205,11 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		if err != nil {
 			if isTLSFailure(err) {
 				banTLSExit(proxy)
-			} else {
+			} else if noteExitTransportErr(proxy) {
 				dropProxy(proxy)
+			} else {
+				lane = laneFailover(lane)
+				*sessionID = laneSession(lane)
 			}
 			if zenDialDead(err) {
 				dialDeadErr, dialDeadProxy = err, proxy
@@ -2207,7 +2226,9 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		}
 		if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 			up.Body.Close()
-			dropProxy(proxy)
+			noteExit429(proxy, nbModel)
+			lane = laneFailover(lane)
+			*sessionID = laneRotate(lane, nbModel)
 			rotating = true
 			zenBackoffCtx(r.Context(), zenRetries)
 			continue
@@ -3082,7 +3103,7 @@ func dedupeGuardrails() {
 		sigAll = append(sigAll, sigTokens(gn)...)
 		out = append(out, guardrailPat{
 			norm:  gn,
-			sig:   sigAll[at:len(sigAll)],
+			sig:   sigAll[at:],
 			gnLen: len(strings.Fields(gn)),
 		})
 	}
@@ -3541,6 +3562,13 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// reject an oversized body before taking a slot or reading it: a
+	// truncated read would only surface as a confusing json error.
+	if r.ContentLength > bodyLimit {
+		acclog.Printf("!! 413 body-too-large %s %s (%d bytes)", r.Method, logSafe(r.URL.Path), r.ContentLength)
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large (max 10MB)")
+		return
+	}
 	if used, limit := p.semStats(); used >= limit {
 		acclog.Printf("%s ... all %d slots busy, queueing", reqID, limit)
 	}
@@ -3564,7 +3592,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		<-readCtx.Done()
 		r.Body.Close()
 	}()
-	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit))
+	body, err := io.ReadAll(io.LimitReader(r.Body, bodyLimit+1))
 	if err != nil {
 		if readCtx.Err() != nil {
 			acclog.Printf("!! 408 body-read-timeout %s %s", r.Method, logSafe(r.URL.Path))
@@ -3576,6 +3604,11 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body.Close()
+	if len(body) > bodyLimit {
+		acclog.Printf("!! 413 body-too-large %s %s", r.Method, logSafe(r.URL.Path))
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large (max 10MB)")
+		return
+	}
 
 	if cfg().Inject.Params {
 		injectParams(&body)
@@ -3716,7 +3749,7 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"nvidia backend is disabled; set nvidia.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
 		return
 	}
-	if len(p.keys) == 0 {
+	if p.keyCount() == 0 {
 		acclog.Printf("<- 503 %s %s model=%s (keyless: no nvidia keys)", r.Method, r.URL.Path, model)
 		http.Error(w, `{"error":"no nvidia keys configured; use an opencode/<model> free model or add nvidia_keys to config.yml"}`, http.StatusServiceUnavailable)
 		return
@@ -3770,8 +3803,9 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 	var retries int
 	var rateLimited bool
 	sticky := p.stickyKey(model)
+	keyCount := p.keyCount()
 
-	for attempt := 0; attempt < max(len(p.keys)*2+2, 4); attempt++ {
+	for attempt := 0; attempt < max(keyCount*2+2, 4); attempt++ {
 		key := p.PickSticky(exclude, model, sticky)
 		if key == nil {
 			if attempt < 3 {
@@ -4077,30 +4111,22 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if zenRetries > 0 && maybeRefreshStalePool(lane) {
 			sessionID = laneSession(lane)
 		}
-		// retries land on a fresh lane, so re-pacing only stacks the
-		// first send's gap onto the retry. first attempt still paces.
-		if zenRetries == 0 {
-			laneGate(r.Context(), lane)
-		}
-		// client gone while pacing: stop before burning an exit.
-		if r.Context().Err() != nil {
-			acclog.Printf("!! opencode client disconnected model=%s (paced)", model)
-			http.Error(w, `{"error":"client disconnected"}`, 499)
-			return
-		}
 		proxy := ""
 		if zenRetries == 0 {
 			proxy = laneProxyFor(lane, realModel)
 			if proxy == "" && laneNeedsProxy(lane) {
-				// this lane holds no exit: wait for one to be drawable
-				// instead of going direct, which always_proxy already ruled
-				// out and an escalated lane already proved burned.
+				// this lane holds no exit: wait up to 30s for one to be drawable
+				// instead of going direct or failing immediately.
 				nl, p := laneProxyWait(r.Context(), lane, realModel, &poolRecoverUntil)
 				if nl != lane {
 					lane = laneHandoff(lane, nl)
 					sessionID = laneSession(lane)
 				}
 				if p == "" {
+					if !time.Now().Before(recoverDeadline(&poolRecoverUntil)) {
+						writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
+						return
+					}
 					continue
 				}
 				proxy = p
@@ -4118,12 +4144,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				proxy = p
 			}
 			if proxy == "" && laneNeedsProxy(lane) {
-				// no exit left to hand out (every one taken, written off,
-				// or the pool drained). when the last attempt was a
-				// refused dial, that error is the honest answer: a bare
-				// "no proxy available" hides what actually happened.
-				if dialDeadErr != nil {
-					acclog.Printf("  opencode dial-dead %s, no distinct exit left for lane %s, ending retry ladder: %v", redactProxyUserinfo(dialDeadProxy), lane.id, dialDeadErr)
+				if !time.Now().Before(recoverDeadline(&poolRecoverUntil)) {
 					writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
 					return
 				}
@@ -4150,6 +4171,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				return
 			}
 			cl = zenClient(proxy)
+		}
+		// enforce 1.5s minimum gap per exit and lane on every send.
+		exitGate(r.Context(), lane, proxy)
+		if r.Context().Err() != nil {
+			acclog.Printf("!! opencode client disconnected model=%s (paced)", model)
+			http.Error(w, `{"error":"client disconnected"}`, 499)
+			return
 		}
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 		if err != nil {
@@ -4183,6 +4211,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			hp := laneProxyFor(hl, realModel)
 			if hp == "" || hp == proxy {
 				return nil, fmt.Errorf("no distinct zen hedge exit")
+			}
+			exitGate(hctx, hl, hp)
+			if hctx.Err() != nil {
+				return nil, hctx.Err()
 			}
 			hcl := zenClient(hp)
 			hreq, herr := http.NewRequestWithContext(hctx, r.Method, target, bytes.NewReader(body))
@@ -4226,7 +4258,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		if err == nil && !firstByteAt.IsZero() {
 			fb := firstByteAt.Sub(sendStart)
 			noteExitRTT(proxy, float64(fb.Milliseconds()))
-			if fb > 6*time.Second {
+			if fb > 15*time.Second {
 				noteExitSlow(proxy)
 			}
 		}
@@ -4238,14 +4270,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				// mitm exit: ban it pool-wide and evacuate every pinned
 				// lane, not just this one.
 				banTLSExit(proxy)
-			} else {
-				dropProxy(proxy)
+			} else if noteExitTransportErr(proxy) {
 				// same stale-pin trap as the anthropic path: a dropped
 				// exit still pinned here must not eat every retry.
 				if laneReproxy(lane, realModel) == proxy {
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, realModel)
 				}
+			} else {
+				lane = laneHandoff(lane, laneFailover(lane))
+				sessionID = laneSession(lane)
 			}
 			if zenDialDead(err) {
 				dialDeadErr, dialDeadProxy = err, proxy
@@ -4258,6 +4292,13 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if !zenLastRetry(zenRetries, attempts) {
 				zenBackoffCtx(r.Context(), zenRetries)
 				continue
+			}
+			// a refused exit dial is pool state, not an upstream answer: the
+			// other ladders end it as proxy capacity, and the caller's move is
+			// to retry against us instead of reading a socks error.
+			if dialDeadErr != nil {
+				writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
+				return
 			}
 			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %s", err))
 			return
@@ -4309,7 +4350,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			resp.Body.Close()
 			acclog.Printf("  opencode exit failed %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, rotating exit+session",
 				st, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
-			dropProxy(proxy)
+			if noteExitTransportErr(proxy) {
+				dropProxy(proxy)
+			}
 			if zenLastRetry(zenRetries, attempts) {
 				// same extension as the 429 path: a refill replaces the dead
 				// exits the ladder just spent itself on.
@@ -4379,15 +4422,25 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if zenFreeTierBlocked(eb) {
 				acclog.Printf("  opencode free-tier-blocked %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, switching lane",
 					resp.StatusCode, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
-				// per-model refusal, not a dead exit: it still serves other
-				// models, so it stays in the pool and the lane rotates off it.
-				noteExitModelBurned(proxy, realModel)
+				if zenGateIPBlocked(eb) {
+					// the IP itself is capped/blocked: park the exit for a
+					// cooldown and rotate the lane onto a fresh one.
+					noteExitGate(proxy)
+				} else {
+					// request-shape refusal: the exit still serves other
+					// shapes, so it keeps its seat and only this model is burnt.
+					noteExitModelBurned(proxy, realModel)
+				}
 				if proxy == "" {
 					laneEscalate(lane, realModel) // direct is flagged: give the lane an exit
 				}
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
+				// keep the refusal body on resp: the branch continues with
+				// resp.Body already closed, and a ladder that ends here must
+				// still hand the caller zen's own answer.
+				resp.Body = io.NopCloser(bytes.NewReader(eb))
 				if noteZenFreeTierErr() {
 					acclog.Printf("  %d+ free-tier blocks, refreshing proxy pool", zenErrorThreshold())
 					refreshZenProxiesAsync(false)
@@ -5054,8 +5107,16 @@ func sanitizeZenChatMessages(m map[string]any) {
 			}
 			if len(kc) > 0 {
 				cp["tool_calls"] = kc
+				if _, hasRC := cp["reasoning_content"]; !hasRC {
+					cp["reasoning_content"] = ""
+				}
 			} else {
 				delete(cp, "tool_calls")
+				// same fill as the plain-assistant branch below, so a
+				// stripped dangling turn does not differ on a second pass.
+				if _, hasRC := cp["reasoning_content"]; !hasRC {
+					cp["reasoning_content"] = ""
+				}
 			}
 			out = append(out, cp)
 			for _, ri := range emitIdx[i] {
@@ -5063,9 +5124,61 @@ func sanitizeZenChatMessages(m map[string]any) {
 			}
 			continue
 		}
+		if rm["role"] == "assistant" {
+			if _, hasRC := rm["reasoning_content"]; !hasRC {
+				cp := map[string]any{}
+				for k, v := range rm {
+					cp[k] = v
+				}
+				cp["reasoning_content"] = ""
+				out = append(out, cp)
+				continue
+			}
+		}
 		out = append(out, r)
 	}
+	dropZenFileParts(out)
 	m["messages"] = out
+}
+
+// dropZenFileParts turns file parts into a text placeholder. zen's chat
+// gateway accepts only text and image_url parts, so a document block (a pdf
+// attachment) 400s the whole request with "[invalid_value] content part type
+// \"file\" is not supported". the bytes cannot be forwarded, so say so
+// instead of losing the turn.
+func dropZenFileParts(msgs []any) {
+	for _, raw := range msgs {
+		rm, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := rm["content"].([]any)
+		if !ok {
+			continue
+		}
+		dropped := false
+		kept := make([]any, 0, len(parts))
+		for _, p := range parts {
+			pm, ok := p.(map[string]any)
+			if !ok {
+				kept = append(kept, p)
+				continue
+			}
+			if t, _ := pm["type"].(string); t == "file" || t == "input_file" {
+				dropped = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if !dropped {
+			continue
+		}
+		kept = append(kept, map[string]any{
+			"type": "text",
+			"text": "[attachment dropped: this upstream accepts text and images only]",
+		})
+		rm["content"] = kept
+	}
 }
 
 // captureRequest dumps an inbound POST to /tmp/oc-capture so real client
@@ -5107,6 +5220,7 @@ func captureRequest(r *http.Request) {
 func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 	type tcall struct{ id, name, args string }
 	var content strings.Builder
+	var reasoning strings.Builder
 	calls := map[int]*tcall{}
 	var order []int
 	finish := "stop"
@@ -5123,8 +5237,10 @@ func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 		var ch struct {
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					Reasoning        string `json:"reasoning"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Function struct {
@@ -5145,6 +5261,11 @@ func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 		}
 		for _, c := range ch.Choices {
 			content.WriteString(c.Delta.Content)
+			if c.Delta.Reasoning != "" {
+				reasoning.WriteString(c.Delta.Reasoning)
+			} else if c.Delta.ReasoningContent != "" {
+				reasoning.WriteString(c.Delta.ReasoningContent)
+			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
 				finish = *c.FinishReason
 			}
@@ -5166,6 +5287,9 @@ func sseToNonStream(rb []byte, model string, tnames toolNames) []byte {
 		}
 	}
 	msg := map[string]any{"role": "assistant", "content": stripWaitSentinel(content.String())}
+	if rStr := stripWaitSentinel(reasoning.String()); rStr != "" {
+		msg["reasoning_content"] = rStr
+	}
 	if len(order) > 0 {
 		arr := make([]any, 0, len(order))
 		for _, idx := range order {
@@ -5542,6 +5666,7 @@ func runProbe() {
 
 			r.attempts = append(r.attempts, int(elapsed))
 
+			var errBody string
 			if resp.StatusCode == 429 {
 				var cd string
 				if v, ok := rh["Retry-After"]; ok {
@@ -5559,9 +5684,9 @@ func runProbe() {
 				fmt.Printf(".")
 			} else {
 				r.errs++
-				bodyStr := strings.TrimSpace(string(rb))
-				if len(bodyStr) > 200 {
-					bodyStr = bodyStr[:200]
+				errBody = strings.TrimSpace(string(rb))
+				if len(errBody) > 200 {
+					errBody = errBody[:200]
 				}
 				r.tokens = append(r.tokens, 0)
 				fmt.Printf("%d", resp.StatusCode)
@@ -5580,6 +5705,7 @@ func runProbe() {
 				TotalTokens:      prompT + compT,
 				RetryAttempt:     i,
 				RateLimited:      resp.StatusCode == 429,
+				Error:            errBody,
 				ContentBytes:     int64(len(body)),
 				Headers:          rh,
 			}

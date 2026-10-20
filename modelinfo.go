@@ -137,22 +137,6 @@ func lookupModelInfo(id string) *modelInfoEntry {
 	return withOROverlay(id, nil)
 }
 
-// lookupModelInfoExact finds an entry without [1m] alias resolution:
-// exact, then with the nvidia/ prefix stripped.
-func lookupModelInfoExact(id string) *modelInfoEntry {
-	modelInfoMu.RLock()
-	defer modelInfoMu.RUnlock()
-	if e, ok := modelInfo[id]; ok {
-		return withOROverlay(id, &e)
-	}
-	if s := strings.TrimPrefix(id, "nvidia/"); s != id {
-		if e, ok := modelInfo[s]; ok {
-			return withOROverlay(id, &e)
-		}
-	}
-	return withOROverlay(id, nil)
-}
-
 // baseModelID strips the trailing [1m] context alias: ("<id>[1m]", "<id>",
 // true), "" when the id carries no such suffix.
 func baseModelID(id string) (string, bool) {
@@ -207,22 +191,6 @@ func modelModality(id string) string {
 	return "text->text"
 }
 
-// modelSupportsParam reports whether the model accepts a request parameter
-// (openrouter list). false when no record exists, so callers must not treat
-// it as "rejected upstream". covered by TestModelReasoningAndParams.
-func modelSupportsParam(id, param string) bool {
-	e := lookupModelInfo(id)
-	if e == nil || len(e.SupportedParams) == 0 {
-		return false
-	}
-	for _, p := range e.SupportedParams {
-		if p == param {
-			return true
-		}
-	}
-	return false
-}
-
 // modelFreepiReasoning reports whether the free-pi gateway declares the
 // model reasoning-capable. the entry's top-level reasoning flag describes
 // the underlying model, not the served contract: freepi_declared_reasoning
@@ -232,15 +200,6 @@ func modelFreepiReasoning(id string) bool {
 		return e.FreepiReasoning
 	}
 	return false
-}
-
-// modelFreepiInputs are the inputs the free-pi gateway declares. same
-// served-contract rule as reasoning: declared wins for freeepi/ ids.
-func modelFreepiInputs(id string) []string {
-	if e := lookupModelInfo(id); e != nil && e.FreepiInputs != nil {
-		return e.FreepiInputs
-	}
-	return nil
 }
 
 // modelServedCtx is the window the proxy layer itself serves: freepi runs
@@ -259,16 +218,6 @@ func modelServedMaxOut(id string) int {
 		return e.FreepiMaxOut
 	}
 	return modelMaxOut(id)
-}
-
-// modelIsReasoning reports whether the model reasons. an explicit false or a
-// null (unknown-provider entry) both mean "not a reasoning model"; the
-// zero value from a missing entry is unknown, so check the entry too.
-func modelIsReasoning(id string) bool {
-	if e := lookupModelInfo(id); e != nil && e.Reasoning != nil {
-		return *e.Reasoning
-	}
-	return false
 }
 
 // modelEffortLevels returns the accepted reasoning_effort values, in order.

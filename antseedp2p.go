@@ -269,10 +269,6 @@ func antEncodeFreeMetadata(in, out, reqs uint64, svcs []antServiceUsage) []byte 
 	return append(head, tail...)
 }
 
-func antFreeMetadataHash(in, out, reqs uint64, svcs []antServiceUsage) []byte {
-	return antKeccak(antEncodeFreeMetadata(in, out, reqs, svcs))
-}
-
 // --- frame codec ---
 
 func antEncodeFrame(typ byte, msgID uint32, payload []byte) []byte {
