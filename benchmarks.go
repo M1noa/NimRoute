@@ -307,10 +307,13 @@ func peelDateStamp(s string) string {
 // dropped when a same-provider sibling in the same family is not older,
 // not smaller, and strictly better in version or size; equal twins stay.
 // ids without a version token are never compared, so embedded-lead-digit
-// names like qwen3.8-27b keep every row.
+// names like qwen3.8-27b keep every row. tier suffixes (lite, mini, pro,
+// turbo) are their own families: flash-lite is a cheaper model, not an
+// older flash.
 
 var variantVerRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)v?$`)
 var variantSizeRe = regexp.MustCompile(`^(\d+)b$`)
+var variantTierWords = map[string]bool{"lite": true, "mini": true, "pro": true, "turbo": true}
 
 type variantRow struct {
 	pref string
@@ -356,6 +359,12 @@ func parseVariantRow(id string) (variantRow, bool) {
 			if n > row.size {
 				row.size = n
 			}
+			continue
+		}
+		if variantTierWords[t] {
+			// first tier suffix only; it takes the row out of the plain family
+			row.fam += "-" + t
+			break
 		}
 	}
 	return row, true

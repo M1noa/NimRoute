@@ -508,7 +508,9 @@ usage:
 models:
   # hide minor refreshes and small sizes of a family's lead model from the
   # /v1/models listing (uno/glm-4.5-flash:free hides behind
-  # uno/glm-5.3-flash-search:free). set false to list everything raw.
+  # uno/glm-5.3-flash-search:free). tier suffixes (lite/mini/pro/turbo)
+  # stay their own entries: gemini-3.5-flash-lite is a cheaper model,
+  # not an older flash. set false to list everything raw.
   dedup_variants: true
   # per-model nudge override: one extra reprompt round for tool-less
   # answers. glob on the model id, first match wins. beats model_info.jsonc
