@@ -109,15 +109,11 @@ func zenVersionStr() string {
 	return zenVersion
 }
 
-// the ai-sdk suffix the real client appends to its own User-Agent: the
-// provider-utils version it runs and the js runtime underneath it.
-const (
-	zenSDKVersion = "4.0.23"
-	zenRuntime    = "bun/1.3.14"
-)
-
+// zenUserAgent is the whole User-Agent the client sends: nothing else is
+// appended. v1.19.3 has `const USER_AGENT = opencode/${InstallationVersion}`
+// in session/llm/request.ts; there is no ai-sdk or runtime suffix.
 func zenUserAgent() string {
-	return "opencode/" + zenVersionStr() + " ai-sdk/provider-utils/" + zenSDKVersion + " runtime/" + zenRuntime
+	return "opencode/" + zenVersionStr()
 }
 
 // fetchOpenCodeVersion pulls the latest opencode release tag from the GitHub

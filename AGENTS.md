@@ -29,12 +29,14 @@ incidental machinery.
   mimics the real opencode client (`setZenHeaders` in anthropic.go):
   `Authorization: Bearer public`, `x-opencode-client: cli`,
   `x-opencode-session: ses_*` + `x-opencode-session-id` (same descending
-  id) + `x-session-affinity`, `x-opencode-project: global`,
-  `User-Agent: opencode/<version> ai-sdk/provider-utils/4.0.23
-  runtime/bun/1.3.14` (live tag from anomalyco/opencode releases — the
-  repo moved off sst/ — refreshed every 6h, default in zenproxy.go).
-  `x-opencode-request` carries a fresh descending-id message id per
-  attempt (`zenMessageID`), as the installed 1.19.x client does.
+  id), `x-opencode-project: global`, bare `User-Agent: opencode/<version>`
+  (live tag from anomalyco/opencode releases — the repo moved off sst/ —
+  refreshed every 6h, default in zenproxy.go). source of truth is the
+  released v1.19.3 `session/llm/request.ts`, which branches on providerID:
+  opencode models get this set with no `ai-sdk`/`runtime` suffix, and
+  `x-session-affinity` + `X-Session-Id` belong to the *other* branch, so
+  they are not sent. `x-opencode-request` carries a fresh descending-id
+  message id per attempt (`zenMessageID`), as the installed 1.19.x client does.
   (`anthropic-version` is NOT
   sent; an earlier doc revision claimed it.) muse-spark models use
   `/responses`, everything else `/chat/completions`; shape follows the

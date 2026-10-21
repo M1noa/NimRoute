@@ -2398,22 +2398,20 @@ func zenMessageID() string {
 }
 
 // setZenHeaders applies the header set the real opencode client sends to zen.
-// source of truth is the live client capture (packages/core/src/session/
-// model-request.ts): authorization Bearer public, x-opencode-client: cli,
-// the session identity in both x-opencode-session and x-opencode-session-id
-// plus x-session-affinity, x-opencode-project, and the bare
-// `opencode/<channel>/<version>/<name>` User-Agent. the free-tier gate on
-// /inference/v1 needs the two session ids and drops a request whose session
-// value is not a descending opencode id (ses_ + 12 hex time + 14 base62), so
-// every session here comes from zenSession(). x-opencode-request is
-// deliberately absent: the current client does not send it.
+// source of truth is v1.19.3 session/llm/request.ts, whose headers branch on
+// providerID: opencode models get x-opencode-project, x-opencode-session,
+// x-opencode-request (the user message id), x-opencode-client and the bare
+// `opencode/<version>` User-Agent. x-session-affinity and X-Session-Id belong
+// to the *other* branch (non-opencode providers) and are not sent here.
+// the free-tier gate on /inference/v1 drops a request whose session value is
+// not a descending opencode id (ses_ + 12 hex time + 14 base62), so every
+// session here comes from zenSession().
 func setZenHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("x-opencode-session-id", sessionID)
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", sessionID)
-	req.Header.Set("x-session-affinity", sessionID)
 	req.Header.Set("x-opencode-request", zenMessageID())
 	req.Header.Set("x-opencode-project", "global")
 	req.Header.Set("User-Agent", zenUserAgent())
