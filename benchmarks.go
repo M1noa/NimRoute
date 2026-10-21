@@ -589,7 +589,8 @@ type benchSummary struct {
 // benchBackends are the id prefixes the backends list under. note the
 // spelling: freepi's *backend* name is "freepi" but its *id* prefix is
 // "freeepi/". anything else (bare nim keys like z-ai/glm-5.3) is nvidia.
-var benchBackends = []string{"opencode", "freeepi", "antseed", "nous"}
+var benchBackends = []string{"opencode", "freeepi", "antseed", "nous",
+	"uno", "openrouter"}
 
 func benchBackendOf(id string) string {
 	if i := strings.Index(id, "/"); i > 0 {
@@ -715,6 +716,21 @@ func servedBenchIDs(known map[string]bool) []string {
 		add("antseed/" + m)
 	}
 	antMu2.Unlock()
+	if unoEnabled() {
+		for _, m := range unoModels() {
+			add("uno/" + m.ID)
+		}
+	}
+	if orChatEnabled() {
+		for _, m := range orChatModels() {
+			add("openrouter/" + m.ID)
+		}
+	}
+	if nousEnabled() {
+		for _, m := range nousFreeModels() {
+			add("nous/" + m.ID)
+		}
+	}
 	sort.Strings(out)
 	return out
 }

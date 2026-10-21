@@ -241,18 +241,20 @@ type unoConfig struct {
 type routeConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Strategy picks the attempt order: priority (opencode, antseed,
-	// freepi, nvidia), latency (fastest measured first), race (all at
-	// once, first 200 wins), random (shuffled). unknown falls to priority.
+	// freepi, nvidia, uno, openrouter, nous), latency (fastest measured
+	// first), race (all at once, first 200 wins), random (shuffled).
+	// unknown falls to priority.
 	Strategy string `yaml:"strategy"`
-	// IncludeFreepi admits freepi candidates. off by default: the free-pi
-	// gateway serves a smaller window than the underlying models.
+	// IncludeFreepi admits freepi candidates. on by default: every live
+	// backend takes part in the fold; turn it off when freepi's ad tier
+	// window should stay out of shared routes.
 	IncludeFreepi bool `yaml:"include_freepi"`
 	// MinOccurrences is how many backends must serve a model for it to get
 	// a route/ id. default 2: a route only exists when there is actually a
 	// fallback. 1 = every shared model routes, even single-backend ones.
 	MinOccurrences int `yaml:"min_occurrences"`
 	// ExcludeProviders drops backends from every route (opencode,
-	// antseed, freepi, nvidia).
+	// antseed, freepi, nvidia, uno, openrouter, nous).
 	ExcludeProviders []string `yaml:"exclude_providers"`
 	// ExcludeModels drops route ids by glob ("*muse-spark*").
 	ExcludeModels []string `yaml:"exclude_models"`
@@ -455,6 +457,7 @@ func defaultConfig() appConfig {
 		Route: routeConfig{
 			Enabled:        true,
 			Strategy:       "priority",
+			IncludeFreepi:  true,
 			MinOccurrences: 2,
 		},
 		Benchmarks: benchmarksConfig{

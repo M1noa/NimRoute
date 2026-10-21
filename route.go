@@ -14,20 +14,25 @@ import (
 )
 
 // route backend: one name fans out across providers in strategy order.
-// route/<key> tries opencode, antseed, freepi, nvidia in turn (or by
-// strategy), first 200 wins. keys match strictly: lowercase, one trailing
-// -free stripped from opencode ids, nvidia ids keep the org prefix.
+// route/<key> tries opencode, antseed, freepi, nvidia, uno, openrouter,
+// nous in turn (or by strategy), first 200 wins. keys match strictly:
+// lowercase, one trailing -free stripped from opencode ids, one trailing
+// :free stripped from uno/openrouter ids, nvidia ids keep the org prefix.
 
 // routeBackends is the fixed priority order.
-var routeBackends = []string{"opencode", "antseed", "freepi", "nvidia"}
+var routeBackends = []string{"opencode", "antseed", "freepi", "nvidia",
+	"uno", "openrouter", "nous"}
 
 // routeKey normalizes one backend model id to its route name: lowercase,
 // opencode's single trailing -free dropped. nvidia ids keep the org slash,
 // so "route/moonshotai/kimi-k3" stays exact.
 func routeKey(backend, id string) string {
 	k := strings.ToLower(strings.TrimSpace(id))
-	if backend == "opencode" {
+	switch backend {
+	case "opencode": // opencode lists both base and -free ids for one model
 		k = strings.TrimSuffix(k, "-free")
+	case "uno", "openrouter": // keyed catalogs carry vendor/model:free rows
+		k = strings.TrimSuffix(k, ":free")
 	}
 	return k
 }
@@ -63,6 +68,12 @@ func routeBackendLive(backend string, p *Pool) bool {
 		return freepiEnabled()
 	case "nvidia":
 		return cfg().Nvidia.Enabled && p.keyCount() > 0
+	case "uno":
+		return unoEnabled()
+	case "openrouter":
+		return orChatEnabled()
+	case "nous":
+		return nousEnabled()
 	}
 	return false
 }
@@ -189,6 +200,21 @@ func buildRouteTable(p *Pool) routeTable {
 			add("nvidia", id)
 		}
 		modelInfoMu.RUnlock()
+	}
+	if !routeBackendOff("uno") && unoEnabled() {
+		for _, m := range unoModels() {
+			add("uno", m.ID)
+		}
+	}
+	if !routeBackendOff("openrouter") && orChatEnabled() {
+		for _, m := range orChatModels() {
+			add("openrouter", m.ID)
+		}
+	}
+	if !routeBackendOff("nous") && nousEnabled() {
+		for _, m := range nousFreeModels() {
+			add("nous", m.ID)
+		}
 	}
 	min := cfg().Route.MinOccurrences
 	if min < 1 {
@@ -421,6 +447,19 @@ func (p *Pool) dispatchRouteOAI(w http.ResponseWriter, r *http.Request, body []b
 		p.handleFreepi(w, r, body, cand, isStream, start, reqID)
 	case "antseed":
 		p.handleAntseed(w, r, body, cand, isStream, start, reqID)
+	case "uno", "openrouter", "nous": // keyed handlers expect the bare id in and on the body
+		nb := body
+		if b, err := setReqModel(body, id); err == nil {
+			nb = b
+		}
+		switch backend {
+		case "uno":
+			p.keyedChat(w, r, nb, id, isStream, start, reqID, unoBackend)
+		case "openrouter":
+			p.keyedChat(w, r, nb, id, isStream, start, reqID, orChatBackend)
+		default:
+			p.handleNous(w, r, nb, id, isStream, start, reqID)
+		}
 	default: // nvidia: strip the listing prefix, keep the bare id upstream
 		nb := body
 		if b, err := setReqModel(body, id); err == nil {
@@ -505,6 +544,19 @@ func (p *Pool) dispatchRouteAnthropic(w http.ResponseWriter, r *http.Request, bo
 		p.handleFreepiAnthropic(w, r, oaiBody, clientModel, cand, tnames, isStream, start, reqID)
 	case "antseed":
 		p.handleAntseedAnthropic(w, r, oaiBody, clientModel, cand, tnames, isStream, start, reqID)
+	case "uno", "openrouter", "nous": // keyed handlers expect the bare id in and on the body
+		nb := oaiBody
+		if b, err := setReqModel(oaiBody, id); err == nil {
+			nb = b
+		}
+		switch backend {
+		case "uno":
+			p.keyedChatAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID, unoBackend)
+		case "openrouter":
+			p.keyedChatAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID, orChatBackend)
+		default:
+			p.handleNousAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID)
+		}
 	default: // nvidia: strip the listing prefix, keep the bare id upstream
 		nb := oaiBody
 		if b, err := setReqModel(oaiBody, id); err == nil {

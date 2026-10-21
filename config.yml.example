@@ -417,15 +417,18 @@ antseed:
 
 # --- route: one name across providers (route/<model>) ---
 # route/muse-spark-1.3-contributor tries opencode/muse-spark-1.3-contributor-free,
-# then antseed, freepi, nvidia sellers of the same model. keys match strictly:
-# lowercase, one trailing -free dropped from opencode ids. nvidia ids keep the
-# org prefix (route/moonshotai/kimi-k3). every shared model routes by default.
+# then antseed, freepi, nvidia, uno, openrouter, nous sellers of the same
+# model. keys match strictly: lowercase, one trailing -free dropped from
+# opencode ids, one trailing :free dropped from uno/openrouter ids. nvidia
+# ids keep the org prefix (route/moonshotai/kimi-k3). every shared model
+# routes by default.
 route:
   enabled: true          # false = route/* 503s, hidden from /v1/models
-  strategy: "priority"   # priority (opencode, antseed, freepi, nvidia) |
-                         # latency (fastest measured first) | race (all at
-                         # once, first 200 wins, losers cancelled) | random
-  include_freepi: false  # freepi joins routes. off: its gateway window is
+  strategy: "priority"   # priority (opencode, antseed, freepi, nvidia, uno,
+                         # openrouter, nous) | latency (fastest measured
+                         # first) | race (all at once, first 200 wins, losers
+                         # cancelled) | random
+  include_freepi: true   # freepi joins routes. off: its gateway window is
                          # smaller than the underlying models.
   min_occurrences: 2     # backends that must serve a model for a route id.
                          # 2 = a route only exists when fallback is real.

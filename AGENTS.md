@@ -294,3 +294,55 @@ retry logic).
   `scan.go` vault/scan cache, `wordpiece.go` tokenizer, `ner_ort.go`
   behind `-tags ner`). lane eviction must not evict vault entries
   (different TTLs); scan-cache idle sweep via `pii.SweepScanIdle`.
+
+## 8. adding a new provider
+
+A provider is done when a caller can request it directly, through
+route, and see it in `/status` and `./nim status` — a backend wired
+into only one of those is half-built. checklist (one bullet per chat
+endpoint unless the provider is NIM-style direct upstream):
+
+- **config**: struct fields in `config.go` + defaults in
+  `defaultConfig()` + documented keys in `config.yml.example`. keys go
+  to the user's `config.yml` only; the example gets placeholder
+  comments. an `enabled()` helper gates everything else (see
+  `unoEnabled`, `orChatEnabled`, `nousEnabled` — enginess keyed on the
+  key pool length, not a bare flag).
+- **request path**: `ServeHTTP` (main.go) prefix branch stripping
+  `<prefix>/` + a matching branch in `handleAnthropic` (anthropic.go) —
+  both dispatch tables carry the prefix or half the clients break.
+- **dispatch**: chat handlers in a provider file (see `uno.go`,
+  `openrouter.go`, `nous.go`) plus the openai and anthropic variants if
+  the catalog is openai-shaped; anthropic-shaped catalogs feed
+  `handleAnthropic` directly. new backends that are openai-compatible
+  with a key pool reuse `keyedchat.go` (`keyedChat` /
+  `keyedChatAnthropic`).
+- **route**: `route.go` — `routeBackends` append + the three
+  conversions: `dispatchRouteOAI` and `dispatchRouteAnthropic` cases
+  (re-set the bare model id on the body before the handler call), and
+  `routeBackendLive` wired to the `enabled()` helper. `routeKey` strips
+  catalog suffixes (`:free`, `-free`) only when the backend lists both
+  base and suffixed rows for one model.
+- **debugtrace**: `backendForModel` (debugtrace.go) needs the prefix
+  case or traces mislabel the backend.
+- **config.yml.example wiring**: the example is the schema source of
+  truth; every new key gets a commented line there. nothing extra:
+  `mergeMissingKeys` appends absent keys to the user file automatically
+  on restart.
+- **/status**: `Status()` builds a section, `StatusFor()` gates it
+  behind `status.show_*` + redaction per section 4. naked key content
+  never reaches `/status` or logs.
+- **models list**: serve ids on `/v1/models`; catalog cache TTL
+  pattern from `uno.go` (hot reload, closed-stale on fetch failure).
+- **bench + AA scoring**: `benchBackends` (benchmarks.go) prefix +
+  `servedBenchIDs` seed so scoring works before the first live hit;
+  model ids matching bench rows use `benchFor(id)` (normModelID folds
+  `:free`/`-free` and vendor-qualified ids).
+- **`.nim` service**: nothing unless the provider needs auth setup
+  (`./nim freepi auth` pattern for interactive logins).
+- **docs**: `docs/service.md` copy for any new user-facing command.
+
+verify before commit: green per section 2, then a scratch-port run
+(`CONFIG_FILE=config.test.yml`, port in `server.port`, own
+`usage:` block, delete after) exercising direct dispatch, one
+route/<model> request, and `/status`.
