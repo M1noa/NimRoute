@@ -1273,7 +1273,7 @@ func antseedSnapshot() *antseedSummary {
 		sum.IDAge = time.Since(antIDBorn).Round(time.Second).String()
 	}
 	antBornMu.Unlock()
-	sum.Models = antSortedModels(sum.Models)
+	sum.Models = antSortedModels(foldStatusIDs("antseed/", sum.Models))
 	return sum
 }
 

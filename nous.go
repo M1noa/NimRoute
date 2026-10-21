@@ -660,6 +660,6 @@ func nousSnapshot() *nousSummary {
 	for _, m := range nousFreeModels() {
 		sum.Models = append(sum.Models, m.ID)
 	}
-	sum.Models = foldVariantIDs("nous/", sum.Models)
+	sum.Models = foldStatusIDs("nous/", sum.Models)
 	return sum
 }

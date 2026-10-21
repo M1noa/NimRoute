@@ -313,34 +313,38 @@ func peelDateStamp(s string) string {
 
 var variantVerRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)v?$`)
 var variantSizeRe = regexp.MustCompile(`^(\d+)b$`)
+var variantSizeAnyRe = regexp.MustCompile(`^(?:a)?(\d+)b$`)
 var variantTierWords = map[string]bool{"lite": true, "mini": true, "pro": true, "turbo": true}
 
 type variantRow struct {
 	pref string
-	fam  string
-	ver  []int // nil = no version token
-	size int   // biggest plain b-suffix token after the version token
+	fam  string // legacy key: tokens before the version, first tier suffix
+	full string // status key: whole name shape minus version and size tokens
+	ver  []int  // nil = no version token
+	size int    // biggest plain b-suffix token after the version token
+	// like size, but aNb (gemma a4b active-param) tokens count too
+	sizeFull int
 }
 
-// parseVariantRow splits one listing id into provider prefix, family, and
-// version/size facts; ok=false marks rows dedupVariants never compares.
-func parseVariantRow(id string) (variantRow, bool) {
+// variantPrefixes are the keyed listings the /v1/models fold compares.
+var variantPrefixes = []string{"openrouter/", "uno/", "nous/"}
+
+// parseVariantFields splits one listing id into provider prefix, keys, and
+// version/size facts. any provider works; the caller picks the scope.
+func parseVariantFields(id string) variantRow {
 	var row variantRow
-	for _, p := range []string{"openrouter/", "uno/", "nous/"} {
-		if strings.HasPrefix(id, p) {
-			row.pref = p
-			break
-		}
-	}
-	if row.pref == "" {
-		return row, false
+	if i := strings.IndexByte(id, '/'); i >= 0 {
+		row.pref = id[:i+1]
 	}
 	rest := strings.TrimSuffix(id[len(row.pref):], ":free")
 	toks := strings.Split(rest, "-")
 	vi := -1
+	vsuffixed := false
 	for i, t := range toks {
 		if m := variantVerRe.FindStringSubmatch(t); m != nil {
 			vi = i
+			// a v affix marks a vision/build line (glm-4.6v, deepseek-v4)
+			vsuffixed = strings.HasPrefix(t, "v") || strings.HasSuffix(t, "v")
 			for _, seg := range strings.Split(m[1], ".") {
 				n, _ := strconv.Atoi(seg)
 				row.ver = append(row.ver, n)
@@ -350,9 +354,27 @@ func parseVariantRow(id string) (variantRow, bool) {
 	}
 	if vi < 0 {
 		// unversioned: the whole id is its own identity
-		return row, true
+		return row
 	}
 	row.fam = strings.Join(toks[:vi], "-")
+	name := make([]string, 0, len(toks))
+	for k, t := range toks {
+		if k == vi {
+			continue
+		}
+		if m := variantSizeAnyRe.FindStringSubmatch(t); m != nil {
+			n, _ := strconv.Atoi(m[1])
+			if n > row.sizeFull {
+				row.sizeFull = n
+			}
+			continue
+		}
+		name = append(name, t)
+	}
+	row.full = strings.Join(name, "-")
+	if vsuffixed {
+		row.full += "-v"
+	}
 	for _, t := range toks[vi:] {
 		if m := variantSizeRe.FindStringSubmatch(t); m != nil {
 			n, _ := strconv.Atoi(m[1])
@@ -367,7 +389,19 @@ func parseVariantRow(id string) (variantRow, bool) {
 			break
 		}
 	}
-	return row, true
+	return row
+}
+
+// parseVariantRow is parseVariantFields scoped to the keyed listings;
+// ok=false marks rows dedupVariants never compares.
+func parseVariantRow(id string) (variantRow, bool) {
+	row := parseVariantFields(id)
+	for _, p := range variantPrefixes {
+		if row.pref == p {
+			return row, true
+		}
+	}
+	return row, false
 }
 
 // verSegLess compares dotted version segments, missing tail as zero, so
@@ -428,17 +462,20 @@ func variantDrop(ids []string) []bool {
 	return drop
 }
 
-// foldVariantIDs applies the same fold to a bare id list (the /status
-// model rows), so the dashboard lists what /v1/models serves.
-func foldVariantIDs(prefix string, ids []string) []string {
-	if !cfg().Models.DedupVariants || len(ids) == 0 {
+// foldStatusIDs folds one provider's /status model rows: dedup_versions
+// hides an older version of the same model shape, dedup_variants hides a
+// smaller size of the same version. status-only: /v1/models runs its own
+// fold and route is never folded.
+func foldStatusIDs(prefix string, ids []string) []string {
+	sc := cfg().Status
+	if len(ids) == 0 || (!sc.DedupVersions && !sc.DedupVariants) {
 		return ids
 	}
-	full := make([]string, len(ids))
+	rows := make([]variantRow, len(ids))
 	for i, id := range ids {
-		full[i] = prefix + id
+		rows[i] = parseVariantFields(prefix + id)
 	}
-	drop := variantDrop(full)
+	drop := statusDrop(rows, sc.DedupVersions, sc.DedupVariants)
 	out := make([]string, 0, len(ids))
 	for i, id := range ids {
 		if !drop[i] {
@@ -446,6 +483,38 @@ func foldVariantIDs(prefix string, ids []string) []string {
 		}
 	}
 	return out
+}
+
+// statusDrop marks rows a same-provider, same-shape sibling supersedes.
+// the shape key ignores version and size tokens, so gpt-6-luna and
+// gpt-6-luna-flex stay apart while glm-4.5-flash falls to glm-4.7-flash.
+func statusDrop(rows []variantRow, versions, sizes bool) []bool {
+	drop := make([]bool, len(rows))
+	for i := range rows {
+		pi := rows[i]
+		if pi.full == "" || pi.ver == nil {
+			continue
+		}
+		for j := range rows {
+			if j == i {
+				continue
+			}
+			pj := rows[j]
+			if pj.pref != pi.pref || pj.full != pi.full || pj.ver == nil {
+				continue
+			}
+			cmp := verSegLess(pj.ver, pi.ver)
+			if versions && cmp > 0 && pj.sizeFull >= pi.sizeFull {
+				drop[i] = true
+				break
+			}
+			if sizes && cmp == 0 && pj.sizeFull > pi.sizeFull {
+				drop[i] = true
+				break
+			}
+		}
+	}
+	return drop
 }
 
 // dedupVariants collapses variant rows of the keyed free listings when

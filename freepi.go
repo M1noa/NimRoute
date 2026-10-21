@@ -418,6 +418,7 @@ func freepiSnapshot() *freepiSummary {
 				st.Mults[e.ID] = m.Mult
 			}
 		}
+		st.Models = foldStatusIDs("freeepi/", st.Models)
 		st.Tier, st.Credits, st.SpentPct, st.ReqToday =
 			fst.Tier, fst.Credits, fst.SpentPct, fst.ReqToday
 		ku := keyUsage("freepi:" + fa.name)

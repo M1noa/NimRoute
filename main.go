@@ -736,7 +736,12 @@ func (p *Pool) Status() StatusResponse {
 		sr.Locks = locks
 	}
 	if zenEnabled() {
-		sr.Opencode = ocInfo.Load()
+		if oi := ocInfo.Load(); oi != nil {
+			// copy: ocInfo is shared with /v1/models
+			cp := *oi
+			cp.Models = foldStatusIDs("", cp.Models)
+			sr.Opencode = &cp
+		}
 	}
 	if zenEnabled() {
 		sr.ZenLanes = laneSnapshot()

@@ -491,6 +491,14 @@ status:
   show_openrouter: true       # openrouter section: keys, free models served
   show_route: true            # route section: strategy, latency, route ids
   show_benchmarks: true       # aa scores per model, best first
+  # status-only folding of the per-provider model rows. does NOT touch
+  # /v1/models or route; those keep models.dedup_variants.
+  dedup_versions: true        # hide older versions of one model
+                              # (uno/glm-4.5-flash hides behind
+                              # glm-4.7-flash); shapes like gpt-6-luna and
+                              # gpt-6-luna-flex stay, they are not versions
+  dedup_variants: true        # hide smaller sizes of the same version
+                              # (gemma-4-26b-a4b-it behind gemma-4-31b-it)
 
 # --- usage: per-request token tracker ---
 # every model request appends one json line (model, tokens, latency,

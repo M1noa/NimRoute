@@ -347,6 +347,9 @@ type statusConfig struct {
 	ShowOpenRouter     bool `yaml:"show_openrouter"`
 	ShowRoute          bool `yaml:"show_route"`
 	ShowBenchmarks     bool `yaml:"show_benchmarks"`
+	// status-only model folding; never touches /v1/models or route.
+	DedupVersions bool `yaml:"dedup_versions"`
+	DedupVariants bool `yaml:"dedup_variants"`
 }
 
 // usageConfig gates the per-request tracker. off = no file, no counters.
@@ -521,6 +524,8 @@ func defaultConfig() appConfig {
 			ShowUno:            true,
 			ShowOpenRouter:     true,
 			ShowBenchmarks:     true,
+			DedupVersions:      true,
+			DedupVariants:      true,
 		},
 		Usage: usageConfig{
 			Enabled: true,
