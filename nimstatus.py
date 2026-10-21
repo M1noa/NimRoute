@@ -351,7 +351,8 @@ def usage_bar(pct, width=10):
 # the rest of its row stays dim.
 PROVIDER_STYLES = {"opencode": "slate_blue1", "freepi": "medium_purple3",
                    "antseed": "steel_blue", "nvidia": "dark_sea_green",
-                   "nous": "medium_spring_green", "route": "gold1"}
+                   "nous": "medium_spring_green", "route": "gold1",
+                   "uno": "cornflower_blue", "openrouter": "plum2"}
 
 
 def health_cell(health, model):
@@ -463,6 +464,14 @@ def build_renderable(d, stats):
         # so the generic name+"/"+val prefixing below would leave them bare
         # and miss the usage.by_model key. prefix them here.
         cols.append(("nous", ["nous/" + m for m in nous_models]))
+    uno = d.get("uno") or {}
+    if uno.get("models"):
+        cols.append(("uno", list(uno["models"])))
+    orx = d.get("openrouter") or {}
+    if orx.get("models"):
+        # same slash-in-id trap as nous: ids are openrouter's own
+        # ("cohere/north-mini-code:free"), so the proxy's prefix goes on here.
+        cols.append(("openrouter", ["openrouter/" + m for m in orx["models"]]))
     # route ids last: one stable id per model that 2+ backends serve.
     rt = d.get("route") or {}
     rt_via = {}
