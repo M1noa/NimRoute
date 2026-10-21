@@ -314,6 +314,7 @@ func peelDateStamp(s string) string {
 var variantVerRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)v?$`)
 var variantSizeRe = regexp.MustCompile(`^(\d+)b$`)
 var variantSizeAnyRe = regexp.MustCompile(`^(?:a)?(\d+)b$`)
+var variantMoeRe = regexp.MustCompile(`^a\d+b$`)
 var variantTierWords = map[string]bool{"lite": true, "mini": true, "pro": true, "turbo": true}
 
 type variantRow struct {
@@ -324,6 +325,8 @@ type variantRow struct {
 	size int    // biggest plain b-suffix token after the version token
 	// like size, but aNb (gemma a4b active-param) tokens count too
 	sizeFull int
+	// aNb token seen: a mixture-of-experts row, not a smaller dense sibling
+	moe bool
 }
 
 // variantPrefixes are the keyed listings the /v1/models fold compares.
@@ -363,6 +366,9 @@ func parseVariantFields(id string) variantRow {
 			continue
 		}
 		if m := variantSizeAnyRe.FindStringSubmatch(t); m != nil {
+			if variantMoeRe.MatchString(t) {
+				row.moe = true
+			}
 			n, _ := strconv.Atoi(m[1])
 			if n > row.sizeFull {
 				row.sizeFull = n
@@ -445,7 +451,7 @@ func variantDrop(ids []string) []bool {
 			}
 			pj := rows[j]
 			if pj.pref != pi.pref || pj.fam != pi.fam ||
-				pj.fam == "" || pj.ver == nil {
+				pj.fam == "" || pj.ver == nil || pj.moe != pi.moe {
 				continue
 			}
 			cmp := verSegLess(pj.ver, pi.ver)
@@ -500,7 +506,7 @@ func statusDrop(rows []variantRow, versions, sizes bool) []bool {
 				continue
 			}
 			pj := rows[j]
-			if pj.pref != pi.pref || pj.full != pi.full || pj.ver == nil {
+			if pj.pref != pi.pref || pj.full != pi.full || pj.ver == nil || pj.moe != pi.moe {
 				continue
 			}
 			cmp := verSegLess(pj.ver, pi.ver)
