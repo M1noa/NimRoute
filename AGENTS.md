@@ -92,7 +92,14 @@ incidental machinery.
   a new backend needs a branch in each. `backendForModel` (debugtrace.go)
   needs a case too or traces mislabel the backend.
   inbound bodies capped at 10MB (`bodyLimit`). `route/` is handled in
-  `route.go` (dispatch sites in `main.go` and `anthropic.go`). service via
+  `route.go` (dispatch sites in `main.go` and `anthropic.go`): default
+  priority ladder opencode -> openrouter -> uno -> antseed -> nvidia ->
+  freepi -> nous (`routeBackends`), per-backend retry budgets
+  (`routeAttemptCap` via `expandRouteAttempts`), loose id matching
+  (`routeKey`: `-free`/`:free` trims + `peelDateStamp` date stamps).
+  `/v1/models` folds variants (`dedupVariants`, models.dedup_variants,
+  default on; parseVariantRow compares only keyed-prefix versioned ids).
+  service via
   `./nim run|start|stop|restart|status [tail]|status-tail|logs|log [N|tail]|tail|models [N]|models sync|install|uninstall|freepi auth|help`
   (docs/service.md is the user-facing copy).
 

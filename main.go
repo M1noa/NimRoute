@@ -2425,6 +2425,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	appendKeyedModels(unoBackend, &out, seenIDs)
 	appendKeyedModels(orChatBackend, &out, seenIDs)
 	appendRouteModels(p, &out, seenIDs)
+	dedupVariants(&out)
 	sortModelsByBench(out.Data)
 
 	w.Header().Set("Content-Type", "application/json")

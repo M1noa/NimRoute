@@ -240,8 +240,8 @@ type unoConfig struct {
 // out across backends in strategy order.
 type routeConfig struct {
 	Enabled bool `yaml:"enabled"`
-	// Strategy picks the attempt order: priority (opencode, antseed,
-	// freepi, nvidia, uno, openrouter, nous), latency (fastest measured
+	// Strategy picks the attempt order: priority (opencode, openrouter,
+	// uno, antseed, nvidia, freepi, nous), latency (fastest measured
 	// first), race (all at once, first 200 wins), random (shuffled).
 	// unknown falls to priority.
 	Strategy string `yaml:"strategy"`
@@ -366,8 +366,9 @@ type nudgeYAML struct {
 }
 
 type modelsConfig struct {
-	ClaudeMap []claudeMapYAML `yaml:"claude_map"`
-	Nudge     []nudgeYAML     `yaml:"nudge"`
+	ClaudeMap     []claudeMapYAML `yaml:"claude_map"`
+	Nudge         []nudgeYAML     `yaml:"nudge"`
+	DedupVariants bool            `yaml:"dedup_variants"`
 }
 
 type appConfig struct {
@@ -532,6 +533,7 @@ func defaultConfig() appConfig {
 				{Pattern: "claude-haiku-*", Model: "opencode/big-pickle"},
 				{Pattern: "claude-*", Model: "moonshotai/kimi-k3"},
 			},
+			DedupVariants: true,
 		},
 	}
 }

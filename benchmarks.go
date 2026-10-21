@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -268,8 +269,166 @@ func stripModelVariants(s string) string {
 				changed = true
 			}
 		}
+		if s2 := peelDateStamp(s); s2 != s {
+			s = s2
+			changed = true
+		}
 	}
 	return s
+}
+
+// dateStampRe matches a trailing "-mmdd" build stamp like deepseek's
+// "-1017" refreshes.
+var dateStampRe = regexp.MustCompile(`-(\d{4})$`)
+
+// peelDateStamp drops one trailing "-mmdd" from a normalized id when the
+// four digits decode as a month/day and the core stays four chars, so
+// "deepseek-v4.1-flash-1017" and "deepseek-v4.1-flash" meet as one model.
+// anything else ("-2507") is part of the name and stays.
+func peelDateStamp(s string) string {
+	m := dateStampRe.FindStringSubmatch(s)
+	if m == nil {
+		return s
+	}
+	mm := int(m[1][0]-'0')*10 + int(m[1][1]-'0')
+	dd := int(m[1][2]-'0')*10 + int(m[1][3]-'0')
+	if mm < 1 || mm > 12 || dd < 1 || dd > 31 {
+		return s
+	}
+	if len(s)-5 < 4 {
+		return s
+	}
+	return s[:len(s)-5]
+}
+
+// dedup listing: keyed providers (uno, openrouter, nous) list minor
+// refreshes and small sizes beside a family's lead model, so
+// "glm-4.5-flash:free" hides behind "glm-5.3-flash-search:free". a row is
+// dropped when a same-provider sibling in the same family is not older,
+// not smaller, and strictly better in version or size; equal twins stay.
+// ids without a version token are never compared, so embedded-lead-digit
+// names like qwen3.8-27b keep every row.
+
+var variantVerRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)v?$`)
+var variantSizeRe = regexp.MustCompile(`^(\d+)b$`)
+
+type variantRow struct {
+	pref string
+	fam  string
+	ver  []int // nil = no version token
+	size int   // biggest plain b-suffix token after the version token
+}
+
+// parseVariantRow splits one listing id into provider prefix, family, and
+// version/size facts; ok=false marks rows dedupVariants never compares.
+func parseVariantRow(id string) (variantRow, bool) {
+	var row variantRow
+	for _, p := range []string{"openrouter/", "uno/", "nous/"} {
+		if strings.HasPrefix(id, p) {
+			row.pref = p
+			break
+		}
+	}
+	if row.pref == "" {
+		return row, false
+	}
+	rest := strings.TrimSuffix(id[len(row.pref):], ":free")
+	toks := strings.Split(rest, "-")
+	vi := -1
+	for i, t := range toks {
+		if m := variantVerRe.FindStringSubmatch(t); m != nil {
+			vi = i
+			for _, seg := range strings.Split(m[1], ".") {
+				n, _ := strconv.Atoi(seg)
+				row.ver = append(row.ver, n)
+			}
+			break
+		}
+	}
+	if vi < 0 {
+		// unversioned: the whole id is its own identity
+		return row, true
+	}
+	row.fam = strings.Join(toks[:vi], "-")
+	for _, t := range toks[vi:] {
+		if m := variantSizeRe.FindStringSubmatch(t); m != nil {
+			n, _ := strconv.Atoi(m[1])
+			if n > row.size {
+				row.size = n
+			}
+		}
+	}
+	return row, true
+}
+
+// verSegLess compares dotted version segments, missing tail as zero, so
+// 4.5 pairs with 4.5.0.
+func verSegLess(a, b []int) int {
+	for i := 0; i < len(a) || i < len(b); i++ {
+		x, y := 0, 0
+		if i < len(a) {
+			x = a[i]
+		}
+		if i < len(b) {
+			y = b[i]
+		}
+		if x < y {
+			return -1
+		}
+		if x > y {
+			return 1
+		}
+	}
+	return 0
+}
+
+// dedupVariants collapses variant rows of the keyed free listings when
+// models.dedup_variants is on (the default). unversioned ids and anything
+// without a keyed prefix are never touched.
+func dedupVariants(out *struct {
+	Data []openRouterModel `json:"data"`
+}) {
+	if !cfg().Models.DedupVariants {
+		return
+	}
+	rows := make([]variantRow, len(out.Data))
+	ok := make([]bool, len(out.Data))
+	for i, m := range out.Data {
+		rows[i], ok[i] = parseVariantRow(m.ID)
+	}
+	drop := make([]bool, len(out.Data))
+	for i := range out.Data {
+		pi := rows[i]
+		if !ok[i] || pi.ver == nil || pi.fam == "" {
+			continue
+		}
+		for j := range out.Data {
+			if j == i || !ok[j] {
+				continue
+			}
+			pj := rows[j]
+			if pj.pref != pi.pref || pj.fam != pi.fam ||
+				pj.fam == "" || pj.ver == nil {
+				continue
+			}
+			cmp := verSegLess(pj.ver, pi.ver)
+			if cmp < 0 || pj.size < pi.size {
+				continue
+			}
+			if cmp == 0 && pj.size == pi.size {
+				continue
+			}
+			drop[i] = true
+			break
+		}
+	}
+	kept := out.Data[:0]
+	for i := range out.Data {
+		if !drop[i] {
+			kept = append(kept, out.Data[i])
+		}
+	}
+	out.Data = kept
 }
 
 // aaBlockRe finds a dataset header line: "catalog":{...,"rows":[

@@ -14,18 +14,60 @@ import (
 )
 
 // route backend: one name fans out across providers in strategy order.
-// route/<key> tries opencode, antseed, freepi, nvidia, uno, openrouter,
-// nous in turn (or by strategy), first 200 wins. keys match strictly:
-// lowercase, one trailing -free stripped from opencode ids, one trailing
-// :free stripped from uno/openrouter ids, nvidia ids keep the org prefix.
+// route/<key> tries opencode, openrouter, uno, antseed, nvidia, freepi,
+// nous in turn (or by strategy), first 200 wins. keys match loosely where
+// it is safe: lowercase, one trailing -free stripped from opencode ids,
+// one trailing :free from uno/openrouter ids, and a trailing dated build
+// stamp peeled from any id ("...-1017" -> "...") when the four digits
+// decode as mmdd, so dated refreshes like uno's deepseek-v4.1-flash-1017
+// hit opencode's deepseek-v4.1-flash. nvidia ids keep the org prefix.
+// most backends get retries in the ladder (routeAttemptsFor); race fans
+// out once per backend.
 
 // routeBackends is the fixed priority order.
-var routeBackends = []string{"opencode", "antseed", "freepi", "nvidia",
-	"uno", "openrouter", "nous"}
+var routeBackends = []string{"opencode", "openrouter", "uno", "antseed",
+	"nvidia", "freepi", "nous"}
+
+// routeAttemptCap is the sequential-ladder retry budget per backend.
+// opencode tries three times, uno and antseed and nvidia two (one retry
+// each), openrouter and freepi and nous once.
+var routeAttemptCap = map[string]int{
+	"opencode":   3,
+	"openrouter": 1,
+	"uno":        2,
+	"antseed":    2,
+	"nvidia":     2,
+	"freepi":     1,
+	"nous":       1,
+}
+
+// routeAttemptsFor is the ladder budget for one backend, 1 when unknown.
+func routeAttemptsFor(backend string) int {
+	if n, ok := routeAttemptCap[backend]; ok && n > 0 {
+		return n
+	}
+	return 1
+}
+
+// expandRouteAttempts repeats each candidate by its backend's ladder budget
+// so opencode gets three tries and uno/antseed/nvidia two before the order
+// falls through to the next backend. race mode stays one candidate per
+// backend: three vacuums on one exit would only fan ignition wider.
+func expandRouteAttempts(cands []string) []string {
+	expanded := cands[:0:0]
+	for _, c := range cands {
+		backend, _, _ := strings.Cut(c, "/")
+		for i := 0; i < routeAttemptsFor(backend); i++ {
+			expanded = append(expanded, c)
+		}
+	}
+	return expanded
+}
 
 // routeKey normalizes one backend model id to its route name: lowercase,
-// opencode's single trailing -free dropped. nvidia ids keep the org slash,
-// so "route/moonshotai/kimi-k3" stays exact.
+// opencode's single trailing -free dropped, uno/openrouter's trailing
+// :free dropped, then one trailing dated build stamp (mmdd) peeled. nvidia
+// ids keep the org slash, so "route/moonshotai/kimi-k3" stays exact.
 func routeKey(backend, id string) string {
 	k := strings.ToLower(strings.TrimSpace(id))
 	switch backend {
@@ -34,7 +76,7 @@ func routeKey(backend, id string) string {
 	case "uno", "openrouter": // keyed catalogs carry vendor/model:free rows
 		k = strings.TrimSuffix(k, ":free")
 	}
-	return k
+	return peelDateStamp(k)
 }
 
 // routeExclude reports whether a route key is dropped by config globs.
@@ -425,7 +467,7 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 			return
 		}
 	} else {
-		for _, cand := range cands {
+		for _, cand := range expandRouteAttempts(cands) {
 			if try(w, cand) {
 				acclog.Printf("%s route=%s won on %s", reqID, key, cand)
 				return
@@ -522,7 +564,7 @@ func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body
 			return
 		}
 	} else {
-		for _, cand := range cands {
+		for _, cand := range expandRouteAttempts(cands) {
 			if try(cand) {
 				acclog.Printf("%s route=%s won on %s", reqID, key, cand)
 				return
