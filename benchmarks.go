@@ -391,27 +391,21 @@ func verSegLess(a, b []int) int {
 	return 0
 }
 
-// dedupVariants collapses variant rows of the keyed free listings when
-// models.dedup_variants is on (the default). unversioned ids and anything
-// without a keyed prefix are never touched.
-func dedupVariants(out *struct {
-	Data []openRouterModel `json:"data"`
-}) {
-	if !cfg().Models.DedupVariants {
-		return
+// variantDrop marks ids superseded by a same-provider family sibling.
+// ids must carry their backend prefix; unversioned ones are never dropped.
+func variantDrop(ids []string) []bool {
+	rows := make([]variantRow, len(ids))
+	ok := make([]bool, len(ids))
+	for i, id := range ids {
+		rows[i], ok[i] = parseVariantRow(id)
 	}
-	rows := make([]variantRow, len(out.Data))
-	ok := make([]bool, len(out.Data))
-	for i, m := range out.Data {
-		rows[i], ok[i] = parseVariantRow(m.ID)
-	}
-	drop := make([]bool, len(out.Data))
-	for i := range out.Data {
+	drop := make([]bool, len(ids))
+	for i := range ids {
 		pi := rows[i]
 		if !ok[i] || pi.ver == nil || pi.fam == "" {
 			continue
 		}
-		for j := range out.Data {
+		for j := range ids {
 			if j == i || !ok[j] {
 				continue
 			}
@@ -431,6 +425,43 @@ func dedupVariants(out *struct {
 			break
 		}
 	}
+	return drop
+}
+
+// foldVariantIDs applies the same fold to a bare id list (the /status
+// model rows), so the dashboard lists what /v1/models serves.
+func foldVariantIDs(prefix string, ids []string) []string {
+	if !cfg().Models.DedupVariants || len(ids) == 0 {
+		return ids
+	}
+	full := make([]string, len(ids))
+	for i, id := range ids {
+		full[i] = prefix + id
+	}
+	drop := variantDrop(full)
+	out := make([]string, 0, len(ids))
+	for i, id := range ids {
+		if !drop[i] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// dedupVariants collapses variant rows of the keyed free listings when
+// models.dedup_variants is on (the default). unversioned ids and anything
+// without a keyed prefix are never touched.
+func dedupVariants(out *struct {
+	Data []openRouterModel `json:"data"`
+}) {
+	if !cfg().Models.DedupVariants {
+		return
+	}
+	ids := make([]string, len(out.Data))
+	for i, m := range out.Data {
+		ids[i] = m.ID
+	}
+	drop := variantDrop(ids)
 	kept := out.Data[:0]
 	for i := range out.Data {
 		if !drop[i] {

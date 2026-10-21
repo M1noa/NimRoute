@@ -499,5 +499,6 @@ func keyedSnapshot(b *keybackend) *keyedSummary {
 	for _, m := range b.models() {
 		sum.Models = append(sum.Models, m.ID)
 	}
+	sum.Models = foldVariantIDs(b.name+"/", sum.Models)
 	return sum
 }
