@@ -43,7 +43,7 @@ Subcommands:
 |---|---|
 | `PORT` | Override listen port |
 | `CONFIG_FILE` | Override `config.yml` path |
-| `NIM_AUTH` | Bearer token used by `nimstatus.py` when querying a locked `/status` |
+| `NIM_AUTH` | Bearer token used by `./nim status` when querying a locked `/status` |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins |
 | `DEBUG` | Set to `1` for verbose debug logs |
 | `DEBUG_FILE` | Directory for failed-request JSON dumps (`1` uses `nimroute-debug/`) |

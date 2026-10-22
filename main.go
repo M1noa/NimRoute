@@ -5821,6 +5821,10 @@ config.yml is created on first run and hot-reloaded after that.
 `
 
 func main() {
+	if nimName() {
+		runNim(os.Args[1:])
+		return
+	}
 	f, rest := parseFlags(os.Args[1:])
 	if f.set["help"] {
 		fmt.Print(cliUsage)

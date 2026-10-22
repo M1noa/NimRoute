@@ -158,7 +158,7 @@ incidental machinery.
   counters only move through `logUsage`; zero overhead when disabled.
   no local tokenizer exists anywhere: token counts are upstream `usage`
   verbatim (prompt/completion/total). never add one.
-  `nimstatus.py` reads the jsonl for today/all-time display.
+  `nimstatus.go` reads the jsonl for today/all-time display.
 
 ## 4. /status rules
 
