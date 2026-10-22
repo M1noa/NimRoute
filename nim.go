@@ -145,6 +145,26 @@ func (e nimEnv) needPy(what string) string {
 	return ""
 }
 
+// statusPy runs the python dashboard until the go port reaches parity.
+// reserve is the rows the caller already printed above it.
+func (e nimEnv) statusPy(reserve int, args ...string) error {
+	py := e.needPy("nimstatus.py")
+	cmd := exec.Command(py, append([]string{filepath.Join(e.dir, "nimstatus.py")}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if reserve > 0 {
+		cmd.Env = append(os.Environ(), fmt.Sprintf("NIM_STATUS_RESERVE=%d", reserve))
+	}
+	return cmd.Run()
+}
+
+// statusTail hands the live refresh to the python dashboard too.
+func (e nimEnv) statusTail() {
+	if err := e.statusPy(0, "tail-status"); err != nil {
+		nimFatal("dashboard", err)
+	}
+	os.Exit(0)
+}
+
 func (e nimEnv) running() bool {
 	switch e.mode {
 	case "launchd":
@@ -323,7 +343,9 @@ func (e nimEnv) prettyStatus() int {
 	}
 	fmt.Printf("nimroute: RUNNING (%s)\n", e.mode)
 	fmt.Println()
-	nimPrintStatus(e.port)
+	if err := e.statusPy(3, "status"); err != nil {
+		fmt.Println("(status unavailable)")
+	}
 	fmt.Println()
 	return 0
 }
@@ -482,16 +504,16 @@ func runNim(args []string) {
 	case "status":
 		code := e.prettyStatus()
 		if arg(1) == "tail" {
-			nimStatusTail(e)
+			e.statusTail()
 			os.Exit(0)
 		}
 		os.Exit(code)
 	case "status-tail":
-		nimStatusTail(e)
+		e.statusTail()
 	case "logs":
 		e.prettyStatus()
-		if err := nimLogs(e, 10); err != nil {
-			fmt.Printf("(log read failed: %v)\n", err)
+		if err := e.statusPy(0, "logs", "10"); err != nil {
+			fmt.Println("(log read failed)")
 			os.Exit(1)
 		}
 	case "log":
@@ -546,18 +568,17 @@ func runNim(args []string) {
 	case "models":
 		switch a := arg(1); {
 		case a == "":
-			if err := nimModels(e, 0); err != nil {
-				fmt.Printf("(status fetch failed: %v)\n", err)
+			if err := e.statusPy(0, "models", "0"); err != nil {
+				fmt.Println("(status fetch failed)")
 				os.Exit(1)
 			}
 		case a[0] >= '0' && a[0] <= '9':
-			n, err := strconv.Atoi(a)
-			if err != nil {
+			if _, err := strconv.Atoi(a); err != nil {
 				fmt.Println("usage: ./nim models [N]")
 				os.Exit(1)
 			}
-			if err := nimModels(e, n); err != nil {
-				fmt.Printf("(status fetch failed: %v)\n", err)
+			if err := e.statusPy(0, "models", a); err != nil {
+				fmt.Println("(status fetch failed)")
 				os.Exit(1)
 			}
 		case a == "sync":
