@@ -382,7 +382,10 @@ zen:
 # impressions); nothing is displayed. jwt never leaves this file.
 freepi:
   enabled: false
-  client_version: "0.4.7"  # server rejects anything below its own min with 426
+  # x-client-version sent upstream. empty = follow /client-version (the
+  # backend re-reads its min/latest) and never go below the built-in. pin
+  # only to force something higher; the server 426s anything under its min.
+  client_version: ""
   ad_inline_every: 5        # inline impression every Nth turn
   # how long a request waits for a busy account to free up (one live
   # stream per jwt). 0 = 60. default 60.

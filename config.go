@@ -452,7 +452,7 @@ func defaultConfig() appConfig {
 			Enabled: true,
 		},
 		Freepi: freepiConfig{
-			ClientVersion: "0.4.7",
+			ClientVersion: "",
 			AdInlineEvery: 5,
 		},
 		Antseed: antseedConfig{

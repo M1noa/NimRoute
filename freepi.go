@@ -48,11 +48,63 @@ func freepiEnabled() bool {
 	return c.Enabled && len(c.Accounts) > 0
 }
 
-func freepiVersion() string {
-	if v := cfg().Freepi.ClientVersion; v != "" {
-		return v
+// freepiVerDefault is the newest released cli version, used until
+// /client-version reports something higher. the server 426s
+// upgrade_required below its minimum, so a stale number breaks the
+// backend for everyone until someone edits this line.
+const freepiVerDefault = "0.4.10"
+
+// freepiVerUpstream is the newest version /client-version has reported
+// (latest, or min as the fallback). empty until the first catalog fetch.
+var freepiVerUpstream atomic.Value
+
+// freepiVerNewer reports whether dotted version a beats b. missing or
+// non-numeric segments count as 0, so "0.4.10" > "0.4.7" and "" loses.
+func freepiVerNewer(a, b string) bool {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		if x, y := freepiSeg(as, i), freepiSeg(bs, i); x != y {
+			return x > y
+		}
 	}
-	return "0.4.7"
+	return false
+}
+
+func freepiSeg(v []string, i int) int {
+	if i >= len(v) {
+		return 0
+	}
+	n := 0
+	for _, r := range v[i] {
+		if r < '0' || r > '9' {
+			break
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// freepiVersion picks the highest of: built-in default, what upstream
+// reported, and an explicit config pin. the server only enforces a floor,
+// so taking the max is always safe; pinning below it is what 426s.
+func freepiVersion() string {
+	v := freepiVerDefault
+	if u, _ := freepiVerUpstream.Load().(string); freepiVerNewer(u, v) {
+		v = u
+	}
+	if c := cfg().Freepi.ClientVersion; c != "" && freepiVerNewer(c, v) {
+		v = c
+	}
+	return v
+}
+
+// freepiVersionSync re-reads /client-version outside the catalog TTL so a
+// 426 can pick up the server's new floor before the retry.
+func freepiVersionSync(fa *freepiAcct) {
+	fa.mu.Lock()
+	fa.catalogAt = time.Time{}
+	fa.mu.Unlock()
+	freepiCatalog(fa)
 }
 
 func freepiInlineEvery() int {
@@ -356,11 +408,21 @@ func freepiCatalog(fa *freepiAcct) []freepiCatalogEntry {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		} `json:"models"`
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Min    string `json:"min"`
+		Latest string `json:"latest"`
 	}
 	var out []freepiCatalogEntry
 	ok := false
 	if json.Unmarshal(body, &cv) == nil {
+		// /client-version also carries the client version floor the
+		// completions endpoint enforces. follow it here so the header
+		// tracks upstream instead of a hardcoded release.
+		if v := cv.Latest; v != "" {
+			freepiVerUpstream.Store(v)
+		} else if cv.Min != "" {
+			freepiVerUpstream.Store(cv.Min)
+		}
 		for _, m := range cv.Models {
 			if m.ID == "" {
 				continue
@@ -575,6 +637,11 @@ func freepiRetryable(fe freepiErr) bool {
 		return false
 	case "rate_limited", "concurrent_session", "ads_required":
 		return true
+	case "upgrade_required":
+		// our client version is under the server floor: that is global, so
+		// rotating accounts cannot clear it. freepiTry re-reads the version
+		// endpoint and resends once; past that the answer goes to the caller.
+		return false
 	}
 	switch {
 	case fe.Status == http.StatusTooManyRequests, fe.Status == http.StatusConflict:
@@ -782,6 +849,18 @@ func freepiTry(ctx context.Context, method, target string, body []byte, fa *free
 			}
 			lease = faultOf(fe)
 			continue
+		}
+		if resp.StatusCode == http.StatusUpgradeRequired && attempt == 0 {
+			// the server retired the version we sent. /client-version
+			// carries the new floor, so re-read it and resend rather than
+			// handing the caller an upgrade nag. once per request: a still
+			// stale version means our own fetch is lying, not the gate.
+			sent := req.Header.Get("x-client-version")
+			freepiVersionSync(fa)
+			if now := freepiVersion(); now != sent {
+				acclog.Printf("  freepi client version %s retired, retrying as %s", sent, now)
+				continue
+			}
 		}
 		acclog.Printf("!! freepi %d [%s] acct=%s model=%s code=%s err=%q",
 			resp.StatusCode, fe.Code, fa.name, model, fe.Code, fe.Msg)
