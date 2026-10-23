@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """nimstatus: rich renderer for ./nim status/log commands. stdlib fallback."""
 import datetime
+import io
 import json
 import os
 import re
@@ -26,6 +27,7 @@ def fetch(path):
 try:
     from rich.console import Console, Group
     from rich.live import Live
+    from rich.segment import Segment
     from rich.table import Table
     from rich import box
     from rich.text import Text
@@ -341,7 +343,7 @@ def merged_table(d, limit):
     for r in rows:
         t.add_row(*(r if any_cc else r[:2] + r[3:]))
     if len(shown) < len(lanes):
-        t.caption = "%d more lanes · taller terminal shows more" % (len(lanes) - len(shown))
+        t.caption = "⋮ %d more lanes · taller terminal shows more" % (len(lanes) - len(shown))
     return t
 
 
@@ -425,8 +427,10 @@ def tps_cell(by_model, model):
                 style="dim")
 
 
-def build_renderable(d, stats, height=None):
-    parts = []
+def render_parts(d, stats, height=None):
+    """header, body and footer as separate lists so a scrolling caller can
+    pin the ends and window the middle."""
+    head, body, foot = [], [], []
     hdr = Text("NimRoute %s" % d.get("version", "?"), style="bold slate_blue1")
     hdr.append("  up %s" % d.get("uptime", "?"), style="dim")
     hdr.append("  load %d/%d" % (d.get("concurrent", 0),
@@ -436,8 +440,8 @@ def build_renderable(d, stats, height=None):
         hdr.append("  keys %d/%d" % (d.get("available", 0),
                                      d.get("total", 0)),
                    style="dark_sea_green" if ok else "red")
-    parts.append(hdr)
-    parts.append(Text("opencode %d active · nvidia %d active · nim lanes %d/%d" % (
+    head.append(hdr)
+    head.append(Text("opencode %d active · nvidia %d active · nim lanes %d/%d" % (
         d.get("concurrent_opencode", 0), d.get("concurrent_nvidia", 0),
         len(d.get("zen_lanes") or []), d.get("lane_cap", 0)), style="dim"))
     oc = d.get("opencode") or {}
@@ -521,7 +525,7 @@ def build_renderable(d, stats, height=None):
         lane_n = max(lane_n, 1) if want_lanes else 0
         model_n = max(model_n, 1) if want_models else 0
     if want_lanes:
-        parts.append(merged_table(d, lane_n))
+        body.append(merged_table(d, lane_n))
     if cols:
         by_model = (d.get("usage") or {}).get("by_model") or {}
         bench = bench_index(d)
@@ -532,39 +536,42 @@ def build_renderable(d, stats, height=None):
         t.add_column("", justify="left")
         for label in ("model", "score", "req", "tokens", "tok/s*", ""):
             t.add_column(label, justify="right" if label in ("score", "req", "tokens", "tok/s*") else "left")
-        done = False
-        for name, models in cols:
-            if done:
-                break
-            for val in models:
-                if model_n and t.row_count >= model_n:
-                    done = True
-                    break
-                # every row is one full id: provider and model never split,
-                # so the table matches what a client sends and what /status
-                # keys usage.by_model by.
-                full = val if "/" in val else name + "/" + val
-                totals = model_totals(by_model, full) or {}
-                # trailing column: usage multiplier on freepi rows, serving
-                # backends on route rows, empty everywhere else.
-                tail = ""
-                if name == "freepi":
-                    tail = mults.get(full.split("/", 1)[-1], "")
-                elif name == "route":
-                    tail = " · ".join(rt_via.get(full) or [])
-                t.add_row(health_cell(health, full),
-                          Text(full, style=PROVIDER_STYLES.get(name, "dim")),
-                          score_cell(bench(full)),
-                          str(totals.get("requests", 0)),
-                          tok_cell(by_model, full), tps_cell(by_model, full),
-                          Text(tail, style="dim") if tail else Text(""))
+        # round-robin across families: a row from every backend lands before
+        # any one of them spends the whole cap, so the late entries in cols
+        # (openrouter, route) are never starved by opencode's catalog.
+        order = []
+        for i in range(max(len(m) for _, m in cols)):
+            for name, models in cols:
+                if i < len(models):
+                    order.append((name, models[i]))
+        if model_n:
+            order = order[:model_n]
+        for name, val in order:
+            # every row is one full id: provider and model never split,
+            # so the table matches what a client sends and what /status
+            # keys usage.by_model by.
+            full = val if "/" in val else name + "/" + val
+            totals = model_totals(by_model, full) or {}
+            # trailing column: usage multiplier on freepi rows, serving
+            # backends on route rows, empty everywhere else.
+            tail = ""
+            if name == "freepi":
+                tail = mults.get(full.split("/", 1)[-1], "")
+            elif name == "route":
+                tail = " · ".join(rt_via.get(full) or [])
+            t.add_row(health_cell(health, full),
+                      Text(full, style=PROVIDER_STYLES.get(name, "dim")),
+                      score_cell(bench(full)),
+                      str(totals.get("requests", 0)),
+                      tok_cell(by_model, full), tps_cell(by_model, full),
+                      Text(tail, style="dim") if tail else Text(""))
         if model_n and t.row_count < want_models:
-            t.caption = "%d more models · taller terminal shows more" % (
+            t.caption = "⋮ %d more models · taller terminal shows more" % (
                 want_models - t.row_count)
-        parts.append(t)
-        parts.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
+        body.append(t)
+        foot.append(Text("* tok/s uses complete request time, not decode speed · · = no sample", style="dim"))
     if bl:
-        parts.append(Text(bl, style="dim"))
+        foot.append(Text(bl, style="dim"))
     for mark, name, req, tok, ms, tier, cred, pct, rtoday in fp_rows:
         line = Text()
         line.append("%s freepi:%s  " % (mark, name),
@@ -573,7 +580,7 @@ def build_renderable(d, stats, height=None):
             req, fmt_tok(tok), tier or "?", cred))
         line.append(usage_bar(pct))
         line.append(" %s day · %d today" % (fmt_pct(pct), rtoday), style="dim")
-        parts.append(line)
+        foot.append(line)
     nous_keys = (d.get("nous") or {}).get("keys") or []
     if nous_keys:
         live = [k for k in nous_keys if k.get("available")]
@@ -586,7 +593,7 @@ def build_renderable(d, stats, height=None):
             line.append("  ·  cooling " + ", ".join(
                 "%s %s" % (k.get("name", "?"), k.get("cooldown", "?"))
                 for k in cooling), style="dim")
-        parts.append(line)
+        foot.append(line)
     p = d.get("pool") or {}
     pool_t = Text()
     pool_t.append("pool  ", style="dim")
@@ -596,7 +603,7 @@ def build_renderable(d, stats, height=None):
                   style="red" if p.get("dropped_total", 0) else "dim")
     pool_t.append(" · refresh %s ago" % p.get("last_refresh_ago", "?"),
                   style="dim")
-    parts.append(pool_t)
+    foot.append(pool_t)
     use_t = Text()
     use_t.append("today ", style="dim")
     use_t.append("%s req" % fmt_int(stats["today"]["req"]), style="bold white")
@@ -606,8 +613,58 @@ def build_renderable(d, stats, height=None):
     use_t.append(" · %s tok" % fmt_tok(stats["all"]["tok"]), style="slate_blue1")
     if stats["since"]:
         use_t.append(" since %s" % stats["since"], style="dim")
-    parts.append(use_t)
-    return Group(*parts)
+    foot.append(use_t)
+    return head, body, foot
+
+
+def build_renderable(d, stats, height=None):
+    head, body, foot = render_parts(d, stats, height)
+    return Group(*head, *body, *foot)
+
+
+class Pre:
+    """pre-rendered lines replayed verbatim. a scrolling caller renders each
+    part to lines once, then windows that flat list: tables cannot be sliced
+    by row index, lines can."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __rich_console__(self, con, opts):
+        # every line terminates, like Text does. a missing trailing newline
+        # makes the next renderable in a Group continue this one's last line
+        # and quietly eats rows.
+        for line in self.lines:
+            yield from line
+            yield Segment.line()
+
+
+SCROLL_KEYS = {"\x1b[A": "up", "\x1b[B": "down", "\x1b[5~": "pgup",
+               "\x1b[6~": "pgdown", "\x1b[H": "home", "\x1b[F": "end",
+               "\x1b[1~": "home", "\x1b[4~": "end",
+               "k": "up", "j": "down", "b": "pgup", "f": "pgdown",
+               " ": "pgdown", "g": "home", "G": "end"}
+QUIT_KEYS = {"q", "\x03", "\x1b"}
+
+
+def decode_keys(data):
+    """turn one read of terminal input into scroll actions. escape
+    sequences are matched before bare esc, which is quit."""
+    s = data.decode("utf-8", "ignore")
+    acts, i = [], 0
+    while i < len(s):
+        for seq, act in SCROLL_KEYS.items():
+            if seq.startswith("\x1b") and s.startswith(seq, i):
+                acts.append(act)
+                i += len(seq)
+                break
+        else:
+            if s[i] in QUIT_KEYS:
+                acts.append("quit")
+            elif s[i] in SCROLL_KEYS:
+                acts.append(SCROLL_KEYS[s[i]])
+            i += 1
+    return acts
 
 
 def term_height():
@@ -664,22 +721,98 @@ def main():
                     time.sleep(2)
             except KeyboardInterrupt:
                 return 0
-        con = Console()
+        import select
+        import termios
+        import time
+        import tty
 
-        def render():
+        con = Console()
+        opts = con.options.update(height=None)
+        # tail mode drops the row cap: the whole dashboard is rendered, the
+        # header and footer stay pinned, and the middle scrolls so no row is
+        # unreachable.
+        state = {"top": 0, "head": [], "body": [], "foot": [], "when": 0.0}
+
+        def to_lines(parts):
+            out = []
+            for r in parts:
+                out.extend(con.render_lines(r, opts))
+            return out
+
+        def reload():
             try:
-                d = fetch("/status")
+                h, b, f = render_parts(fetch("/status"), jsonl_stats())
             except Exception as e:
-                return Text("(status fetch failed: %s)" % e, style="red")
-            return build_renderable(d, jsonl_stats(), term_height())
-        with Live(render(), refresh_per_second=0.5, console=con) as live:
-            import time
-            try:
+                h = [Text("(status fetch failed: %s)" % e, style="red")]
+                b, f = [], []
+            state["head"], state["body"], state["foot"] = (
+                to_lines(h), to_lines(b), to_lines(f))
+            state["when"] = time.time()
+
+        def room():
+            # both markers and the hint always spend one line each, so the
+            # frame lands on exactly con.height rows.
+            return max(1, con.height - len(state["head"])
+                       - len(state["foot"]) - 3)
+
+        def frame():
+            body = state["body"]
+            total = len(body)
+            top = max(0, min(state["top"], max(0, total - room())))
+            state["top"] = top
+            win = body[top:top + room()]
+            rest = total - top - len(win)
+            above = Text("⋮ %d more above" % top, style="dim") if top else Text("")
+            below = Text("⋮ %d more below" % rest, style="dim") if rest else Text("")
+            hint = Text("[q] quit  [↑↓/jk] scroll  [pgup/pgdn] page  refresh 2s",
+                        style="dim")
+            if top or rest:
+                hint.append("  %d-%d/%d" % (top + 1, top + len(win), total))
+            return Group(Pre(state["head"]), above, Pre(win), below,
+                         Pre(state["foot"]), hint)
+
+        reload()
+        interactive = sys.stdin.isatty()
+        old = termios.tcgetattr(sys.stdin.fileno()) if interactive else None
+        try:
+            if interactive:
+                tty.setcbreak(sys.stdin.fileno())
+            with Live(frame(), console=con, refresh_per_second=4) as live:
                 while True:
-                    time.sleep(1)
-                    live.update(render())
-            except KeyboardInterrupt:
-                pass
+                    live.update(frame())
+                    if interactive and select.select([sys.stdin], [], [], 0.25)[0]:
+                        try:
+                            data = os.read(sys.stdin.fileno(), 64)
+                        except OSError:
+                            data = b""
+                        if not data:
+                            interactive = False
+                            continue
+                        for act in decode_keys(data):
+                            if act == "quit":
+                                return 0
+                            if act == "up":
+                                state["top"] -= 1
+                            elif act == "down":
+                                state["top"] += 1
+                            elif act == "pgup":
+                                state["top"] -= room()
+                            elif act == "pgdown":
+                                state["top"] += room()
+                            elif act == "home":
+                                state["top"] = 0
+                            elif act == "end":
+                                state["top"] = len(state["body"])
+                            state["top"] = max(0, state["top"])
+                        live.update(frame())
+                    time.sleep(0.25)
+                    if time.time() - state["when"] >= 2:
+                        reload()
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            if old is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
     elif cmd == "models":
         # optional arg: a row cap. no arg = whatever fits the terminal, so
         # the caption stays on screen.
