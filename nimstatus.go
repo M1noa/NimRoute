@@ -154,11 +154,11 @@ func padL(s string, w int) string {
 	return s
 }
 
-// healthCell is the ✓/X/· marker beside a model id.
+// healthCell is the ✓/X/- marker beside a model id.
 func healthCell(h map[string]modelHealth, model string) string {
 	m, ok := h[model]
 	if !ok {
-		return cDim.Render("·")
+		return cDim.Render("-")
 	}
 	switch m.State {
 	case "working":
@@ -384,14 +384,16 @@ func usageTotalsFor(path string) nimStats {
 	return c.st
 }
 
+// prefixed puts the backend on every id. a portal id names its own vendor
+// ("poolside/laguna-s-2.1:free"), so a bare slash is no reason to skip it.
 func prefixed(prefix string, ids []string) []string {
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if strings.Contains(id, "/") {
+		if strings.HasPrefix(id, prefix) {
 			out = append(out, id)
-		} else {
-			out = append(out, prefix+id)
+			continue
 		}
+		out = append(out, prefix+id)
 	}
 	return out
 }
@@ -567,9 +569,11 @@ func (m *dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dashTickMsg:
 		return m, tea.Batch(dashLoad(m.port, m.dir), dashTick())
 	case dashMsg:
+		// one slow /status must not wedge the view: keep the last good frame
+		// and try again on the next tick
 		if msg.err != nil {
 			m.err = msg.err
-			return m, nil
+			return m, dashTick()
 		}
 		m.err, m.d, m.st, m.at = nil, msg.d, msg.st, time.Now()
 	case tea.KeyMsg:
@@ -606,8 +610,9 @@ func (m *dashModel) bodyHeight() int {
 }
 
 func (m *dashModel) View() string {
-	if m.err != nil {
-		return cRed.Render("nimroute: "+m.err.Error()) + "\n\n" + cDim.Render("[q] quit")
+	if m.err != nil && m.d == nil {
+		return ansi.Truncate(cRed.Render("nimroute: "+m.err.Error()), m.w, "…") +
+			"\n\n" + cDim.Render("[q] quit")
 	}
 	if m.d == nil {
 		return cDim.Render("loading…")
@@ -636,7 +641,7 @@ func (m *dashModel) View() string {
 	if !m.at.IsZero() {
 		foot += cDim.Render("  · " + m.at.Format("15:04:05"))
 	}
-	return strings.Join(shown, "\n") + "\n\n" + foot
+	return strings.Join(shown, "\n") + "\n\n" + ansi.Truncate(foot, m.w, "…")
 }
 
 func (m *dashModel) headLines() []string {
@@ -655,7 +660,7 @@ func (m *dashModel) headLines() []string {
 
 	sum := fmt.Sprintf("opencode %d active · nvidia %d active · nim lanes %d/%d",
 		d.ConcurrentZen, d.ConcurrentNV, len(d.ZenLanes), d.LaneCap)
-	return []string{head, cDim.Render(sum), ""}
+	return []string{head, cDim.Render(sum)}
 }
 
 func (m *dashModel) tailLines() []string {
@@ -663,6 +668,8 @@ func (m *dashModel) tailLines() []string {
 	var tail []string
 	if len(m.modelGroups()) > 0 {
 		tail = append(tail, cDim.Render("* tok/s uses complete request time, not decode speed · · = no sample"))
+	} else {
+		tail = append(tail, cDim.Render("no models (pool still starting)"))
 	}
 	if bl := benchLine(d.Benchmarks); bl != "" {
 		tail = append(tail, cDim.Render(bl))
@@ -738,9 +745,6 @@ func (m *dashModel) tailLines() []string {
 		l += cDim.Render(" since " + st.since)
 	}
 	tail = append(tail, l)
-	if len(tail) > 0 {
-		tail = append([]string{""}, tail...)
-	}
 	return tail
 }
 
@@ -749,18 +753,32 @@ func (m *dashModel) tailLines() []string {
 func (m *dashModel) render() []string {
 	mrows := m.modelRows()
 	head, tail := m.headLines(), m.tailLines()
-	// two table headers, two trailing blanks, one caption each
-	spare := m.bodyHeight() - len(head) - len(tail) - 4
-	laneN, modelN := splitRows(spare, len(m.d.ZenLanes), len(mrows), 4)
-	if laneN == 0 && len(m.d.ZenLanes) > 0 {
-		laneN = 1
+	wantL, wantM := len(m.d.ZenLanes), len(mrows)
+	// a table spends a blank, a header, a rule, a blank and its caption
+	rows := m.bodyHeight() - len(head) - len(tail)
+	if wantL > 0 {
+		rows -= 5
 	}
-	if modelN == 0 && len(mrows) > 0 {
-		modelN = 1
+	if wantM > 0 {
+		rows -= 5
 	}
+	// too short for one row of data: drop the table rather than spend its
+	// chrome on an empty header, the foot totals are worth more. the lane
+	// table is live state, so the catalog goes first.
+	if wantM > 0 && rows < 1 {
+		wantM, rows = 0, rows+5
+	}
+	if wantL > 0 && rows < 1 {
+		wantL = 0
+	}
+	laneN, modelN := splitRows(rows, wantL, wantM, 4)
 	out := append([]string{}, head...)
-	out = append(out, m.laneLines(laneN)...)
-	out = append(out, modelLines(mrows, modelN)...)
+	if wantL > 0 {
+		out = append(out, m.laneLines(laneN)...)
+	}
+	if wantM > 0 {
+		out = append(out, modelLines(mrows, modelN)...)
+	}
 	return append(out, tail...)
 }
 
@@ -940,20 +958,22 @@ func (m *dashModel) modelRows() [][]string {
 // modelLines draws the model table, capped at limit rows.
 func modelLines(rows [][]string, limit int) []string {
 	if len(rows) == 0 {
-		return []string{cDim.Render("no models (pool still starting)"), ""}
+		return nil
 	}
 	want := len(rows)
-	if limit > 0 && len(rows) > limit {
+	if limit < 0 {
+		limit = 0
+	}
+	if want > limit {
 		rows = rows[:limit]
 	}
 	cols := []colSpec{{"", false}, {"model", false}, {"score", true}, {"req", true},
 		{"tokens", true}, {"tok/s*", true}, {"", false}}
-	out := drawTable(cols, rows)
+	out := append([]string{""}, drawTable(cols, rows)...)
 	if len(rows) < want {
 		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more models · taller terminal shows more", want-len(rows))))
 	}
-	out = append(out, "")
-	return out
+	return append(out, "")
 }
 
 // nil2 returns the per-model usage totals for the current status snapshot.
@@ -969,7 +989,8 @@ type colSpec struct {
 	right bool
 }
 
-// drawTable pads every column to its widest cell and trims trailing blanks.
+// drawTable pads every column to its widest cell, trims trailing blanks and
+// rules under the header like rich's box.simple.
 func drawTable(cols []colSpec, rows [][]string) []string {
 	w := make([]int, len(cols))
 	for i, c := range cols {
@@ -985,10 +1006,15 @@ func drawTable(cols []colSpec, rows [][]string) []string {
 		}
 	}
 	head := make([]string, len(cols))
+	width := 2 * (len(cols) - 1)
 	for i, c := range cols {
 		head[i] = cell(c.h, w[i], c.right)
+		width += w[i]
 	}
-	out := []string{cDim.Render(strings.TrimRight(strings.Join(head, "  "), " "))}
+	out := []string{
+		cDim.Render(strings.TrimRight(strings.Join(head, "  "), " ")),
+		cDim.Render(strings.Repeat("─", width)),
+	}
 	for _, r := range rows {
 		cells := make([]string, len(cols))
 		for i := range cols {
@@ -1030,7 +1056,10 @@ func (m *dashModel) laneLines(limit int) []string {
 	})
 
 	want := len(lanes)
-	if limit > 0 && want > limit {
+	if limit < 0 {
+		limit = 0
+	}
+	if want > limit {
 		lanes = lanes[:limit]
 	}
 	var rows [][]string
@@ -1082,10 +1111,9 @@ func (m *dashModel) laneLines(limit int) []string {
 			rows[i] = append(rows[i][:2], rows[i][3:]...)
 		}
 	}
-	out := drawTable(cols, rows)
+	out := append([]string{""}, drawTable(cols, rows)...)
 	if len(lanes) < want {
 		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more lanes · taller terminal shows more", want-len(lanes))))
 	}
-	out = append(out, "")
-	return out
+	return append(out, "")
 }
