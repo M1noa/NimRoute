@@ -20,15 +20,20 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/term"
 )
 
 // styles mirror nimstatus.py's palette.
 var (
-	cDim    = lipgloss.NewStyle().Faint(true)
-	cBold   = lipgloss.NewStyle().Bold(true)
-	cGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
-	cRed    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	cYellow = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
+	cDim     = lipgloss.NewStyle().Faint(true)
+	cBold    = lipgloss.NewStyle().Bold(true)
+	cWhite   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	cGreen   = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
+	cSpring  = lipgloss.NewStyle().Foreground(lipgloss.Color("85"))
+	cRed     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	cYellow  = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
+	cMagenta = lipgloss.NewStyle().Foreground(lipgloss.Color("201"))
+	cSlate   = lipgloss.NewStyle().Foreground(lipgloss.Color("68"))
 )
 
 var provColor = map[string]lipgloss.Style{
@@ -163,7 +168,57 @@ func healthCell(h map[string]modelHealth, model string) string {
 	case "dead":
 		return cRed.Render("X")
 	}
-	return cDim.Render("·")
+	return cDim.Render("-")
+}
+
+// modelCore is python's _model_core: bare id, dots folded, free suffix trimmed.
+func modelCore(mid string) string {
+	if i := strings.LastIndex(mid, "/"); i >= 0 {
+		mid = mid[i+1:]
+	}
+	core := strings.ToLower(strings.ReplaceAll(mid, ".", "-"))
+	for _, suf := range []string{":free", "-free"} {
+		if strings.HasSuffix(core, suf) && len(core) > len(suf) {
+			core = core[:len(core)-len(suf)]
+		}
+	}
+	return core
+}
+
+// benchLookup resolves a serving id to a bench row: exact key first, then the
+// bare model core, marked alias so the score renders dim.
+func benchLookup(b *benchSummary) func(string) *benchRow {
+	if b == nil {
+		return func(string) *benchRow { return nil }
+	}
+	byID := make(map[string]*benchRow, len(b.Models))
+	for i := range b.Models {
+		byID[b.Models[i].ID] = &b.Models[i]
+	}
+	return func(full string) *benchRow {
+		if r, ok := byID[full]; ok {
+			return r
+		}
+		core := modelCore(full)
+		for _, r := range b.Models {
+			if modelCore(r.ID) == core {
+				cp := r
+				cp.Match = "alias"
+				return &cp
+			}
+		}
+		return nil
+	}
+}
+
+func scoreCell(r *benchRow) string {
+	if r == nil || r.Intel == 0 {
+		return cDim.Render("·")
+	}
+	if r.Match == "exact" {
+		return cWhite.Render(fmt.Sprintf("%.1f", r.Intel))
+	}
+	return cDim.Render(fmt.Sprintf("%.1f", r.Intel))
 }
 
 // modelTotals falls back the way python did: exact, bare, then opencode/bare.
@@ -329,120 +384,6 @@ func usageTotalsFor(path string) nimStats {
 	return c.st
 }
 
-// ---- plain renderers ----
-
-func nimPrintStatus(port string) {
-	d, err := nimFetchStatus(port)
-	if err != nil {
-		fmt.Printf("(status unavailable: %v)\n", err)
-		return
-	}
-	st := usageTotalsFor(filepath.Join(newNimEnv().dir, "nim-usage.jsonl"))
-
-	line := fmt.Sprintf("NimRoute %s | up %s | load %d/%d", d.Version, d.Uptime, d.Concurrent, d.SemLimit)
-	if len(d.Keys) > 0 {
-		avail := 0
-		for _, k := range d.Keys {
-			if k.Available {
-				avail++
-			}
-		}
-		line += fmt.Sprintf(" | keys %d/%d", avail, len(d.Keys))
-	}
-	fmt.Println(line)
-
-	fmt.Printf("opencode %d active · nvidia %d active · lanes %d/%d\n",
-		d.ConcurrentZen, d.ConcurrentNV, len(d.ZenLanes), d.LaneCap)
-
-	var served int
-	if d.Usage != nil {
-		served = d.Usage.Prompt + d.Usage.Completion
-	}
-	if served == 0 {
-		for _, l := range d.ZenLanes {
-			served += l.Prompt + l.Completion
-		}
-	}
-	fmt.Printf("%s tok served", fmtTok(served))
-	if st.allReq > 0 {
-		fmt.Printf(" · %s req logged", fmtInt(int(st.allReq)))
-	}
-	fmt.Println()
-
-	if d.Opencode != nil && len(d.Opencode.Models) > 0 {
-		fmt.Printf("models %d free\n", len(d.Opencode.Models))
-	}
-	if d.Pool != nil {
-		fmt.Printf("pool %d verified, %d candidates, %d dropped\n",
-			d.Pool.Verified, d.Pool.Cands, d.Pool.Dropped)
-	}
-	if bl := benchLine(d.Benchmarks); bl != "" {
-		fmt.Println(bl)
-	}
-
-	if st.allReq > 0 {
-		fmt.Printf("today %s req, %s tok · all-time %s req, %s tok",
-			fmtInt(int(st.todayReq)), fmtTok(int(st.todayTok)),
-			fmtInt(int(st.allReq)), fmtTok(int(st.allTok)))
-		if st.since != "" {
-			fmt.Printf(" since %s", st.since)
-		}
-		fmt.Println()
-	}
-
-	if d.Freepi != nil && len(d.Freepi.Accounts) > 0 {
-		for _, a := range d.Freepi.Accounts {
-			l := fmt.Sprintf("freepi:%s %s req, %s tok", a.Name,
-				fmtInt(a.Requests), fmtTok(int(a.Prompt+a.Completion)))
-			if a.Inflight {
-				l += " (streaming)"
-			}
-			if a.ReqToday > 0 {
-				l += fmt.Sprintf(" · %d today", a.ReqToday)
-			}
-			fmt.Println(l)
-		}
-	}
-
-	if d.Antseed != nil {
-		l := fmt.Sprintf("antseed %d peers, %d offers", d.Antseed.Peers, d.Antseed.Offers)
-		if len(d.Antseed.Models) > 0 {
-			l += ": " + strings.Join(prefixed("antseed/", d.Antseed.Models), ", ")
-		} else {
-			l += " (discovering)"
-		}
-		if d.Antseed.StaleFor != "" {
-			l += " · stale " + d.Antseed.StaleFor
-		}
-		fmt.Println(l)
-	}
-
-	if d.Route != nil && d.Route.Enabled {
-		var lat []string
-		var names []string
-		for b := range d.Route.Latency {
-			names = append(names, b)
-		}
-		sort.Strings(names)
-		for _, b := range names {
-			lat = append(lat, b+" "+d.Route.Latency[b]+"ms")
-		}
-		latstr := "no samples"
-		if len(lat) > 0 {
-			latstr = strings.Join(lat, ", ")
-		}
-		ids := make([]string, 0, len(d.Route.Routes))
-		for i, r := range d.Route.Routes {
-			if i == 8 {
-				ids = append(ids, "…")
-				break
-			}
-			ids = append(ids, strings.TrimPrefix(r.ID, "route/"))
-		}
-		fmt.Printf("route [%s] %d ids: %s\n", latstr, d.Route.Count, strings.Join(ids, ", "))
-	}
-}
-
 func prefixed(prefix string, ids []string) []string {
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -558,6 +499,49 @@ func nimStatusTail(e nimEnv) {
 	}
 }
 
+// dashOnce prints the dashboard once for `./nim status`. reserve is the rows
+// the caller already printed above it.
+func dashOnce(e nimEnv, reserve int) error {
+	d, err := nimFetchStatus(e.port)
+	if err != nil {
+		return err
+	}
+	m := &dashModel{
+		port: e.port,
+		dir:  e.dir,
+		d:    d,
+		st:   usageTotalsFor(filepath.Join(e.dir, "nim-usage.jsonl")),
+	}
+	m.w, m.h = termSize()
+	// render() budgets bodyHeight() = h-3 for the blank and key-hint lines the
+	// tea view adds; a one-shot prints neither, so hand those rows back.
+	m.h = m.h - reserve + 3
+	for _, ln := range m.render() {
+		fmt.Println(ansi.Truncate(ln, m.w, "…"))
+	}
+	return nil
+}
+
+// termSize reports the terminal size, falling back to rich's 80x25 when the
+// output is not a tty.
+func termSize() (int, int) {
+	w, h, err := term.GetSize(os.Stdout.Fd())
+	if err != nil || w <= 0 || h <= 0 {
+		return 80, 25
+	}
+	return w, h
+}
+
+// modelsLimit is how many rows fit in a bare `./nim models`.
+func modelsLimit() int {
+	_, h := termSize()
+	n := h - 6
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 func dashLoad(port, dir string) tea.Cmd {
 	return func() tea.Msg {
 		d, err := nimFetchStatus(port)
@@ -655,130 +639,186 @@ func (m *dashModel) View() string {
 	return strings.Join(shown, "\n") + "\n\n" + foot
 }
 
-func (m *dashModel) render() []string {
-	d, st := m.d, m.st
-	var out []string
-
-	head := cBold.Render("NimRoute " + d.Version)
+func (m *dashModel) headLines() []string {
+	d := m.d
+	head := cSlate.Render("NimRoute " + d.Version)
 	head += cDim.Render("  up " + d.Uptime + "  ")
 	head += fmt.Sprintf("load %d/%d", d.Concurrent, d.SemLimit)
-	if len(d.Keys) > 0 {
-		avail := 0
-		for _, k := range d.Keys {
-			if k.Available {
-				avail++
-			}
+	if d.Keys != nil {
+		ks := fmt.Sprintf("  keys %d/%d", d.Available, d.Total)
+		if d.Available > 0 {
+			head += cGreen.Render(ks)
+		} else {
+			head += cRed.Render(ks)
 		}
-		head += fmt.Sprintf("  keys %d/%d", avail, len(d.Keys))
 	}
-	out = append(out, head)
 
-	sum := fmt.Sprintf("opencode %d active · nvidia %d active · lanes %d/%d",
+	sum := fmt.Sprintf("opencode %d active · nvidia %d active · nim lanes %d/%d",
 		d.ConcurrentZen, d.ConcurrentNV, len(d.ZenLanes), d.LaneCap)
-	var served int
-	if d.Usage != nil {
-		served = d.Usage.Prompt + d.Usage.Completion
-	}
-	if served == 0 {
-		for _, l := range d.ZenLanes {
-			served += l.Prompt + l.Completion
-		}
-	}
-	sum += " · " + fmtTok(served) + " tok served"
-	out = append(out, cDim.Render(sum), "")
+	return []string{head, cDim.Render(sum), ""}
+}
 
-	out = append(out, m.modelLines()...)
-	out = append(out, m.laneLines()...)
-
+func (m *dashModel) tailLines() []string {
+	d, st := m.d, m.st
 	var tail []string
+	if len(m.modelGroups()) > 0 {
+		tail = append(tail, cDim.Render("* tok/s uses complete request time, not decode speed · · = no sample"))
+	}
 	if bl := benchLine(d.Benchmarks); bl != "" {
 		tail = append(tail, cDim.Render(bl))
 	}
-	if d.Pool != nil {
-		p := fmt.Sprintf("pool %d verified · %d candidates · %d dropped · %d 429 · %d dead",
-			d.Pool.Verified, d.Pool.Cands, d.Pool.Dropped, d.Pool.RateLimited, d.Pool.Dead)
-		if d.Pool.NextRefresh != "" {
-			p += " · next refresh " + d.Pool.NextRefresh
-		}
-		tail = append(tail, cDim.Render(p))
-	}
-	if d.Freepi != nil && len(d.Freepi.Accounts) > 0 {
+	if d.Freepi != nil {
 		for _, a := range d.Freepi.Accounts {
-			l := provStyle("freepi").Render("freepi:"+a.Name) + " "
-			l += fmt.Sprintf("%s req, %s tok", fmtInt(a.Requests), fmtTok(int(a.Prompt+a.Completion)))
+			mark, style := "◇", cMagenta
 			if a.Inflight {
-				l += cGreen.Render("  streaming")
+				mark, style = "◆", cYellow
 			}
-			if a.Credits > 0 {
-				l += cDim.Render(fmt.Sprintf("  %.0f cr", a.Credits))
+			l := style.Render(mark + " freepi:" + a.Name + "  ")
+			tier := a.Tier
+			if tier == "" {
+				tier = "?"
 			}
-			if a.SpentPct > 0 {
-				l += "  " + usageBar(a.SpentPct, 10) + " " + fmtPct(a.SpentPct)
-			}
+			l += fmt.Sprintf("%s req · %s tok · %s · %g credits · ",
+				fmtInt(a.Requests), fmtTok(int(a.Prompt+a.Completion)), tier, a.Credits)
+			l += usageBar(a.SpentPct, 10)
+			l += cDim.Render(fmt.Sprintf(" %s day · %d today", fmtPct(a.SpentPct), a.ReqToday))
 			tail = append(tail, l)
 		}
 	}
-	if d.Antseed != nil {
-		l := provStyle("antseed").Render("antseed")
-		l += fmt.Sprintf(" %d peers, %d offers", d.Antseed.Peers, d.Antseed.Offers)
-		if len(d.Antseed.Models) > 0 {
-			l += cDim.Render("  " + strings.Join(d.Antseed.Models, ", "))
+	if d.Nous != nil && len(d.Nous.Keys) > 0 {
+		live := 0
+		var cooling []string
+		for _, k := range d.Nous.Keys {
+			if k.Available {
+				live++
+				continue
+			}
+			name, cd := k.Name, k.Cooldown
+			if name == "" {
+				name = "?"
+			}
+			if cd == "" {
+				cd = "?"
+			}
+			cooling = append(cooling, name+" "+cd)
+		}
+		l := cDim.Render("nous  ")
+		up := fmt.Sprintf("%d/%d keys up", live, len(d.Nous.Keys))
+		if live > 0 {
+			l += cSpring.Render(up)
 		} else {
-			l += cDim.Render("  discovering…")
+			l += cRed.Render(up)
 		}
-		if d.Antseed.StaleFor != "" {
-			l += cDim.Render("  stale " + d.Antseed.StaleFor)
-		}
-		tail = append(tail, l)
-	}
-	if st.allReq > 0 {
-		l := fmt.Sprintf("today %s req, %s tok", fmtInt(int(st.todayReq)), fmtTok(int(st.todayTok)))
-		l += cDim.Render(fmt.Sprintf(" · all-time %s req, %s tok", fmtInt(int(st.allReq)), fmtTok(int(st.allTok))))
-		if st.since != "" {
-			l += cDim.Render(" since " + st.since)
+		if len(cooling) > 0 {
+			l += cDim.Render("  ·  cooling " + strings.Join(cooling, ", "))
 		}
 		tail = append(tail, l)
 	}
+	if d.Pool != nil {
+		p := cDim.Render("pool  ") + cGreen.Render(fmt.Sprintf("%d verified", d.Pool.Verified))
+		p += cDim.Render(" · ")
+		dropped := fmt.Sprintf("%d dropped", d.Pool.Dropped)
+		if d.Pool.Dropped > 0 {
+			p += cRed.Render(dropped)
+		} else {
+			p += cDim.Render(dropped)
+		}
+		ago := d.Pool.Refresh
+		if ago == "" {
+			ago = "?"
+		}
+		p += cDim.Render(" · refresh " + ago + " ago")
+		tail = append(tail, p)
+	}
+	l := cDim.Render("today ") + cWhite.Render(fmtInt(int(st.todayReq))+" req")
+	l += cSlate.Render(" · " + fmtTok(int(st.todayTok)) + " tok")
+	l += cDim.Render("   │   all-time ") + cWhite.Render(fmtInt(int(st.allReq))+" req")
+	l += cSlate.Render(" · " + fmtTok(int(st.allTok)) + " tok")
+	if st.since != "" {
+		l += cDim.Render(" since " + st.since)
+	}
+	tail = append(tail, l)
 	if len(tail) > 0 {
-		out = append(out, "")
-		out = append(out, tail...)
+		tail = append([]string{""}, tail...)
 	}
-	return out
+	return tail
 }
 
-func (m *dashModel) modelLines() []string {
-	d := m.d
-	var rows [][]string
-	cols := []colSpec{{"", false}, {"model", false}, {"req", true}, {"tok", true}, {"tok/s", true}}
-
-	add := func(prov, id string) {
-		t, ok := modelTotals(nil2(d), id)
-		req, tok, rate := "·", "·", "·"
-		if ok {
-			req = fmtInt(int(t.Requests))
-			tok = fmtTok(int(t.Prompt + t.Completion))
-			if t.DurationMs > 0 && t.Completion > 0 {
-				rate = fmtTok(int(float64(t.Completion) / (float64(t.DurationMs) / 1000)))
-				rate += "/s"
-			}
-			if t.Errors > 0 {
-				req += cDim.Render(fmt.Sprintf(" (%d!)", t.Errors))
-			}
-		}
-		rows = append(rows, []string{
-			healthCell(d.Health, id),
-			provStyle(prov).Render(id),
-			req, tok, rate,
-		})
+// render fits both tables to the terminal: head and foot stay put and each
+// table gets a share of the rows left over, the busiest four first.
+func (m *dashModel) render() []string {
+	mrows := m.modelRows()
+	head, tail := m.headLines(), m.tailLines()
+	// two table headers, two trailing blanks, one caption each
+	spare := m.bodyHeight() - len(head) - len(tail) - 4
+	laneN, modelN := splitRows(spare, len(m.d.ZenLanes), len(mrows), 4)
+	if laneN == 0 && len(m.d.ZenLanes) > 0 {
+		laneN = 1
 	}
+	if modelN == 0 && len(mrows) > 0 {
+		modelN = 1
+	}
+	out := append([]string{}, head...)
+	out = append(out, m.laneLines(laneN)...)
+	out = append(out, modelLines(mrows, modelN)...)
+	return append(out, tail...)
+}
 
-	if d.Opencode != nil {
-		for _, id := range d.Opencode.Models {
-			add("opencode", "opencode/"+id)
+// splitRows divides the spare table rows between two lists: each starts at the
+// busiest floor rows, then grows alternately while height remains.
+func splitRows(spare, wantA, wantB, floor int) (int, int) {
+	if spare < 0 {
+		spare = 0
+	}
+	if wantA > 0 && wantB > 0 {
+		if floor > spare/2 {
+			floor = spare / 2
 		}
+	} else {
+		floor = 0
+	}
+	a, b := wantA, wantB
+	if a > floor {
+		a = floor
+	}
+	if b > floor {
+		b = floor
+	}
+	for spare-a-b > 0 && (a < wantA || b < wantB) {
+		if a < wantA {
+			a++
+		} else if b < wantB {
+			b++
+		}
+		if spare-a-b > 0 && b < wantB {
+			b++
+		}
+	}
+	return a, b
+}
+
+type modelGroup struct {
+	prov  string
+	ids   []string
+	tails []string // trailing column: freepi multiplier, route vias
+}
+
+// modelGroups lists each backend catalog in display order.
+func (m *dashModel) modelGroups() []modelGroup {
+	d := m.d
+	var gs []modelGroup
+	if d.Opencode != nil && len(d.Opencode.Models) > 0 {
+		gs = append(gs, modelGroup{prov: "opencode", ids: prefixed("opencode/", d.Opencode.Models)})
 	}
 	if d.Freepi != nil {
+		mults := map[string]string{}
+		for _, a := range d.Freepi.Accounts {
+			for k, v := range a.Mults {
+				mults[k] = v
+			}
+		}
 		seen := map[string]bool{}
+		var ids, tails []string
 		for _, a := range d.Freepi.Accounts {
 			for _, id := range a.Models {
 				if !strings.Contains(id, "/") {
@@ -788,52 +828,132 @@ func (m *dashModel) modelLines() []string {
 					continue
 				}
 				seen[id] = true
-				add("freepi", id)
+				ids = append(ids, id)
+				tails = append(tails, mults[bareID(id)])
 			}
+		}
+		if len(ids) > 0 {
+			gs = append(gs, modelGroup{prov: "freepi", ids: ids, tails: tails})
 		}
 	}
 	if d.Antseed != nil {
-		for _, id := range prefixed("antseed/", d.Antseed.Models) {
-			add("antseed", id)
+		ids := d.Antseed.Models
+		if len(ids) == 0 { // a placeholder row, still backend-prefixed
+			if d.Antseed.StaleFor == "" {
+				ids = []string{"discovering…"}
+			} else {
+				ids = []string{"no free models"}
+			}
 		}
+		gs = append(gs, modelGroup{prov: "antseed", ids: prefixed("antseed/", ids)})
 	}
-	if d.Nous != nil && d.Nous.Enabled {
-		for _, id := range prefixed("nous/", d.Nous.Models) {
-			add("nous", id)
+	if len(d.Keys) > 0 {
+		names := make([]string, 0, len(d.Keys))
+		for _, k := range d.Keys {
+			names = append(names, k.Name)
 		}
+		gs = append(gs, modelGroup{prov: "nvidia", ids: []string{"nvidia/keys: " + strings.Join(names, ", ")}})
 	}
-	if d.Uno != nil && d.Uno.Enabled {
-		for _, id := range prefixed("uno/", d.Uno.Models) {
-			add("uno", id)
-		}
+	if d.Nous != nil && len(d.Nous.Models) > 0 {
+		// portal ids already hold a slash, so the generic prefixing below
+		// would leave them bare and miss the usage.by_model key.
+		gs = append(gs, modelGroup{prov: "nous", ids: prefixed("nous/", d.Nous.Models)})
 	}
-	if d.OpenRouter != nil && d.OpenRouter.Enabled {
-		for _, id := range prefixed("openrouter/", d.OpenRouter.Models) {
-			add("openrouter", id)
-		}
+	if d.Uno != nil && len(d.Uno.Models) > 0 {
+		gs = append(gs, modelGroup{prov: "uno", ids: d.Uno.Models})
+	}
+	if d.OpenRouter != nil && len(d.OpenRouter.Models) > 0 {
+		gs = append(gs, modelGroup{prov: "openrouter", ids: prefixed("openrouter/", d.OpenRouter.Models)})
 	}
 	if d.Route != nil && d.Route.Enabled {
+		g := modelGroup{prov: "route"}
 		for _, r := range d.Route.Routes {
-			id := r.ID
-			via := cDim.Render(strings.Join(r.Via, ","))
+			g.ids = append(g.ids, r.ID)
+			g.tails = append(g.tails, strings.Join(r.Via, " · "))
+		}
+		if len(g.ids) > 0 {
+			gs = append(gs, g)
+		}
+	}
+	return gs
+}
+
+// bareID is python's full.split("/", 1)[-1].
+func bareID(id string) string {
+	if i := strings.Index(id, "/"); i >= 0 {
+		return id[i+1:]
+	}
+	return id
+}
+
+// modelRows builds the full model table, round-robin across backends: a row
+// from every family lands before any one spends the whole cap, so the late
+// catalogs (openrouter, route) are never starved by opencode's list.
+func (m *dashModel) modelRows() [][]string {
+	d := m.d
+	byModel := nil2(d)
+	bench := benchLookup(d.Benchmarks)
+
+	gs := m.modelGroups()
+	worst := 0
+	for _, g := range gs {
+		if len(g.ids) > worst {
+			worst = len(g.ids)
+		}
+	}
+	var rows [][]string
+	for i := 0; i < worst; i++ {
+		for _, g := range gs {
+			if i >= len(g.ids) {
+				continue
+			}
+			val := g.ids[i]
+			// every row is one full id: provider and model never split, so the
+			// table matches what a client sends and what /status keys usage by.
+			full := val
+			if !strings.Contains(val, "/") {
+				full = g.prov + "/" + val
+			}
+			req, tok, tps := "0", cDim.Render("·"), cDim.Render("·")
+			if t, ok := modelTotals(byModel, full); ok {
+				req = fmtInt(int(t.Requests))
+				tok = cDim.Render(fmtTok(int(t.Prompt + t.Completion)))
+				if t.DurationMs > 0 {
+					tps = cDim.Render(fmt.Sprintf("%.1f", float64(t.Completion)/(float64(t.DurationMs)/1000)))
+				}
+			}
+			tail := ""
+			if i < len(g.tails) && g.tails[i] != "" {
+				tail = cDim.Render(g.tails[i])
+			}
 			rows = append(rows, []string{
-				cDim.Render("·"),
-				provStyle("route").Render(id) + cDim.Render("  "+plainVia(r.Via)),
-				"", "", via,
+				healthCell(d.Health, full),
+				provStyle(g.prov).Render(full),
+				scoreCell(bench(full)),
+				req, tok, tps, tail,
 			})
 		}
 	}
+	return rows
+}
 
+// modelLines draws the model table, capped at limit rows.
+func modelLines(rows [][]string, limit int) []string {
 	if len(rows) == 0 {
 		return []string{cDim.Render("no models (pool still starting)"), ""}
 	}
+	want := len(rows)
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	cols := []colSpec{{"", false}, {"model", false}, {"score", true}, {"req", true},
+		{"tokens", true}, {"tok/s*", true}, {"", false}}
 	out := drawTable(cols, rows)
+	if len(rows) < want {
+		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more models · taller terminal shows more", want-len(rows))))
+	}
 	out = append(out, "")
 	return out
-}
-
-func plainVia(via []string) string {
-	return strings.Join(via, ",")
 }
 
 // nil2 returns the per-model usage totals for the current status snapshot.
@@ -890,7 +1010,8 @@ func cell(v string, w int, right bool) string {
 	return padR(v, w)
 }
 
-func (m *dashModel) laneLines() []string {
+// laneLines draws the lane table, capped at limit rows.
+func (m *dashModel) laneLines(limit int) []string {
 	lanes := append([]laneStatus(nil), m.d.ZenLanes...)
 	if len(lanes) == 0 {
 		return nil
@@ -908,43 +1029,51 @@ func (m *dashModel) laneLines() []string {
 		return lanes[i].ID < lanes[j].ID
 	})
 
-	cols := []colSpec{{"lane", false}, {"exit", false}, {"cc", false}, {"ttfb", true},
-		{"req", true}, {"429", true}, {"avg turn", true}, {"tokens", true}}
-	anyCC := false
-	for _, l := range lanes {
-		if l.Country != "" {
-			anyCC = true
-		}
+	want := len(lanes)
+	if limit > 0 && want > limit {
+		lanes = lanes[:limit]
 	}
 	var rows [][]string
-	var tokSum int64
-	for i, l := range lanes {
-		if i == 8 {
-			break
-		}
+	anyCC := false
+	for _, l := range lanes {
 		lane := l.ID
-		if lipgloss.Width(lane) > 18 {
-			lane = ansi.Truncate(lane, 17, "…")
+		if lane == "" {
+			lane = "?"
 		}
-		exit, cc, ttfb := "direct", "", "·"
-		if e, ok := exits[l.Proxy]; ok {
-			exit = e.Proxy
+		if lipgloss.Width(lane) > 14 {
+			lane = ansi.Truncate(lane, 14, "")
+		}
+		exit, ttfb := cDim.Render("—"), "·"
+		if l.Proxy != "" {
+			exit = l.Proxy
+			if i := strings.Index(exit, "://"); i >= 0 {
+				exit = exit[i+3:]
+			}
 			if lipgloss.Width(exit) > 24 {
 				exit = ansi.Truncate(exit, 23, "…")
 			}
-			cc = e.Country
-			ttfb = fmtMs(e.Latency)
+			ttfb = fmtMs(exits[l.Proxy].AvgMs)
 		}
-		r429 := "·"
+		cc := strings.TrimSpace(exits[l.Proxy].Country)
+		if cc == "" {
+			cc = strings.TrimSpace(l.Country)
+		}
+		if cc == "" || cc == "??" {
+			cc = "·"
+		} else {
+			anyCC = true
+		}
+		r429 := strconv.Itoa(l.RateLimit)
 		if l.RateLimit > 0 {
-			r429 = cYellow.Render(strconv.Itoa(l.RateLimit))
+			r429 = cYellow.Render(r429)
 		}
 		rows = append(rows, []string{
-			lane, exit, cc, ttfb, fmtInt(l.Requests), r429,
-			fmtMs(l.AvgMs), fmtTok(l.Prompt + l.Completion),
+			cSlate.Render(lane), exit, cc, ttfb, fmtInt(l.Requests), r429,
+			fmtMs(l.AvgMs), fmtTok(l.Tokens),
 		})
-		tokSum += int64(l.Prompt + l.Completion)
 	}
+	cols := []colSpec{{"lane", false}, {"exit", false}, {"cc", false}, {"ttfb", true},
+		{"req", true}, {"429", true}, {"avg turn", true}, {"tokens", true}}
 	if !anyCC {
 		c := append([]colSpec{}, cols[:2]...)
 		c = append(c, cols[3:]...)
@@ -954,9 +1083,8 @@ func (m *dashModel) laneLines() []string {
 		}
 	}
 	out := drawTable(cols, rows)
-	if len(lanes) > 8 {
-		out = append(out, cDim.Render(fmt.Sprintf("%d more lanes · %s tok across %d lanes",
-			len(lanes)-8, fmtTok(int(tokSum)), len(lanes))))
+	if len(lanes) < want {
+		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more lanes · taller terminal shows more", want-len(lanes))))
 	}
 	out = append(out, "")
 	return out
