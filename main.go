@@ -2216,6 +2216,9 @@ func (p *Pool) nudgePostResponses(r *http.Request, target string, nb []byte, ses
 		}
 		up, err := cl.Do(req)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return nil // caller gone: nothing to blame on the exit
+			}
 			if isTLSFailure(err) {
 				banTLSExit(proxy)
 			} else if noteExitTransportErr(proxy) {
@@ -4080,6 +4083,19 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 // /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time, reqID string) {
 	realModel := strings.TrimPrefix(model, "opencode/")
+	// failBody is the caller's own body, kept for zenFreeFailover: the zen
+	// reshaping below rewrites model and injects zen's tool ballast.
+	failBody := body
+	// a spent shared budget cannot be rotated past, so it is not worth a
+	// ladder of hops: serve the model elsewhere, or say why not.
+	if zenFreeCapped() {
+		acclog.Printf("%s opencode free budget spent until %s, model=%s", reqID, time.Unix(zenFreeUntil.Load(), 0).UTC().Format(time.RFC3339), model)
+		if p.zenFreeFailover(w, r, failBody, realModel, isStream, start, reqID) {
+			return
+		}
+		writeJSONError(w, http.StatusServiceUnavailable, zenFreeSpentMsg(model))
+		return
+	}
 	// shape follows the client path, not the model: a responses-shaped body
 	// to a chat-only model (or vice versa) is converted so zen sees the
 	// shape its endpoint accepts and the client gets its own shape back.
@@ -4312,6 +4328,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": resp.StatusCode, "headers": resp.Header, "attempt": zenRetries, "model": realModel})
 		}
 		if err != nil {
+			if r.Context().Err() != nil {
+				// the caller went away (cancel, timeout): the exit never
+				// finished a turn, so it is not blamed, marked, or dropped.
+				return
+			}
 			if isTLSFailure(err) {
 				// mitm exit: ban it pool-wide and evacuate every pinned
 				// lane, not just this one.
@@ -4358,17 +4379,34 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		gaveUp := false
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 			st := resp.StatusCode
+			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
-			acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s lane=%s, rotating exit+session",
-				st, zenRetries, zenRetryLabel(), model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
-			if proxy == "" {
-				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
+			// zen's free-tier 429 answers "FreeUsageLimitError" on whichever
+			// exit took the request. the budget behind it is shared by the
+			// whole pool, so the exit is fine and marking it would only
+			// park healthy plumbing: that cap goes to the failover instead.
+			freeCap := zenFreeUsageCap(eb)
+			acclog.Printf("  opencode rate-limited %d (retry %d/%d) freetier=%t model=%s country=%s proxy=%s lane=%s, rotating exit+session",
+				st, zenRetries, zenRetryLabel(), freeCap, model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
+			if freeCap {
+				noteZenFreeCap(resp.Header)
+				noteExitOK(proxy, realModel)
+				if p.zenFreeFailover(w, r, failBody, realModel, isStream, start, reqID) {
+					return
+				}
+				resp, gaveUp = exhaustedExits(model, st), true
+			} else {
+				if proxy == "" {
+					laneEscalate(lane, realModel) // direct got limited: give the lane an exit
+				}
+				noteExit429(proxy, realModel)
 			}
-			noteExit429(proxy, realModel)
-			if zenLastRetry(zenRetries, attempts) {
+			if !freeCap && zenLastRetry(zenRetries, attempts) {
 				// the ladder is spent on a written-off pool: refill and buy
 				// more hops instead of handing the caller a 503, as long as
 				// the marks (not a merely busy model) are what bounded it.
+				// a free-tier cap is upstream-wide, not a written-off pool:
+				// a forced refill would only wait out the recovery budget.
 				if ladderExtend(r.Context(), &poolRecoverUntil) {
 					attempts++
 					lane = laneHandoff(lane, laneFailover(lane))
@@ -4379,7 +4417,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				// the client hears about the proxy pool, never the 429 we
 				// just absorbed.
 				resp, gaveUp = exhaustedExits(model, st), true
-			} else {
+			} else if !freeCap {
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
@@ -4512,6 +4550,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		resetZenNetErrs()
 		if resp.StatusCode == http.StatusOK {
+			// a 200 proves the free budget is back, whatever the last
+			// retry-after said.
+			clearZenFreeCap()
 			p.noteZenSuccess(sessionID, usedProxy)
 			noteExitOK(usedProxy, realModel)
 			laneTouch(lane, usedProxy, realModel)

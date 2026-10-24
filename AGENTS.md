@@ -52,7 +52,13 @@ incidental machinery.
   `verifyProxy` probes `POST /chat/completions` with an invalid message
   role (`verifyProbeBody` — 0 tokens/0 inference cost, returns 400 when
   the IP passes the gate and 403 FreeTierError when the IP is blocked or
-  daily-capped). a working exit stays pinned to its lane across turns
+  daily-capped; a 429 — `FreeUsageLimitError` included — is `verifyCapped`,
+  since the exit dialed and the gate parsed the body: rotation handles the
+  limit, exclusion does not). the daily cap splits in two: per-exit churn a
+  sweep can replace (~50-100 requests), and one shared free-tier bucket that
+  answers every exit with the same 00:00 UTC refill (section 5) — rotation
+  clears the first and cannot touch the second, which is why that one
+  fails over instead of rotating. a working exit stays pinned to its lane across turns
   until it actually hits a 429 or 403 cap (`noteExitGate` parks + drops
   the exit and evacuates its lane onto a fresh one). upstream tool call names pointing at the ballast map back
   via `zenToolAliases` in `toolNames.resolve`.- **freepi**: ad-supported `freeepi/<model>` ids via `https://api.freepi.ai`.
@@ -176,21 +182,51 @@ incidental machinery.
 
 | signal | meaning | action |
 |---|---|---|
-| 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15), extends itself when the pool itself is written off (below), and only then ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for the cycle (`noteExit429`), cleared by the next refresh. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
+| 429 | per exit+model rate limit. instant exit+session rotation (`laneRotate`), no cooldown waits, and never forwarded: the ladder retries across lanes (`max_retries` default 15), extends itself when the pool itself is written off (below), and only then ends in a `proxy_exhausted` 503. 2 in a row or 6 a cycle marks that pair `rate_limited` for `exit_429_cool_secs` (default 300, capped at the refresh interval), so a busy exit comes back on its own instead of sitting out the cycle; the next refresh clears the marks and counters too. the mark is per model because zen limits the pair: an exit busy on one model keeps serving the rest | normal, no fix |
 | 403 FreeTierError, "current network"/"abusive traffic" | the exit IP hit its daily cap or was flagged (`zenGateIPBlocked`). parked for `exit_burn_minutes` (`noteExitGate`) and dropped from the pool; the lane rotates onto a fresh exit and the request still succeeds | normal, no fix — this is the everyday churn: ~50-100 requests per IP, then move to the next one |
-| 403 FreeTierError, "can only be used from within OpenCode" | the request shape itself was refused, so the IP is fine. burns that exit+model for the cycle (`noteExitModelBurned`) and rotates, but never parks the exit | fix the shape (headers/tools/stream), not the pool. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately |
+| 403 FreeTierError, "can only be used from within OpenCode" | the request shape itself was refused, so the IP is fine. burns that exit+model for the cycle (`noteExitModelBurned`) and rotates, but never parks the exit | fix the shape (headers/tools/stream), not the pool. do NOT inject gate stubs into tool-less bodies — the summarizer emits calls zen rejects ("tool call not allowed while generating summary"); `ensureZenTools` skips empty `tools` deliberately. if it survives rotation, work through "403 that survives rotation" below. shape gate verified live 2026-10-24 on `/inference/v1/chat/completions`: a body with no `tools` → 403, `stream:false` → 403, and dropping the session headers → 403; `User-Agent: opencode/1.18.29` and an extra `x-opencode-request` still pass. the gate runs before the quota check, so a 429 proves the shape was accepted |
 | 502/503/504 from an exit | dead exit or a proxy in front of it failing (`zenRetryableStatus`). rotated like a 429, also never forwarded | normal noise, no fix |
 | 403 geo (`not available in your country`) / `[user_blocked]` | exit banned or region-blocked. `dropProxy` + failover; threshold (`error_threshold`, default 3) refreshes pool | normal, no fix |
 | 502 / transport error | dead exit, dropped from pool (`dropProxy`, transport closed) | normal noise, no fix |
 | 529 | treated as 429 in both NIM and zen paths | normal, no fix |
+| 429 `FreeUsageLimitError`, "Free usage limit reached" | zen's **shared** free budget, not this exit's limit. one bucket sits behind `Bearer public`: measured on 140+ IPs (pool exits, unrelated public lists, and a home line across four cloudflare colos) all answer it with the same countdown, and the same deadline lands on 00:00 UTC regardless of IP (`Retry-After` 22 856s at 17:39 UTC). the exit is healthy; the budget is empty | not rotatable, so do not spend a ladder on it: `noteZenFreeCap` records the deadline, the exit is marked ok (`noteExitOK`), and the request goes to `zenFreeFailover` (route.go) — ~2s to a 200 from another backend instead of 16 hops to a 503. the marker short-circuits the next requests before they touch an exit (`zenFreeCapped`) and clears on any zen 200 or at the deadline; one request a minute still probes zen so a refill is noticed hours before the deadline. re-confirmed 2026-10-24 19:15 UTC with the app's own byte-exact body sent direct from the home line (no proxy): 429 `FreeUsageLimitError`, so it is not an exit problem and not a shape problem. never forwarded |
 | persistent all-exit failure | no success for `stale_pool_secs` (default 15s) with a lane limited the whole time = stale pool/sessions: refresh + `resetStaleLanes` | fix the refresh/rotation path, not the retry loop |
 
-client contract: no zen response ever carries a rate limit. every 429/529
-an exit returns is absorbed by rotation, and a spent ladder answers
+client contract: no zen response ever carries a rate limit. every 429/529 an
+exit returns is absorbed by rotation, and a spent ladder answers
 `exhaustedExits` — a `proxy_exhausted` 503 naming the pool state — so the
 caller retries against us instead of waiting us out. `ProxyUnavailableMsg`
 is the shared text for the other "could not place this request on an exit"
 exits (dial-dead, no pin under `always_proxy`, empty pool).
+
+free-tier failover (`zenFailoverCands` / `zenFailoverRun`, route.go): while
+zen's shared budget is spent, `opencode/<model>` is served by another backend
+instead of a 503. attempts are ranked 0 = the model's own route key, 1 = a
+same-family key (`zenFamily`: same vendor token and same tier word, so
+`deepseek-v4.1-flash` reaches `deepseek-v4-flash`), 2 = `zenFallbackKeys`
+(`glm-5.3-flash`, `beam`, `deepseek-v4.1-flash`) for ids no other backend
+serves (`big-pickle`, `flint-40b`, the nemotron rows). `opencode` is skipped
+and each rank is latency-ordered by the backend ewma.
+
+the chain streams and hedges; it does not buffer:
+- every attempt writes through its own `zenLatch`, so the first 200 owns the
+  client and streams token by token. buffering the whole body is what made a
+  failover answer cost a full generation before the caller saw a byte.
+- a candidate that stays silent past `zenHedgeDelay` (1.5s, or 300ms for a
+  backend whose ewma is past 4s) gets the next one started alongside it; a
+  fast failure moves on at once. first 200 wins, losers are cancelled.
+- the whole chain is bounded by `zenFailoverBudget` (9s): beyond it the
+  caller gets `zenFreeSpentMsg`, which names the refill time. the last
+  candidate keeps the rest of the budget instead of being cut off on launch.
+- every answer names the backend in `X-Nimroute-Served-By`, and the log
+  carries `substituted=` — the model that answered is not always the one that
+  was asked for.
+
+known limit: the substitute handlers (`freepi`, `antseed`) fetch upstream
+with `stream:false` and synthesize the SSE afterwards, so their ttfb is the
+generation, not the first token. sequential requests land at ~0.5-1s on
+antseed; a long generation or heavy concurrency is bounded by that backend,
+not by this chain.
 
 two rules keep that 503 rare, both in zenlanes.go:
 - no lane ever sends without an exit. a lane that draws none waits
@@ -235,8 +271,13 @@ dials at any claimed speed, and the list's own figure tops out around
 6.5s, so 10000 admits the whole file). `pool_size` caps candidates per
 sweep; 0 (the default) dials the filtered list and fans out to 200 verify
 workers, which is what an uncapped pool needs to finish in under a minute.
-lanes are capped at the pool size (`laneCapFor`) so every lane can hold
-its own exit; a 30m refresh
+lanes are capped at the exits a lane can actually hold (`laneCapFor`, every
+lane-creating path including `sharedLaneLocked`'s fallback; `usableExitCount`
+drops dead and gate-parked members, since a raw pool count promises pins the
+sweep just proved dead), and the table is trimmed back to that when it shrinks
+(`trimLanesToPool`, from `ensureLanePins`, the drop path, a spent pool wait,
+and every request completion via `repairLanes`): a lane with no exit cannot
+send at all under `always_proxy`. a 30m refresh
 (`refresh_interval_minutes`) refills the table and re-pins idle lanes
 (`ensureLanePins`). the sweep fetches `proxyListURL` and falls back to the
 same json straight from the repo (`proxyListFallback`) when the site is
@@ -247,6 +288,42 @@ to the pool once they are all taken/dead (`pickLaneProxyExcluding`), and a
 transport failure marks a configured exit dead like a pool exit — bare
 `dropProxy` is a no-op for one, so it used to be re-picked on every
 request.
+
+### 403 that survives rotation
+
+when `403 FreeTierError` comes back from several distinct exits with fresh
+sessions — i.e. rotation is working and the upstream still refuses — the
+answer is our request shape, not the pool. our imitation has drifted before
+(tools array, identity headers) and will drift again. do not stop at "the
+tier is spent" from our own probes alone: the other clients are on the same
+free tier and are evidence of today's accepted shape.
+
+clone all four into one scratch folder outside the tree (`/tmp/zenrefs`),
+then work the list in order:
+
+- `https://github.com/anomalyco/opencode` — the client we mimic
+  (`session/llm/request.ts` is the source of truth for the zen branch)
+- `https://github.com/cheaper-inference/OmniRoute`
+- `https://github.com/decolua/9router`
+- `https://github.com/Ebony-Vinyl/dsh-our-free-model`
+
+1. find their zen path in each (`grep -rn "opencode\.ai\|x-opencode\|Bearer public"`).
+   read how they build the request — upstream path, identity headers, body
+   shape, tools array, session/request ids, stream handling.
+2. diff the four against each other *and* against ours (`setZenHeaders`,
+   `zenOCDefsJSON`, `zenMessageID`, `zenSessionID`, `zenFwdHeaders`). what
+   they agree on is the shape zen accepts; what we send that none of them
+   send (or omit that they all send) is the bug.
+3. reproduce with curl or a scratch script against the live upstream before
+   touching Go: one request per variant, record status and body. a variant
+   that answers 200 for one model must be re-run across every
+   `opencode/<model>` id from `/v1/models` — the gate is per model, and an
+   id that only works in one body shape proves nothing about the rest.
+4. only then port the winning shape into the proxy, smallest diff (section
+   2). done means every listed zen model serves through :5419 on both
+   `/v1/chat/completions` and `/v1/messages` — not one probe returning 200.
+5. delete the scratch folder and any mock/probe scripts with the rest of the
+   scratch artifacts (section 2).
 
 Investigate only when rotation stops working: same rate-limited exit
 reused, sessions never refreshing, refresh storms (see docs/TODO.md item

@@ -2523,6 +2523,16 @@ func estimateTokens(body []byte) int {
 // handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
 func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time, reqID string) {
 	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
+	// a spent shared budget cannot be rotated past (see zenFreeUntil):
+	// serve the model elsewhere before spending a single exit on it.
+	if zenFreeCapped() {
+		acclog.Printf("%s opencode free budget spent until %s, model=%s", reqID, time.Unix(zenFreeUntil.Load(), 0).UTC().Format(time.RFC3339), clientModel)
+		if p.zenFreeFailoverAnthropic(w, r, origBody, oaiBody, clientModel, zenModel, tnames, isStream, start, reqID) {
+			return
+		}
+		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", zenFreeSpentMsg(clientModel))
+		return
+	}
 	endpoint := endpointForModel(zenModel)
 	isResponses := endpoint == "/responses"
 	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, zenModel, endpoint)
@@ -2718,6 +2728,11 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				zenDebugCapture("resp", map[string]any{"req_id": reqID, "status": up.StatusCode, "headers": up.Header, "attempt": zenRetries, "model": zenModel})
 			}
 			if err != nil {
+				if r.Context().Err() != nil {
+					// the caller went away (cancel, timeout): the exit never
+					// finished a turn, so it is not blamed, marked, or dropped.
+					return nil
+				}
 				if isTLSFailure(err) {
 					// mitm exit: ban it pool-wide and evacuate every
 					// pinned lane, not just this one.
@@ -2757,17 +2772,33 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			gaveUp := false
 			if up.StatusCode == http.StatusTooManyRequests || up.StatusCode == 529 {
 				st := up.StatusCode
+				eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 				up.Body.Close()
-				acclog.Printf("  opencode rate-limited %d (retry %d/%d) model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
-					st, zenRetries, zenRetryLabel(), clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
-				if proxy == "" {
-					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
+				// a free-tier 429 (FreeUsageLimitError) is the shared budget,
+				// not this exit's limit: the exit is healthy, so it is not
+				// marked, and the model goes to the failover instead.
+				freeCap := zenFreeUsageCap(eb)
+				acclog.Printf("  opencode rate-limited %d (retry %d/%d) freetier=%t model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
+					st, zenRetries, zenRetryLabel(), freeCap, clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
+				if freeCap {
+					noteZenFreeCap(up.Header)
+					noteExitOK(proxy, zenModel)
+					if p.zenFreeFailoverAnthropic(w, r, origBody, oaiBody, clientModel, zenModel, tnames, isStream, start, reqID) {
+						return zenAnswered
+					}
+					up, gaveUp = exhaustedExits(clientModel, st), true
+				} else {
+					if proxy == "" {
+						laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
+					}
+					noteExit429(proxy, zenModel)
 				}
-				noteExit429(proxy, zenModel)
-				if zenLastRetry(zenRetries, attempts) {
+				if !freeCap && zenLastRetry(zenRetries, attempts) {
 					// the ladder is spent on a written-off pool: refill and buy
 					// more hops instead of handing the caller a 503, as long as
 					// the marks (not a merely busy model) are what bounded it.
+					// a free-tier cap is upstream-wide, not a written-off pool:
+					// a forced refill would only wait out the recovery budget.
 					if ladderExtend(r.Context(), &poolRecoverUntil) {
 						attempts++
 						lane = laneHandoff(lane, laneFailover(lane))
@@ -2778,7 +2809,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					// the client hears about the proxy pool, never the 429 we
 					// just absorbed.
 					up, gaveUp = exhaustedExits(clientModel, st), true
-				} else {
+				} else if !freeCap {
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
@@ -2902,6 +2933,8 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			resetZenNetErrs()
 			if up.StatusCode == http.StatusOK {
+				// a 200 proves the free budget is back.
+				clearZenFreeCap()
 				p.noteZenSuccess(sessionID, proxy)
 				noteExitOK(proxy, zenModel)
 				laneTouch(lane, proxy, zenModel)
@@ -2912,6 +2945,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 
 	resp = zenPost(oaiBody, isStream, "")
+	if resp == zenAnswered {
+		return
+	}
 	if resp == nil {
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", proxyUnavailableMsg(zenModel))
 		return
@@ -2929,7 +2965,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		}
 		errMsg := extractErrMessage(string(rb))
 		acclog.Printf("!! opencode zen %d model=%s err=%q", resp.StatusCode, clientModel, errMsg)
-		writeAnthropicError(w, resp.StatusCode, "api_error", errMsg)
+		kind := "api_error"
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// a rate limit is retryable, and the client only retries a
+			// rate_limit_error; api_error reads as a bug in the proxy.
+			kind = "rate_limit_error"
+		}
+		writeAnthropicError(w, resp.StatusCode, kind, errMsg)
 		return
 	}
 

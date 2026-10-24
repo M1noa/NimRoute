@@ -184,10 +184,15 @@ type zenConfig struct {
 	// (exit, model) pair, which leaves the exit serving other models. 0 = 30.
 	ExitBurnMinutes int `yaml:"exit_burn_minutes"`
 	// Exit429Streak 429s in a row, or Exit429Total 429s since the last
-	// refresh, retires an exit until the next refresh. 0 disables either
-	// trip (0 = 2 and 6).
+	// refresh, retires an exit for Exit429CoolSecs. 0 disables either trip
+	// (0 = 2 and 6).
 	Exit429Streak int `yaml:"exit_429_streak"`
 	Exit429Total  int `yaml:"exit_429_total"`
+	// Exit429CoolSecs is how long a retired exit sits out before it is
+	// tried again. a 429 is usually a short burst, not a dead exit, so the
+	// mark must lapse on its own instead of waiting for the next refresh.
+	// 0 = 300, negative = until the next refresh.
+	Exit429CoolSecs int `yaml:"exit_429_cool_secs"`
 	// MaxRetries caps zen upstream retries per request (attempts =
 	// MaxRetries+1). 0 = default (first try + 15 retries, one walk of a
 	// full lane table), negative = single attempt, no retry. a rate limit
@@ -494,6 +499,7 @@ func defaultConfig() appConfig {
 			ExitBurnMinutes:          30,
 			Exit429Streak:            2,
 			Exit429Total:             6,
+			Exit429CoolSecs:          300,
 			MaxRetries:               15,
 			LaneGateMaxSecs:          10,
 			StalePoolSecs:            15,

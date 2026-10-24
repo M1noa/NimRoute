@@ -115,6 +115,8 @@ func setLaneProxy(l *zenLane, p string) {
 // lanes whose pin left the pool or got marked, get a fresh unique pick.
 // runs after each pool refresh, so a rotation that emptied the table comes
 // back with every lane serving on its own exit instead of limping direct.
+// the table is trimmed to the pool afterwards: a lane that could not draw an
+// exit is a lane that cannot send at all.
 func ensureLanePins() {
 	lanesMu.Lock()
 	var stale []*zenLane
@@ -126,6 +128,70 @@ func ensureLanePins() {
 	lanesMu.Unlock()
 	for _, l := range stale {
 		laneReproxy(l, "")
+	}
+	trimLanesToPool()
+}
+
+// trimLanesToPool drops lanes that hold no exit once the table outgrows the
+// exits a lane can actually hold. one exit per lane means a table larger than
+// that can never pin every lane, and a pinless lane is one that cannot send
+// (always_proxy) or sits out the whole pool-recovery wait for an exit no other
+// lane will give up. the surplus goes idlest first, pinless only, so a serving
+// lane is never touched; the next request opens a fresh lane under the cap
+// instead.
+func trimLanesToPool() {
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	trimLanesToPoolLocked()
+}
+
+// trimLanesToPoolLocked is trimLanesToPool with lanesMu already held.
+func trimLanesToPoolLocked() {
+	// fast path: a table where every idle lane holds an exit has nothing to
+	// drop, and the check costs no locks. this runs at request completion.
+	surplus := false
+	for _, l := range lanes {
+		if l.proxy == "" && l.inflight == 0 {
+			surplus = true
+			break
+		}
+	}
+	if !surplus {
+		return
+	}
+	zenProxiesMu.RLock()
+	pool := len(zenProxies)
+	zenProxiesMu.RUnlock()
+	if pool == 0 {
+		return // cold or mid-sweep: an empty pool is not a verdict on the table
+	}
+	limit := laneCapFor()
+	if len(lanes) <= limit {
+		return
+	}
+	type spare struct {
+		key  string
+		lane *zenLane
+	}
+	var victims []spare
+	for k, l := range lanes {
+		// inflight lanes keep their seat: a request is still walking this
+		// lane through the pool wait, and dropping it would hide the lane
+		// from the taken set while its send is live.
+		if l.proxy == "" && l.inflight == 0 {
+			victims = append(victims, spare{k, l})
+		}
+	}
+	if len(victims) == 0 {
+		return
+	}
+	sort.Slice(victims, func(i, j int) bool { return victims[i].lane.lastUsed.Before(victims[j].lane.lastUsed) })
+	for _, v := range victims {
+		if len(lanes) <= limit {
+			break
+		}
+		delete(lanes, v.key)
+		dropConvoSeen(v.key)
 	}
 }
 
@@ -593,8 +659,28 @@ func deadTTL() time.Duration {
 	return 30 * time.Minute
 }
 
-// markExitRateLimited pulls one exit+model pair out of rotation for a
-// refresh cycle: log it, mark it, and leave every other model on that exit
+// rateLimitCooldown is how long a retired exit sits out before the pool may
+// hand it out again. a 429 is a burst, not a verdict: the mark lapses on its
+// own so a busy exit comes back into rotation without waiting for the next
+// refresh. negative (or a refresh cycle shorter than the cooldown) keeps the
+// old behaviour of holding the mark until the sweep clears it.
+func rateLimitCooldown() time.Duration {
+	s := cfg().Zen.Exit429CoolSecs
+	if s == 0 {
+		return 5 * time.Minute
+	}
+	if s < 0 {
+		return poolInterval()
+	}
+	d := time.Duration(s) * time.Second
+	if d > poolInterval() {
+		return poolInterval()
+	}
+	return d
+}
+
+// markExitRateLimited pulls one exit+model pair out of rotation for one
+// cooldown: log it, mark it, and leave every other model on that exit
 // alone. the exit stays in the pool on purpose: it still serves other models
 // and it will verify again, and the lane that tripped this already rotated
 // off it, so no other lane is moved.
@@ -609,12 +695,12 @@ func markExitRateLimited(proxy, model, reason string) {
 	}
 	mk := st.rl[model]
 	mk.at = time.Now()
-	mk.until = mk.at.Add(poolInterval())
+	mk.until = mk.at.Add(rateLimitCooldown())
 	st.rl[model] = mk
 	st.reason = reason + " on " + model
 	exitStateMu.Unlock()
-	acclog.Printf("  zen exit %s rate-limited for %s until next refresh (%s: %d in a row, %d this cycle)",
-		redactProxyUserinfo(proxy), model, reason, mk.streak, mk.total)
+	acclog.Printf("  zen exit %s rate-limited for %s for %v (%s: %d in a row, %d this cycle)",
+		redactProxyUserinfo(proxy), model, rateLimitCooldown(), reason, mk.streak, mk.total)
 }
 
 // markExitDead pulls an exit out for a hard failure and logs why.
@@ -653,8 +739,9 @@ func exit429Policy() (streak, total int) {
 }
 
 // noteExit429 records a 429 for one exit+model. the policy's streak in a row,
-// or cycle total, retires that pair until the next pool refresh: the exit
-// stays usable for every other model. returns true when the pair was pulled.
+// or cycle total, retires that pair for one cooldown: the exit stays usable
+// for every other model, and comes back when the mark lapses. returns true
+// when the pair was pulled.
 func noteExit429(proxy, model string) bool {
 	if proxy == "" || model == "" {
 		return false
@@ -955,19 +1042,37 @@ func laneCap() int {
 	return 25
 }
 
-// laneCapFor is laneCap trimmed to the pool. one exit per lane means a table
-// larger than the pool can never pin every lane, and the pinless leftovers
-// are what hammered one exit into 429s. an empty pool keeps the configured
-// cap (a cold start is still warming, not a verdict on the pool size).
+// laneCapFor is laneCap trimmed to the exits a lane can actually hold. one
+// exit per lane means a table larger than the pool can never pin every lane,
+// and the pinless leftovers are what hammered one exit into 429s. an empty
+// pool keeps the configured cap (a cold start is still warming, not a verdict
+// on the pool size).
 func laneCapFor() int {
 	c := laneCap()
-	zenProxiesMu.RLock()
-	n := len(zenProxies)
-	zenProxiesMu.RUnlock()
-	if n > 0 && n < c {
+	if n := usableExitCount(); n > 0 && n < c {
 		return n
 	}
 	return c
+}
+
+// usableExitCount is the pool less the exits no lane can hold right now: dead
+// ones and gate-parked ones. per-model marks do not count (the picker still
+// hands those out, they only order the pool), so a busy model never shrinks
+// the table. reading the pool count alone overstated it: a sweep verifies an
+// exit, the exit dies on its first real send, and every lane created against
+// it ends up pinless. 0 means an empty pool, not a verdict.
+func usableExitCount() int {
+	zenProxiesMu.RLock()
+	pool := append([]string(nil), zenProxies...)
+	zenProxiesMu.RUnlock()
+	n := 0
+	for _, p := range pool {
+		if exitDead(p) || exitGateCooling(p) {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 func laneTTL() time.Duration {
@@ -1229,6 +1334,7 @@ func laneFor(headerSession string, body []byte) *zenLane {
 		if len(lanes) < laneCapFor() {
 			l := &zenLane{id: shortLaneID(key), session: zenSession(), lastUsed: time.Now()}
 			lanes[key] = l
+			pinLocked(l, poolSnapshotForPins())
 			return l
 		}
 		// table full: convert the idlest shared lane into this key so a
@@ -1247,6 +1353,7 @@ func laneFor(headerSession string, body []byte) *zenLane {
 			k := "shared:" + l.session[len(l.session)-6:]
 			l.id = shortLaneID(k)
 			lanes[k] = l
+			pinLocked(l, poolSnapshotForPins())
 			return l
 		}
 	}
@@ -1300,6 +1407,9 @@ func convertSharedLocked(key string) *zenLane {
 		id:       shortLaneID(key),
 	}
 	lanes[key] = l
+	// the converted lane takes the victim's seat; pin it here so the swap does
+	// not hand the request a lane without an exit.
+	pinLocked(l, poolSnapshotForPins())
 	return l
 }
 
@@ -1318,14 +1428,58 @@ func ensureSharedLanes() {
 
 // ensureSharedLanesLocked is ensureSharedLanes with lanesMu already held.
 // new lanes get an epoch lastUsed so they land at the cold end of the lru
-// pick and hand out one per request before any lane is reused.
+// pick and hand out one per request before any lane is reused. each one is
+// pinned as it opens: a lane the top-up leaves without an exit is a lane
+// that may never be used and never be repaired, which is how the table
+// filled with pinless leftovers while free exits sat in the pool.
 func ensureSharedLanesLocked() {
+	if len(lanes) >= laneCapFor() {
+		return
+	}
+	pool := poolSnapshotForPins()
 	for len(lanes) < laneCapFor() {
 		l := &zenLane{id: "shared", session: zenSession(), lastUsed: time.Now()}
 		k := "shared:" + l.session[len(l.session)-6:]
 		l.id = shortLaneID(k)
 		lanes[k] = l
+		pinLocked(l, pool)
 	}
+}
+
+// poolSnapshotForPins copies the pin source for a caller that holds lanesMu
+// and cannot take the picker path.
+func poolSnapshotForPins() []string {
+	if cps := getCustomProxies(); len(cps) > 0 {
+		return append([]string(nil), cps...)
+	}
+	zenProxiesMu.RLock()
+	defer zenProxiesMu.RUnlock()
+	return append([]string(nil), zenProxies...)
+}
+
+// pinLocked stamps a freshly opened lane with an exit no other lane holds.
+// caller holds lanesMu: no picker, no reload, just a snapshot pick. dead,
+// gate-parked and rate-limited exits stay out; when no spare is left the lane
+// opens pinless and the dry-pool path hands it one on its first send.
+func pinLocked(l *zenLane, pool []string) {
+	taken := map[string]bool{}
+	for _, o := range lanes {
+		if o != l && o.proxy != "" {
+			taken[o.proxy] = true
+		}
+	}
+	var cands []string
+	for _, p := range pool {
+		if taken[p] || !exitUsable(p) {
+			continue
+		}
+		cands = append(cands, p)
+	}
+	if len(cands) == 0 {
+		return
+	}
+	sort.Slice(cands, func(i, j int) bool { return proxyWeight(cands[i]) > proxyWeight(cands[j]) })
+	stampLaneProxy(l, sampleWeighted(cands, 1)[0])
 }
 
 // cacheKeyOf reads the openai-compat prompt_cache_key (or camel
@@ -1376,11 +1530,16 @@ func sharedLaneLocked() *zenLane {
 		cands[0].lastUsed = now
 		return cands[0]
 	}
-	if len(lanes) < laneCap() {
+	// laneCapFor, not laneCap: a table larger than the pool can never pin
+	// every lane. this branch is how it grew past the pool before: a full
+	// table of hdr/pck lanes has no shared lane to convert, so every new
+	// request appended another shared lane that no exit could reach.
+	if len(lanes) < laneCapFor() {
 		l := &zenLane{id: "shared", session: zenSession(), lastUsed: now}
 		k := "shared:" + l.session[len(l.session)-6:]
 		l.id = shortLaneID(k)
 		lanes[k] = l
+		pinLocked(l, poolSnapshotForPins())
 		return l
 	}
 	// table full of pinned lanes: reuse the stalest one so the request
@@ -1394,6 +1553,7 @@ func sharedLaneLocked() *zenLane {
 	if best == nil {
 		l := &zenLane{id: "shared", session: zenSession(), lastUsed: now}
 		lanes["shared:fallback"] = l
+		pinLocked(l, poolSnapshotForPins())
 		return l
 	}
 	return best
@@ -2344,10 +2504,33 @@ func laneClaim(l *zenLane) {
 // idle again. no cooldown: the next request paces on laneGate instead.
 func laneDone(l *zenLane) {
 	lanesMu.Lock()
-	defer lanesMu.Unlock()
 	if l.inflight > 0 {
 		l.inflight--
 	}
+	lanesMu.Unlock()
+	repairLanes()
+}
+
+// repairLanes gives idle lanes that lost their exit another one, then drops
+// what the pool cannot cover. runs at request completion so a lane that ends
+// a request pinless is either one free exit away from serving again or one
+// lane too many, instead of sitting in the table until the next sweep.
+func repairLanes() {
+	lanesMu.Lock()
+	var pinless []*zenLane
+	for _, l := range lanes {
+		if l.proxy == "" && l.inflight == 0 {
+			pinless = append(pinless, l)
+		}
+	}
+	lanesMu.Unlock()
+	if len(pinless) == 0 {
+		return
+	}
+	for _, l := range pinless {
+		laneReproxy(l, "")
+	}
+	trimLanesToPool()
 }
 
 // laneHandoff transfers a request's claim on failover: the lane it leaves
@@ -2407,6 +2590,7 @@ func laneFailover(l *zenLane) *zenLane {
 		k := "shared:" + nl.session[len(nl.session)-6:]
 		nl.id = shortLaneID(k)
 		lanes[k] = nl
+		pinLocked(nl, poolSnapshotForPins())
 		return nl
 	}
 	return l
@@ -2472,6 +2656,7 @@ func laneProxyWait(ctx context.Context, l *zenLane, model string, until *time.Ti
 		// only a wait starts the clock: a request served on the first try
 		// draws no budget, so a later wait keeps all of it.
 		if !time.Now().Before(recoverDeadline(until)) {
+			trimLanesToPool()
 			return l, ""
 		}
 		select {

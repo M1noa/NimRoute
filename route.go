@@ -478,6 +478,345 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("route: all backends failed for %q", key))
 }
 
+// zenFallbackKeys are the route keys a zen-only id is served from while the
+// free budget is spent. big-pickle, flint-40b and the nemotron rows exist on no
+// other backend; answering with a mirrored model beats a 503, and the
+// substitution is named in the response header and the log. more than one key
+// because no single backend is always up: antseed, uno and freepi fail for
+// different reasons at different times.
+var zenFallbackKeys = []string{"glm-5.3-flash", "beam", "deepseek-v4.1-flash"}
+
+// zenFailoverCand is one attempt for a zen model while its budget is spent.
+// rank 0 is the caller's own model on another backend, 1 a family match and 2
+// the shared fallback: anything above 0 answers with a different model, which
+// the response header and the log both name.
+type zenFailoverCand struct {
+	id   string
+	rank int
+}
+
+// zenTierWords are the capability words a family substitution must match on:
+// answering a flash request with a pro model is a different product, not a
+// mirrored one.
+var zenTierWords = []string{"flash", "lite", "mini", "pro", "turbo", "max", "vl"}
+
+// zenTier returns the first tier word in a route key, "" when it has none.
+func zenTier(key string) string {
+	for _, tok := range strings.Split(key, "-") {
+		for _, w := range zenTierWords {
+			if tok == w {
+				return w
+			}
+		}
+	}
+	return ""
+}
+
+// zenFamily matches route keys from one model family: same vendor token and,
+// when either names a tier, the same tier (deepseek-v4.1-flash and
+// deepseek-v4-flash are one family; deepseek-v4.1-flash and deepseek-r1 are
+// not).
+func zenFamily(a, b string) bool {
+	if ta, tb := zenTier(a), zenTier(b); ta != tb {
+		return false
+	}
+	fa := strings.SplitN(a, "-", 2)[0]
+	fb := strings.SplitN(b, "-", 2)[0]
+	return fa != "" && fa == fb
+}
+
+// zenUnknownLatency is where a backend with no success sample ranks: neither
+// trusted to be fast nor demoted.
+const zenUnknownLatency = 1500
+
+// backendRank orders candidates by measured latency.
+func backendRank(cand string) float64 {
+	backend, _, _ := strings.Cut(cand, "/")
+	if ms := routeLatency(backend); ms > 0 {
+		return ms
+	}
+	return zenUnknownLatency
+}
+
+// zenFailoverCands lists attempts for a zen model while the free budget is
+// spent: its own route key first, then same-family keys (deepseek-v4.1-flash
+// exists only on freepi, while the family's deepseek-v4-flash is on antseed),
+// then one widely-mirrored model so a zen-only id still answers. opencode is
+// skipped — it is the backend that answered the cap — as is an excluded
+// backend. each rank is latency-ordered, so the half-second backend answers
+// before the eighteen-second one.
+func zenFailoverCands(p *Pool, realModel string) []zenFailoverCand {
+	key := routeKey("opencode", realModel)
+	var out []zenFailoverCand
+	seen := map[string]bool{}
+	add := func(k string, rank int) {
+		for _, cand := range routeCandidates(p, k) {
+			backend, _, _ := strings.Cut(cand, "/")
+			if backend == "opencode" || routeBackendOff(backend) || seen[cand] {
+				continue
+			}
+			seen[cand] = true
+			out = append(out, zenFailoverCand{id: cand, rank: rank})
+		}
+	}
+	add(key, 0)
+	t := routeTableFor(p)
+	fam := make([]string, 0, len(t))
+	for k := range t {
+		if k != key && !routeExclude(k) && zenFamily(key, k) {
+			fam = append(fam, k)
+		}
+	}
+	sort.Strings(fam)
+	for _, k := range fam {
+		add(k, 1)
+	}
+	for _, k := range zenFallbackKeys {
+		if k != key {
+			add(k, 2)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].rank != out[j].rank {
+			return out[i].rank < out[j].rank
+		}
+		return backendRank(out[i].id) < backendRank(out[j].id)
+	})
+	return out
+}
+
+// zenFailoverBudget bounds one failover chain: the caller gets an answer or an
+// honest 503 within it, never a request parked on a slow backend.
+const zenFailoverBudget = 9 * time.Second
+
+// zenHedgeDelay is how long one candidate may stay silent before the next is
+// started alongside it. a fast failure moves on at once; a slow backend is
+// bypassed instead of serially waited on.
+const zenHedgeDelay = 1500 * time.Millisecond
+
+// a backend whose measured latency is past zenSlowBackend is hedged after
+// zenSlowHedgeDelay only: waiting on it is how a 2s answer turns into a 5s one.
+const zenSlowBackend = 4000
+const zenSlowHedgeDelay = 300 * time.Millisecond
+
+// zenClaim hands the client to the first candidate that answers 200.
+type zenClaim struct {
+	once    sync.Once
+	won     chan struct{}
+	mu      sync.Mutex
+	cancels []context.CancelFunc
+	winner  int
+}
+
+func newZenClaim() *zenClaim {
+	return &zenClaim{won: make(chan struct{}), winner: -1}
+}
+
+func (c *zenClaim) attempt(cancel context.CancelFunc) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cancels = append(c.cancels, cancel)
+	return len(c.cancels) - 1
+}
+
+func (c *zenClaim) take(i int) bool {
+	took := false
+	c.once.Do(func() {
+		took = true
+		c.winner = i
+	})
+	return took
+}
+
+// cancelLosers stops every attempt but the one that won.
+func (c *zenClaim) cancelLosers() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, cancel := range c.cancels {
+		if i != c.winner {
+			cancel()
+		}
+	}
+}
+
+// zenLatch streams the winning candidate straight to the client and keeps a
+// losing one off it. buffering the whole body made every failover cost a full
+// generation before the caller saw a byte; here the caller sees the upstream's
+// first token, and only a non-200 stays buffered so the next candidate gets a
+// turn.
+type zenLatch struct {
+	real   http.ResponseWriter
+	claim  *zenClaim
+	index  int
+	head   http.Header
+	status int
+	live   bool
+}
+
+func newZenLatch(w http.ResponseWriter, claim *zenClaim, index int) *zenLatch {
+	return &zenLatch{real: w, claim: claim, index: index, head: http.Header{}}
+}
+
+func (l *zenLatch) Header() http.Header {
+	if l.live {
+		return l.real.Header()
+	}
+	return l.head
+}
+
+func (l *zenLatch) WriteHeader(code int) {
+	if l.live || l.status != 0 {
+		return
+	}
+	if code != http.StatusOK {
+		l.status = code
+		return
+	}
+	if !l.claim.take(l.index) {
+		l.status = http.StatusBadGateway
+		return
+	}
+	for k, v := range l.head {
+		l.real.Header()[k] = v
+	}
+	l.real.WriteHeader(code)
+	l.live = true
+	close(l.claim.won)
+}
+
+func (l *zenLatch) Write(b []byte) (int, error) {
+	if !l.live {
+		if l.status == 0 {
+			l.WriteHeader(http.StatusOK)
+		}
+		if !l.live {
+			return len(b), nil // losing attempt: its body never reaches the client
+		}
+	}
+	n, err := l.real.Write(b)
+	if f, ok := l.real.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, err
+}
+
+func (l *zenLatch) Flush() {
+	if !l.live {
+		return
+	}
+	if f, ok := l.real.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// zenFailoverRun hedges the candidate list: each attempt streams through its
+// own latch, the next starts after zenHedgeDelay (or at once when this one
+// failed), and the first 200 owns the client. the winner keeps its own context
+// so its stream is never cancelled; every loser is cut off.
+func (p *Pool) zenFailoverRun(w http.ResponseWriter, r *http.Request, cands []zenFailoverCand, model, reqID string, dial func(zenFailoverCand, http.ResponseWriter, *http.Request)) bool {
+	if len(cands) == 0 {
+		return false
+	}
+	claim := newZenClaim()
+	var wg sync.WaitGroup
+	budget := time.NewTimer(zenFailoverBudget)
+	defer budget.Stop()
+	launch := func(c zenFailoverCand) <-chan struct{} {
+		ctx, cancel := context.WithCancel(r.Context())
+		idx := claim.attempt(cancel)
+		done := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(done)
+			lw := newZenLatch(w, claim, idx)
+			t0 := time.Now()
+			dial(c, lw, r.WithContext(ctx))
+			if lw.live {
+				backend, _, _ := strings.Cut(c.id, "/")
+				noteRouteLatency(backend, time.Since(t0))
+				acclog.Printf("%s zen free tier spent: %s served by %s (substituted=%t)", reqID, model, c.id, c.rank > 0)
+			}
+		}()
+		return done
+	}
+launchLoop:
+	for _, c := range cands {
+		done := launch(c)
+		// a backend already known to be slow is hedged at once instead of
+		// holding the client for the full delay: its ewma says it will not
+		// be the one that answers first.
+		hedge := zenHedgeDelay
+		if backendRank(c.id) > zenSlowBackend {
+			hedge = zenSlowHedgeDelay
+		}
+		select {
+		case <-claim.won:
+			break launchLoop
+		case <-done: // this one failed fast: the next starts now
+		case <-time.After(hedge):
+		case <-budget.C:
+			break launchLoop
+		case <-r.Context().Done():
+			break launchLoop
+		}
+	}
+	// the list is spent: give the attempts still running the rest of the
+	// budget instead of cutting off the last one the moment it was launched.
+	allDone := make(chan struct{})
+	go func() { wg.Wait(); close(allDone) }()
+	select {
+	case <-claim.won:
+	case <-allDone:
+	case <-budget.C:
+	case <-r.Context().Done():
+	}
+	claim.cancelLosers()
+	<-allDone
+	return claim.winner >= 0
+}
+
+// zenFreeFailover serves a zen model through the route ladder while zen's
+// anonymous free budget is spent. that budget is one bucket behind `Bearer
+// public` (see zenFreeUntil), so rotation cannot clear it: the same model
+// family on another backend is what keeps opencode/<model> answering instead
+// of failing the caller after a ladder of hops that all hit the same cap.
+func (p *Pool) zenFreeFailover(w http.ResponseWriter, r *http.Request, body []byte, realModel string, isStream bool, start time.Time, reqID string) bool {
+	if !routeEnabled() {
+		return false
+	}
+	return p.zenFailoverRun(w, r, zenFailoverCands(p, realModel), "opencode/"+realModel, reqID,
+		func(c zenFailoverCand, lw http.ResponseWriter, rr *http.Request) {
+			backend, id, _ := strings.Cut(c.id, "/")
+			nb, err := setReqModel(body, c.id)
+			if err != nil {
+				lw.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			lw.Header().Set("X-Nimroute-Served-By", c.id)
+			p.dispatchRouteOAI(lw, rr, nb, c.id, backend, id, isStream, start, reqID)
+		})
+}
+
+// zenFreeFailoverAnthropic is zenFreeFailover on /v1/messages: same candidate
+// order, anthropic-shaped dispatch, same streaming latch.
+func (p *Pool) zenFreeFailoverAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, realModel string, tnames toolNames, isStream bool, start time.Time, reqID string) bool {
+	if !routeEnabled() {
+		return false
+	}
+	return p.zenFailoverRun(w, r, zenFailoverCands(p, realModel), clientModel, reqID,
+		func(c zenFailoverCand, lw http.ResponseWriter, rr *http.Request) {
+			backend, id, _ := strings.Cut(c.id, "/")
+			nb, err := setReqModel(oaiBody, c.id)
+			if err != nil {
+				lw.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			lw.Header().Set("X-Nimroute-Served-By", c.id)
+			p.dispatchRouteAnthropic(lw, rr, body, nb, clientModel, c.id, backend, id, tnames, isStream, start, reqID)
+		})
+}
+
 // dispatchRouteOAI runs one candidate on openai-compat paths.
 func (p *Pool) dispatchRouteOAI(w http.ResponseWriter, r *http.Request, body []byte, cand, backend, id string, isStream bool, start time.Time, reqID string) {
 	switch backend {

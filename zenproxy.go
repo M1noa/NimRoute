@@ -515,7 +515,7 @@ func refreshZenProxies(fresh bool) {
 			r := verifyProxy(u)
 			mu.Lock()
 			mix.add(r)
-			ok := r == verifyOK
+			ok := r == verifyOK || r == verifyCapped
 			if ok {
 				verified = append(verified, u)
 			}
@@ -568,9 +568,9 @@ func refreshZenProxies(fresh bool) {
 	ensureSharedLanes()
 	warmZenTransports(finalPool)
 	// acclog, not log: stderr lands in nimroute.err.log and nothing reads it.
-	// the mix rides the summary so a gate that starts refusing the shared
-	// public key shows up as pool shrinkage with a reason attached.
-	acclog.Printf("  zen proxies: %d verified (%d total pool) of %d candidates dialed (target %d) mix: 429=%d 403=%d other=%d dialerr=%d", len(verified), len(finalPool), len(cands), target, mix.rateLimited, mix.freeTier, mix.other, mix.dialErr)
+	// the mix rides the summary so an upstream that starts answering 429/403
+	// to everything shows up next to the pool size with a reason attached.
+	acclog.Printf("  zen proxies: %d verified (%d total pool) of %d candidates dialed (target %d) mix: cap=%d 429=%d 403=%d other=%d dialerr=%d", len(verified), len(finalPool), len(cands), target, mix.capped, mix.rateLimited, mix.freeTier, mix.other, mix.dialErr)
 }
 
 // savedPool is the last verified pool, loaded at boot so requests serve
@@ -652,7 +652,8 @@ type verifyResult int
 
 const (
 	verifyOK          verifyResult = iota // 200 and a model-list body
-	verifyRateLimited                     // 429 on GET /models
+	verifyCapped                          // 429 free-usage answer: reachable, rotation's problem
+	verifyRateLimited                     // 429 aimed at this exit
 	verifyFreeTier                        // 403 FreeTierError on GET /models
 	verifyOther                           // any other rejection
 	verifyDialErr                         // no response came back at all
@@ -662,6 +663,7 @@ const (
 // the sweep summary. statuses and counts only: never a proxy url, so no
 // credentials can reach the log.
 type verifyMix struct {
+	capped      int
 	rateLimited int
 	freeTier    int
 	other       int
@@ -671,6 +673,8 @@ type verifyMix struct {
 func (m *verifyMix) add(r verifyResult) {
 	switch r {
 	case verifyOK:
+	case verifyCapped:
+		m.capped++
 	case verifyRateLimited:
 		m.rateLimited++
 	case verifyFreeTier:
@@ -716,6 +720,14 @@ func verifyProxy(proxyURL string) verifyResult {
 	case http.StatusOK, http.StatusBadRequest:
 		return verifyOK
 	case http.StatusTooManyRequests:
+		// a 429 answers after the gate: the exit dialed and zen parsed the
+		// body, it just will not serve this request. rotation handles that
+		// (noteExit429 marks the pair for a cooldown), so excluding the exit
+		// here is what emptied the pool and left lanes pinless while the
+		// exits were all reachable.
+		if b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10)); zenFreeUsageCap(b) {
+			return verifyCapped
+		}
 		return verifyRateLimited
 	case http.StatusForbidden:
 		return verifyFreeTier
@@ -912,15 +924,18 @@ func evacuateProxyPins(dead string) {
 		}
 		lanesMu.Unlock()
 		if victim == nil {
-			return
+			break
 		}
 		// "" model: evacuation outranks per-model burns; the next real
 		// send re-rotates if the spare is burned for its model. the dead
 		// exit is out of the pool, so the pick can never hand it back.
 		if laneReproxy(victim, "") == dead {
-			return // empty pool: no unique spare to move to, stop trying
+			break // empty pool: no unique spare to move to, stop trying
 		}
 	}
+	// a lane left without an exit cannot send: the table goes back down to
+	// the pool instead of leaving it pinless.
+	trimLanesToPool()
 }
 
 // isTLSFailure reports whether a transport error means the exit is
@@ -1344,6 +1359,11 @@ func proxyUnavailableMsg(model string) string {
 		model, verified, countRateLimited(), countDeadExits(), countGateParked())
 }
 
+// zenAnswered is the zenPost sentinel for "the caller already has its
+// response": the free-tier failover wrote it, so the ladder stops without
+// touching w again (a nil return would draw a second, 503 error body).
+var zenAnswered = &http.Response{}
+
 // exhaustedExits is the retry ladder's last word: every attempt landed on an
 // exit that could not serve the request (rate limit, transport, overload).
 // the client gets a 503 that names the proxy pool as the problem and never a
@@ -1363,6 +1383,59 @@ func exhaustedExits(model string, status int) *http.Response {
 	h.Set("Retry-After", "5")
 	acclog.Printf("!! opencode exits exhausted model=%s attempts=%d last=%d, synthesizing 503", model, zenMaxRetries(), status)
 	return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(eb)), Header: h}
+}
+
+// zenFreeUntil is when zen's anonymous free budget refills, in unix seconds.
+// the 429 body is FreeUsageLimitError with a retry-after that lands on 00:00
+// utc, and every exit answers it: measured on 140+ IPs across four cloudflare
+// colos, public proxies and a home line alike, all with the same countdown.
+// one bucket sits behind `Bearer public`, so rotating exits cannot clear it
+// and the only way to keep opencode/<model> answering is another backend
+// (zenFreeFailover in route.go).
+var zenFreeUntil atomic.Int64
+
+// noteZenFreeCap records the refill deadline from a free-usage 429's
+// retry-after, keeping the latest one seen.
+func noteZenFreeCap(h http.Header) {
+	secs := 0
+	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			secs = n
+		}
+	}
+	if secs <= 0 {
+		secs = 60
+	}
+	until := time.Now().Add(time.Duration(secs) * time.Second).Unix()
+	for {
+		cur := zenFreeUntil.Load()
+		if until <= cur || zenFreeUntil.CompareAndSwap(cur, until) {
+			return
+		}
+	}
+}
+
+// zenFreeCapped reports whether the shared budget is still spent.
+func zenFreeCapped() bool { return zenFreeUntil.Load() > time.Now().Unix() }
+
+// zenFreeSpentMsg says why a zen model cannot be served: the shared free
+// budget is spent and no other backend carries the model.
+func zenFreeSpentMsg(model string) string {
+	until := time.Unix(zenFreeUntil.Load(), 0).UTC().Format("2006-01-02 15:04 MST")
+	return fmt.Sprintf("opencode zen: %s rides zen's free tier, whose budget is shared by every exit and spent until %s; no other backend serves it.", model, until)
+}
+
+// clearZenFreeCap drops the marker: a 200 proves the budget is back.
+func clearZenFreeCap() { zenFreeUntil.Store(0) }
+
+// zenFreeUsageCap reports whether a 429 body is zen's free-usage answer
+// (429 FreeUsageLimitError) rather than a limit aimed at this exit. both are
+// reachability, not exclusion; the split only feeds the sweep summary.
+func zenFreeUsageCap(body []byte) bool {
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "freeusagelimiterror") ||
+		strings.Contains(s, "free usage limit") ||
+		strings.Contains(s, "free usage exceeded")
 }
 
 // logZenBlocked logs a geo/user block with status, snippet, and the running

@@ -291,12 +291,17 @@ zen:
   # 1500; 0 = 1500.
   lane_min_gap_ms: 1500
   # per exit+model 429 policy: this many 429s in a row (2), or this many
-  # total since the last refresh (6), retires that pair until the next
-  # refresh. the mark is per model because zen limits the pair: an exit that
-  # is busy on one model keeps serving every other one. a completed refresh
-  # clears the marks. 0 disables the trip.
+  # total since the last refresh (6), retires that pair for
+  # exit_429_cool_secs. the mark is per model because zen limits the pair: an
+  # exit that is busy on one model keeps serving every other one. a
+  # completed refresh clears the marks. 0 disables the trip.
   exit_429_streak: 2
   exit_429_total: 6
+  # seconds a 429'd exit sits out before rotation may hand it out again. a
+  # 429 is usually a short burst, so the mark lapses on its own instead of
+  # holding the exit until the next refresh (30m by default). never longer
+  # than the refresh interval. 0 = 300, negative = until the next refresh.
+  exit_429_cool_secs: 300
   # refresh the whole pool once this many lanes hit 429 since the last
   # refresh (distinct exits all limited = stale pool). 0 disables.
   pool_refresh_429s: 4

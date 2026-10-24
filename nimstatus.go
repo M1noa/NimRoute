@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
+	"gopkg.in/yaml.v3"
 )
 
 // styles mirror nimstatus.py's palette.
@@ -302,6 +303,15 @@ type nimStats struct {
 	allReq, allTok     int64
 	todayReq, todayTok int64
 	since              string
+	// todayByModel is today's per-model work, so the model table can show
+	// real numbers right after a restart: the server's in-memory totals
+	// start at zero, and a table of zeros under a five-digit "today"
+	// footer reads like the dashboard is broken.
+	todayByModel map[string]modelUse
+}
+
+type modelUse struct {
+	req, tok, comp, dur int64
 }
 
 // statsCache keeps the last file identity and offset so a 2s refresh reads
@@ -319,9 +329,11 @@ var statsCache struct {
 
 type usageLine struct {
 	TS         string `json:"ts"`
+	Model      string `json:"model"`
 	Prompt     int64  `json:"prompt_tokens"`
 	Completion int64  `json:"completion_tokens"`
 	Total      int64  `json:"total_tokens"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 func usageTotalsFor(path string) nimStats {
@@ -373,15 +385,65 @@ func usageTotalsFor(path string) nimStats {
 		if n == 0 {
 			n = u.Prompt + u.Completion
 		}
+		// ts is written in UTC: comparing its date prefix to the local
+		// "today" put the day boundary in the wrong place (a 21:00 CDT row
+		// stamped 02:00Z landed on tomorrow), so today's totals were a
+		// rolling 24h window rather than today.
+		day := ""
+		if t, err := time.Parse(time.RFC3339Nano, u.TS); err == nil {
+			day = t.Local().Format("2006-01-02")
+		} else if len(u.TS) >= 10 {
+			day = u.TS[:10]
+		}
 		c.st.allReq++
 		c.st.allTok += n
-		c.st.todayReq++
-		c.st.todayTok += n
-		if c.st.since == "" && len(u.TS) >= 10 {
-			c.st.since = u.TS[:10]
+		// the file holds every day: only today's rows are today's totals.
+		// counting the whole file as today made both numbers read the same.
+		if day == today {
+			c.st.todayReq++
+			c.st.todayTok += n
+			if u.Model != "" {
+				if c.st.todayByModel == nil {
+					c.st.todayByModel = map[string]modelUse{}
+				}
+				mu := c.st.todayByModel[u.Model]
+				mu.req++
+				mu.tok += n
+				mu.comp += u.Completion
+				mu.dur += u.DurationMs
+				c.st.todayByModel[u.Model] = mu
+			}
+		}
+		if c.st.since == "" && day != "" {
+			c.st.since = day
 		}
 	}
 	return c.st
+}
+
+// usagePathFor resolves the usage log the server writes. the dashboards used
+// to hardcode nim-usage.jsonl, so a config that moved usage.path showed zero
+// totals on every refresh. unset keeps the default name.
+func usagePathFor(dir string) string {
+	name := "nim-usage.jsonl"
+	cp := configPath()
+	if _, err := os.Stat(cp); err != nil {
+		cp = filepath.Join(dir, "config.yml")
+	}
+	if raw, err := os.ReadFile(cp); err == nil {
+		var c struct {
+			Usage struct {
+				Path string `yaml:"path"`
+			} `yaml:"usage"`
+		}
+		if yaml.Unmarshal(raw, &c) == nil && c.Usage.Path != "" {
+			name = c.Usage.Path
+		}
+	}
+	if !filepath.IsAbs(name) {
+		name = filepath.Join(dir, name)
+	}
+	return name
 }
 
 // prefixed puts the backend on every id. a portal id names its own vendor
@@ -512,13 +574,20 @@ func dashOnce(e nimEnv, reserve int) error {
 		port: e.port,
 		dir:  e.dir,
 		d:    d,
-		st:   usageTotalsFor(filepath.Join(e.dir, "nim-usage.jsonl")),
+		st:   usageTotalsFor(usagePathFor(e.dir)),
 	}
 	m.w, m.h = termSize()
 	// render() budgets bodyHeight() = h-3 for the blank and key-hint lines the
 	// tea view adds; a one-shot prints neither, so hand those rows back.
 	m.h = m.h - reserve + 3
-	for _, ln := range m.render() {
+	lines := m.render()
+	// a one-shot has no viewport: keep it to a screenful and point at the
+	// dashboard, which scrolls the whole catalog.
+	if max := m.h; max > 0 && len(lines) > max {
+		n := len(lines) - max + 1
+		lines = append(lines[:max-1:max-1], cDim.Render(fmt.Sprintf("· %d more rows · ./nim status-tail scrolls them", n)))
+	}
+	for _, ln := range lines {
 		fmt.Println(ansi.Truncate(ln, m.w, "…"))
 	}
 	return nil
@@ -550,7 +619,7 @@ func dashLoad(port, dir string) tea.Cmd {
 		if err != nil {
 			return dashMsg{err: err}
 		}
-		return dashMsg{d: d, st: usageTotalsFor(filepath.Join(dir, "nim-usage.jsonl"))}
+		return dashMsg{d: d, st: usageTotalsFor(usagePathFor(dir))}
 	}
 }
 
@@ -658,7 +727,7 @@ func (m *dashModel) headLines() []string {
 		}
 	}
 
-	sum := fmt.Sprintf("opencode %d active · nvidia %d active · nim lanes %d/%d",
+	sum := fmt.Sprintf("opencode %d active · nvidia %d active · lanes %d/%d",
 		d.ConcurrentZen, d.ConcurrentNV, len(d.ZenLanes), d.LaneCap)
 	return []string{head, cDim.Render(sum)}
 }
@@ -751,68 +820,20 @@ func (m *dashModel) tailLines() []string {
 // render fits both tables to the terminal: head and foot stay put and each
 // table gets a share of the rows left over, the busiest four first.
 func (m *dashModel) render() []string {
-	mrows := m.modelRows()
+	mrows, hasHealth, hasTail := m.modelRows()
 	head, tail := m.headLines(), m.tailLines()
-	wantL, wantM := len(m.d.ZenLanes), len(mrows)
-	// a table spends a blank, a header, a rule, a blank and its caption
-	rows := m.bodyHeight() - len(head) - len(tail)
-	if wantL > 0 {
-		rows -= 5
-	}
-	if wantM > 0 {
-		rows -= 5
-	}
-	// too short for one row of data: drop the table rather than spend its
-	// chrome on an empty header, the foot totals are worth more. the lane
-	// table is live state, so the catalog goes first.
-	if wantM > 0 && rows < 1 {
-		wantM, rows = 0, rows+5
-	}
-	if wantL > 0 && rows < 1 {
-		wantL = 0
-	}
-	laneN, modelN := splitRows(rows, wantL, wantM, 4)
+	wantL := len(m.d.ZenLanes)
+	// everything is rendered and the viewport scrolls: capping rows to the
+	// terminal height left the rest of the catalog unreachable, so a short
+	// pane could never show the models below the fold.
 	out := append([]string{}, head...)
 	if wantL > 0 {
-		out = append(out, m.laneLines(laneN)...)
+		out = append(out, m.laneLines(wantL)...)
 	}
-	if wantM > 0 {
-		out = append(out, modelLines(mrows, modelN)...)
+	if len(mrows) > 0 {
+		out = append(out, modelLines(mrows, len(mrows), hasHealth, hasTail, wantL == 0)...)
 	}
 	return append(out, tail...)
-}
-
-// splitRows divides the spare table rows between two lists: each starts at the
-// busiest floor rows, then grows alternately while height remains.
-func splitRows(spare, wantA, wantB, floor int) (int, int) {
-	if spare < 0 {
-		spare = 0
-	}
-	if wantA > 0 && wantB > 0 {
-		if floor > spare/2 {
-			floor = spare / 2
-		}
-	} else {
-		floor = 0
-	}
-	a, b := wantA, wantB
-	if a > floor {
-		a = floor
-	}
-	if b > floor {
-		b = floor
-	}
-	for spare-a-b > 0 && (a < wantA || b < wantB) {
-		if a < wantA {
-			a++
-		} else if b < wantB {
-			b++
-		}
-		if spare-a-b > 0 && b < wantB {
-			b++
-		}
-	}
-	return a, b
 }
 
 type modelGroup struct {
@@ -893,6 +914,31 @@ func (m *dashModel) modelGroups() []modelGroup {
 			gs = append(gs, g)
 		}
 	}
+	// each backend keeps its block, sorted, so the catalog reads as one list
+	// per provider instead of whatever order the status snapshot happened to
+	// carry. tails ride along with their ids.
+	for gi := range gs {
+		g := &gs[gi]
+		order := make([]int, len(g.ids))
+		for i := range order {
+			order[i] = i
+		}
+		sort.SliceStable(order, func(a, b int) bool {
+			return strings.ToLower(g.ids[order[a]]) < strings.ToLower(g.ids[order[b]])
+		})
+		ids := make([]string, len(g.ids))
+		var tails []string
+		if len(g.tails) > 0 {
+			tails = make([]string, len(g.ids))
+		}
+		for n, i := range order {
+			ids[n] = g.ids[i]
+			if tails != nil && i < len(g.tails) {
+				tails[n] = g.tails[i]
+			}
+		}
+		g.ids, g.tails = ids, tails
+	}
 	return gs
 }
 
@@ -904,28 +950,35 @@ func bareID(id string) string {
 	return id
 }
 
-// modelRows builds the full model table, round-robin across backends: a row
-// from every family lands before any one spends the whole cap, so the late
-// catalogs (openrouter, route) are never starved by opencode's list.
-func (m *dashModel) modelRows() [][]string {
+// modelRows builds the full model table, one provider block after another:
+// the dashboard scrolls, so every backend keeps its ids together instead of
+// interleaving them across the table.
+func (m *dashModel) modelRows() (rows [][]string, hasHealth, hasTail bool) {
 	d := m.d
 	byModel := nil2(d)
 	bench := benchLookup(d.Benchmarks)
 
 	gs := m.modelGroups()
-	worst := 0
+	// an empty column of dashes reads like a broken table: only draw the
+	// health and via columns when the snapshot actually carries them.
+	// one known state is not enough — the column is a wall of "-" unless a
+	// model in the table has been tried, which is the common cold-start.
 	for _, g := range gs {
-		if len(g.ids) > worst {
-			worst = len(g.ids)
+		for _, id := range g.ids {
+			if h, ok := d.Health[id]; ok && h.State != "" {
+				hasHealth = true
+			}
 		}
 	}
-	var rows [][]string
-	for i := 0; i < worst; i++ {
-		for _, g := range gs {
-			if i >= len(g.ids) {
-				continue
+	for _, g := range gs {
+		for _, t := range g.tails {
+			if t != "" {
+				hasTail = true
 			}
-			val := g.ids[i]
+		}
+	}
+	for _, g := range gs {
+		for i, val := range g.ids {
 			// every row is one full id: provider and model never split, so the
 			// table matches what a client sends and what /status keys usage by.
 			full := val
@@ -939,24 +992,38 @@ func (m *dashModel) modelRows() [][]string {
 				if t.DurationMs > 0 {
 					tps = cDim.Render(fmt.Sprintf("%.1f", float64(t.Completion)/(float64(t.DurationMs)/1000)))
 				}
+			} else if u, ok := m.st.todayByModel[full]; ok {
+				// the server's counters reset on restart; today's log rows are
+				// the same work, so the table agrees with the footer totals.
+				req = fmtInt(int(u.req))
+				tok = cDim.Render(fmtTok(int(u.tok)))
+				if u.dur > 0 {
+					tps = cDim.Render(fmt.Sprintf("%.1f", float64(u.comp)/(float64(u.dur)/1000)))
+				}
 			}
 			tail := ""
 			if i < len(g.tails) && g.tails[i] != "" {
 				tail = cDim.Render(g.tails[i])
 			}
-			rows = append(rows, []string{
-				healthCell(d.Health, full),
+			row := []string{
 				provStyle(g.prov).Render(full),
 				scoreCell(bench(full)),
-				req, tok, tps, tail,
-			})
+				req, tok, tps,
+			}
+			if hasHealth {
+				row = append([]string{healthCell(d.Health, full)}, row...)
+			}
+			if hasTail {
+				row = append(row, tail)
+			}
+			rows = append(rows, row)
 		}
 	}
-	return rows
+	return rows, hasHealth, hasTail
 }
 
 // modelLines draws the model table, capped at limit rows.
-func modelLines(rows [][]string, limit int) []string {
+func modelLines(rows [][]string, limit int, hasHealth, hasTail, lead bool) []string {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -967,9 +1034,21 @@ func modelLines(rows [][]string, limit int) []string {
 	if want > limit {
 		rows = rows[:limit]
 	}
-	cols := []colSpec{{"", false}, {"model", false}, {"score", true}, {"req", true},
-		{"tokens", true}, {"tok/s*", true}, {"", false}}
-	out := append([]string{""}, drawTable(cols, rows)...)
+	cols := []colSpec{}
+	if hasHealth {
+		cols = append(cols, colSpec{"ok", false})
+	}
+	cols = append(cols, colSpec{"model", false}, colSpec{"score", true}, colSpec{"req", true},
+		colSpec{"tokens", true}, colSpec{"tok/s*", true})
+	if hasTail {
+		// route rows list their backends here, freepi rows their speed
+		// multiple: one header for both, or the column reads like a bug.
+		cols = append(cols, colSpec{"via / ×", false})
+	}
+	out := drawTable(cols, rows)
+	if lead {
+		out = append([]string{""}, out...)
+	}
 	if len(rows) < want {
 		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more models · taller terminal shows more", want-len(rows))))
 	}

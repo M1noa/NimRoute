@@ -317,6 +317,32 @@ func (e nimEnv) stop() {
 	}
 }
 
+// waitPort blocks until the status port answers, up to d. a service that was
+// just booted out and back in is not listening yet when launchd returns.
+func (e nimEnv) waitPort(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if e.portAlive() {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// boot launches the service and retries once when the port stays dead:
+// launchd refuses a bootstrap that lands inside the throttle window of the
+// bootout before it, which left `restart` reporting RUNNING with no server.
+func (e nimEnv) boot(args []string) {
+	e.start(args)
+	if e.waitPort(8 * time.Second) {
+		return
+	}
+	time.Sleep(2 * time.Second)
+	e.start(args)
+	e.waitPort(8 * time.Second)
+}
+
 // prettyStatus prints the state line then the dashboard. stopped exits 1 so
 // `./nim status` is usable in a shell condition.
 func (e nimEnv) prettyStatus() int {
@@ -329,7 +355,16 @@ func (e nimEnv) prettyStatus() int {
 	}
 	fmt.Printf("nimroute: RUNNING (%s)\n", e.mode)
 	fmt.Println()
-	if err := dashOnce(e, 3); err != nil {
+	// a just-(re)started server answers /status only after it has loaded the
+	// pool cache: retry instead of declaring it unavailable on the first miss.
+	var err error
+	for i := 0; i < 40; i++ {
+		if err = dashOnce(e, 3); err == nil {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if err != nil {
 		fmt.Println("(status unavailable)")
 	}
 	fmt.Println()
@@ -472,8 +507,7 @@ func runNim(args []string) {
 			e.prettyStatus()
 			os.Exit(0)
 		}
-		e.start(args[1:])
-		time.Sleep(2 * time.Second)
+		e.boot(args[1:])
 		e.prettyStatus()
 	case "stop":
 		e.stop()
@@ -484,8 +518,7 @@ func runNim(args []string) {
 		}
 		e.stop()
 		time.Sleep(time.Second)
-		e.start(args[1:])
-		time.Sleep(2 * time.Second)
+		e.boot(args[1:])
 		e.prettyStatus()
 	case "status":
 		code := e.prettyStatus()
