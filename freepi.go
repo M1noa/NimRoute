@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +53,7 @@ func freepiEnabled() bool {
 // /client-version reports something higher. the server 426s
 // upgrade_required below its minimum, so a stale number breaks the
 // backend for everyone until someone edits this line.
-const freepiVerDefault = "0.4.10"
+const freepiVerDefault = "0.6.11"
 
 // freepiVerUpstream is the newest version /client-version has reported
 // (latest, or min as the fallback). empty until the first catalog fetch.
@@ -319,11 +320,19 @@ func freepiImpress(fa *freepiAcct, adBody []byte) {
 	var ad struct {
 		AdID       string `json:"ad_id"`
 		ClickToken string `json:"click_token"`
+		Source     string `json:"source"`
+		ImpURL     string `json:"imp_url"`
 	}
 	if json.Unmarshal(adBody, &ad) != nil || ad.AdID == "" || ad.ClickToken == "" {
 		return
 	}
-	payload, _ := json.Marshal(map[string]string{"ad_id": ad.AdID, "click_token": ad.ClickToken})
+	// the cli fires the gravity pixel itself before reporting the impression,
+	// and says so with imp_fired so neither side bills the view twice.
+	fields := map[string]any{"ad_id": ad.AdID, "click_token": ad.ClickToken}
+	if freepiGravityPixel(ad.Source, ad.ImpURL) {
+		fields["imp_fired"] = true
+	}
+	payload, _ := json.Marshal(fields)
 	req, err := http.NewRequest("POST", freepiBase()+"/ads/impression", bytes.NewReader(payload))
 	if err != nil {
 		return
@@ -335,6 +344,38 @@ func freepiImpress(fa *freepiAcct, adBody []byte) {
 		return
 	}
 	resp.Body.Close()
+}
+
+// freepiGravityPixel fires a gravity ad's impression pixel the way the cli
+// does: not awaited, and reported as fired either way, because the server
+// counts the view off the pixel and only needs to know it was attempted. any
+// other source, or a url outside trygravity, is left alone (never a client
+// supplied host).
+func freepiGravityPixel(source, raw string) bool {
+	if source != "gravity" || raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if !strings.HasSuffix(host, "trygravity.ai") && !strings.HasSuffix(host, "trygravity.com") {
+		return false
+	}
+	go func() {
+		req, err := http.NewRequest("GET", raw, nil)
+		if err != nil {
+			return
+		}
+		cl := &http.Client{Timeout: 3 * time.Second}
+		resp, err := cl.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
+	return true
 }
 
 // freepiErr classifies the server error envelope.

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,7 +18,7 @@ import (
 // route/<key> tries opencode, openrouter, uno, antseed, nvidia, freepi,
 // nous in turn (or by strategy), first 200 wins. keys match loosely where
 // it is safe: lowercase, one trailing -free stripped from opencode ids,
-// one trailing :free from uno/openrouter ids, and a trailing dated build
+// one trailing :free from uno/openrouter ids (or -free from orcarouter), and a trailing dated build
 // stamp peeled from any id ("...-1017" -> "...") when the four digits
 // decode as mmdd, so dated refreshes like uno's deepseek-v4.1-flash-1017
 // hit opencode's deepseek-v4.1-flash. nvidia ids keep the org prefix.
@@ -25,7 +26,7 @@ import (
 // out once per backend.
 
 // routeBackends is the fixed priority order.
-var routeBackends = []string{"opencode", "openrouter", "uno", "antseed",
+var routeBackends = []string{"opencode", "openrouter", "orcarouter", "uno", "antseed",
 	"nvidia", "freepi", "nous"}
 
 // routeAttemptCap is the sequential-ladder retry budget per backend.
@@ -34,6 +35,7 @@ var routeBackends = []string{"opencode", "openrouter", "uno", "antseed",
 var routeAttemptCap = map[string]int{
 	"opencode":   3,
 	"openrouter": 1,
+	"orcarouter": 2,
 	"uno":        2,
 	"antseed":    2,
 	"nvidia":     2,
@@ -75,6 +77,8 @@ func routeKey(backend, id string) string {
 		k = strings.TrimSuffix(k, "-free")
 	case "uno", "openrouter": // keyed catalogs carry vendor/model:free rows
 		k = strings.TrimSuffix(k, ":free")
+	case "orcarouter": // orcarouter marks free rows with -free
+		k = strings.TrimSuffix(k, "-free")
 	}
 	return peelDateStamp(k)
 }
@@ -114,6 +118,8 @@ func routeBackendLive(backend string, p *Pool) bool {
 		return unoEnabled()
 	case "openrouter":
 		return orChatEnabled()
+	case "orcarouter":
+		return orcaEnabled()
 	case "nous":
 		return nousEnabled()
 	}
@@ -123,15 +129,23 @@ func routeBackendLive(backend string, p *Pool) bool {
 // routeTable maps route key -> backend -> exact backend model id.
 type routeTable map[string]map[string]string
 
+// routeModel is one servable pair: a live backend and one exact model id.
+// wroute matches against these; route folds them by key.
+type routeModel struct {
+	backend string
+	id      string
+}
+
 // routeTableTTL is how long one built table stays fresh. /status polls at 1hz
 // and every build unions each live backend's catalog, so the table is reused
 // instead of rebuilt per request.
 const routeTableTTL = 2 * time.Second
 
-// routeTableCache holds the last built table per pool. the entry is pinned to
-// the config pointer, so a hot reload rebuilds at once.
+// routeTableCache holds the last built catalog and table per pool. the entry
+// is pinned to the config pointer, so a hot reload rebuilds at once.
 var routeTableCache struct {
 	sync.Mutex
+	cat []routeModel
 	t   routeTable
 	cfg *appConfig
 	p   *Pool
@@ -140,18 +154,27 @@ var routeTableCache struct {
 
 // routeTableFor returns the cached table, rebuilding at most once per ttl.
 func routeTableFor(p *Pool) routeTable {
+	_, t := routeCatalogAndTable(p)
+	return t
+}
+
+// routeCatalogAndTable returns the flat catalog and its folded table from one
+// cache entry: wroute needs the exact ids, route needs the folded keys.
+func routeCatalogAndTable(p *Pool) ([]routeModel, routeTable) {
 	c := cfg()
 	routeTableCache.Lock()
 	if t := routeTableCache.t; t != nil && routeTableCache.p == p && routeTableCache.cfg == c && time.Since(routeTableCache.at) < routeTableTTL {
+		cat, t := routeTableCache.cat, routeTableCache.t
 		routeTableCache.Unlock()
-		return t
+		return cat, t
 	}
 	routeTableCache.Unlock()
-	t := buildRouteTable(p)
+	cat := buildRouteCatalog(p)
+	t := buildRouteTable(cat)
 	routeTableCache.Lock()
-	routeTableCache.t, routeTableCache.p, routeTableCache.cfg, routeTableCache.at = t, p, c, time.Now()
+	routeTableCache.cat, routeTableCache.t, routeTableCache.p, routeTableCache.cfg, routeTableCache.at = cat, t, p, c, time.Now()
 	routeTableCache.Unlock()
-	return t
+	return cat, t
 }
 
 // zenListRefresh admits one background listing refresh at a time: an
@@ -170,24 +193,16 @@ func kickZenListRefresh() {
 	}
 }
 
-// buildRouteTable unions every live backend's catalog. min counts distinct
-// backends per key; excluded backends and models never enter. freepi joins
-// only when route.include_freepi is set (its window is smaller).
-func buildRouteTable(p *Pool) routeTable {
-	t := routeTable{}
+// buildRouteCatalog unions every live backend's catalog as exact pairs.
+// excluded backends and models never enter. freepi joins only when
+// route.include_freepi is set (its window is smaller).
+func buildRouteCatalog(p *Pool) []routeModel {
+	var cat []routeModel
 	add := func(backend, id string) {
-		k := routeKey(backend, id)
-		if k == "" || routeExclude(k) {
+		if strings.TrimSpace(id) == "" || routeExclude(routeKey(backend, id)) {
 			return
 		}
-		m := t[k]
-		if m == nil {
-			m = map[string]string{}
-			t[k] = m
-		}
-		if _, ok := m[backend]; !ok {
-			m[backend] = id
-		}
+		cat = append(cat, routeModel{backend: backend, id: id})
 	}
 	if zenEnabled() && !routeBackendOff("opencode") {
 		// cached list: per-request fetch would block on upstream.
@@ -253,9 +268,35 @@ func buildRouteTable(p *Pool) routeTable {
 			add("openrouter", m.ID)
 		}
 	}
+	if !routeBackendOff("orcarouter") && orcaEnabled() {
+		for _, m := range orcaModels() {
+			add("orcarouter", m.ID)
+		}
+	}
 	if !routeBackendOff("nous") && nousEnabled() {
 		for _, m := range nousFreeModels() {
 			add("nous", m.ID)
+		}
+	}
+	return cat
+}
+
+// buildRouteTable folds the catalog into key -> backend -> id. min counts
+// distinct backends per key.
+func buildRouteTable(cat []routeModel) routeTable {
+	t := routeTable{}
+	for _, m := range cat {
+		k := routeKey(m.backend, m.id)
+		if k == "" {
+			continue
+		}
+		b := t[k]
+		if b == nil {
+			b = map[string]string{}
+			t[k] = b
+		}
+		if _, ok := b[m.backend]; !ok {
+			b[m.backend] = m.id
 		}
 	}
 	min := cfg().Route.MinOccurrences
@@ -272,8 +313,57 @@ func buildRouteTable(p *Pool) routeTable {
 	return t
 }
 
+// routeFree reports whether one catalog id is a free row on its backend. the
+// keyed catalogs say so in the id; the rest serve free models by
+// construction (opencode's tier pool, antseed's sellers, freepi's ad-supported
+// accounts, nous's zero-priced catalog, nvidia's key pool).
+func routeFree(backend, id string) bool {
+	switch backend {
+	case "uno", "openrouter": // keyed catalogs mark free rows with :free
+		return strings.HasSuffix(strings.ToLower(id), ":free")
+	case "orcarouter": // orcarouter marks them with -free
+		return strings.HasSuffix(strings.ToLower(id), "-free")
+	}
+	return true
+}
+
+// routePrice is one candidate's published price per million tokens, input
+// plus output. only backends whose catalog quotes a price take part: uno
+// keeps a separate pricing catalog, openrouter quotes on every row.
+func routePrice(backend, id string) (float64, bool) {
+	switch backend {
+	case "uno":
+		if in, out, ok := unoPriceFor(id); ok {
+			return in + out, true
+		}
+	case "openrouter":
+		if in, out, ok := orPrice1M("openrouter/" + id); ok {
+			return in + out, true
+		}
+	}
+	return 0, false
+}
+
+// routeRank is one candidate's tier inside its provider block: 0 free, 2 paid
+// with a published price, 3 paid with no price. cheaper wins at 2, so a priced
+// row is always asked before an unpriced one and the cheapest priced row goes
+// first. it only ever compares rows of one provider: the provider ladder is
+// the heavier term (routeBackendRank), so a free row on a later backend never
+// jumps a paid row on an earlier one.
+func routeRank(cand string) (int, float64) {
+	backend, id, _ := strings.Cut(cand, "/")
+	if routeFree(backend, id) {
+		return 0, 0
+	}
+	if p, ok := routePrice(backend, id); ok {
+		return 2, p
+	}
+	return 3, 0
+}
+
 // routeCandidates resolves route/<key> to attempt ids in strategy order:
-// "backend/id" with the backend's exact spelling.
+// "backend/id" with the backend's exact spelling, free rows first and priced
+// rows cheapest first.
 func routeCandidates(p *Pool, key string) []string {
 	if !routeEnabled() {
 		return nil
@@ -281,7 +371,11 @@ func routeCandidates(p *Pool, key string) []string {
 	t := routeTableFor(p)
 	m, ok := t[strings.ToLower(strings.TrimSpace(key))]
 	if !ok {
-		return nil
+		// no route row for this key: the wide family below decides, so an old
+		// config naming a spelling that never merged
+		// (route/nemotron-3.5-lightning-free) still lands on the exact model
+		// it points at.
+		return wrouteCandidates(p, key)
 	}
 	order := append([]string{}, routeBackends...)
 	switch strings.ToLower(strings.TrimSpace(cfg().Route.Strategy)) {
@@ -301,6 +395,11 @@ func routeCandidates(p *Pool, key string) []string {
 			continue
 		}
 		out = append(out, b+"/"+id)
+	}
+	if len(out) == 0 {
+		// every backend that served this key is down: widen to the family
+		// rather than 404 a key that exists.
+		return wrouteCandidates(p, key)
 	}
 	// race still needs the ordered list: the racer fans out over it.
 	return out
@@ -353,12 +452,57 @@ const routeBufLimit = 32 << 20
 
 var errRouteTooLarge = errors.New("route: response exceeds buffer limit")
 
+// routeTTFT and wrouteTTFT bound how long one candidate may go without
+// answering at all: a model that has produced nothing when the window closes
+// is abandoned for the next one instead of holding the request. wroute is the
+// wide fan-out over one line's patches, so it cuts earlier (3s) to keep the
+// ladder cheap; a plain route row gives the model 6s.
+const (
+	routeTTFT  = 6 * time.Second
+	wrouteTTFT = 3 * time.Second
+)
+
+// routeTTFTFor is the first-response window for one ladder name.
+func routeTTFTFor(name string) time.Duration {
+	if name == "wroute" {
+		return wrouteTTFT
+	}
+	return routeTTFT
+}
+
+// routeUsageKey carries the model a route attempt actually landed on, so its
+// usage counts against that model instead of the route id the client sent.
+type routeUsageKey struct{}
+
+// withRouteUsage labels attempts with the model they resolved to.
+func withRouteUsage(ctx context.Context, model string) context.Context {
+	if model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, routeUsageKey{}, model)
+}
+
+// usageModel is the model a usage row belongs to: the routed model when the
+// request came through route/, else the client's own id.
+func usageModel(r *http.Request, clientModel string) string {
+	if m, ok := r.Context().Value(routeUsageKey{}).(string); ok && m != "" {
+		return m
+	}
+	return clientModel
+}
+
 // routeRecorder buffers one backend attempt: headers, status, body. flush
 // replays it onto the real writer when the attempt wins.
 type routeRecorder struct {
 	header http.Header
 	body   bytes.Buffer
 	status int
+	// answering flips once the attempt has something to replay (a header, a
+	// status or a byte), which is what the ttft watchdog watches.
+	answering atomic.Bool
+	// aborted marks an attempt the watchdog gave up on: whatever it recorded
+	// is a miss, never a win.
+	aborted atomic.Bool
 	// set by a completed attempt so the race path can record only the
 	// winner's latency.
 	label   string
@@ -370,12 +514,18 @@ func newRouteRecorder() *routeRecorder {
 }
 
 func (r *routeRecorder) Header() http.Header { return r.header }
-func (r *routeRecorder) WriteHeader(s int)   { r.status = s }
-func (r *routeRecorder) Flush()              {}
+
+func (r *routeRecorder) WriteHeader(s int) {
+	r.answering.Store(true)
+	r.status = s
+}
+
+func (r *routeRecorder) Flush() {}
 
 // Write buffers, marking implicit 200 like net/http does when handlers
 // never call WriteHeader explicitly.
 func (r *routeRecorder) Write(b []byte) (int, error) {
+	r.answering.Store(true)
 	if r.body.Len()+len(b) > routeBufLimit {
 		r.status = http.StatusBadGateway
 		return 0, errRouteTooLarge
@@ -386,7 +536,7 @@ func (r *routeRecorder) Write(b []byte) (int, error) {
 	return r.body.Write(b)
 }
 
-func (r *routeRecorder) won() bool { return r.status == http.StatusOK }
+func (r *routeRecorder) won() bool { return r.status == http.StatusOK && !r.aborted.Load() }
 
 func (r *routeRecorder) flush(w http.ResponseWriter) {
 	for k, v := range r.header {
@@ -399,13 +549,33 @@ func (r *routeRecorder) flush(w http.ResponseWriter) {
 	w.Write(r.body.Bytes())
 }
 
-// routeTry runs fn against a recorder; a 200 replays onto w and wins.
-func routeTry(ctx context.Context, w http.ResponseWriter, fn func(http.ResponseWriter) bool) bool {
-	rec := newRouteRecorder()
+// routeTry runs fn against a recorder; a 200 replays onto w and wins. an
+// attempt that answers nothing within ttft is cancelled and counts as a miss,
+// so the ladder tries the next candidate instead of waiting out this one.
+func routeTry(ctx context.Context, w http.ResponseWriter, ttft time.Duration, fn func(context.Context, http.ResponseWriter) bool) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	fn(rec)
+	rec := newRouteRecorder()
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if ttft > 0 {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			t := time.NewTimer(ttft)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				if !rec.answering.Load() {
+					rec.aborted.Store(true)
+					cancel()
+				}
+			case <-done:
+			}
+		}()
+	}
+	fn(actx, rec)
 	if !rec.won() {
 		return false
 	}
@@ -416,12 +586,26 @@ func routeTry(ctx context.Context, w http.ResponseWriter, fn func(http.ResponseW
 // handleRoute serves route/<key> on openai-compat paths: resolve candidates,
 // try each in order (buffered, first 200 replays), or race them all at once.
 func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, model, key string, isStream bool, start time.Time, reqID string) {
-	cands := routeCandidates(p, key)
+	p.serveRoute(w, r, body, model, "route", key, routeCandidates(p, key), isStream, start, reqID, cfg().Route.Strategy, true)
+}
+
+// handleWRoute serves wroute/<key>, route's wide sibling. candidates are exact
+// models, so the per-backend retry budget does not apply (each candidate is
+// already a different model) and race stays off: it would fire one upstream
+// call per family member on every request.
+func (p *Pool) handleWRoute(w http.ResponseWriter, r *http.Request, body []byte, model, key string, isStream bool, start time.Time, reqID string) {
+	p.serveRoute(w, r, body, model, "wroute", key, wrouteCandidates(p, key), isStream, start, reqID, "", false)
+}
+
+// serveRoute runs one resolved candidate list under name: the sequential
+// ladder (repeat adds the per-backend retry budget) or the race fan-out.
+func (p *Pool) serveRoute(w http.ResponseWriter, r *http.Request, body []byte, model, name, key string, cands []string, isStream bool, start time.Time, reqID string, strategy string, repeat bool) {
 	if len(cands) == 0 {
-		acclog.Printf("<- 404 %s %s model=%s (no route backends serve %q)", r.Method, r.URL.Path, model, key)
-		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("route: no backends serve %q", key))
+		acclog.Printf("<- 404 %s %s model=%s (no %s backends serve %q)", r.Method, r.URL.Path, model, name, key)
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("%s: no backends serve %q", name, key))
 		return
 	}
+	ttft := routeTTFTFor(name)
 	try := func(w http.ResponseWriter, cand string) bool {
 		backend, id, _ := strings.Cut(cand, "/")
 		nb, err := setReqModel(body, cand)
@@ -429,9 +613,9 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 			return false
 		}
 		var dt time.Duration
-		won := routeTry(r.Context(), w, func(rw http.ResponseWriter) bool {
+		won := routeTry(r.Context(), w, ttft, func(ctx context.Context, rw http.ResponseWriter) bool {
 			t0 := time.Now()
-			p.dispatchRouteOAI(rw, r, nb, cand, backend, id, isStream, start, reqID)
+			p.dispatchRouteOAI(rw, r.WithContext(ctx), nb, cand, backend, id, isStream, start, reqID)
 			dt = time.Since(t0)
 			return true
 		})
@@ -441,7 +625,7 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 		}
 		return won
 	}
-	if strings.EqualFold(strings.TrimSpace(cfg().Route.Strategy), "race") && len(cands) > 1 {
+	if strings.EqualFold(strings.TrimSpace(strategy), "race") && len(cands) > 1 {
 		fns := make([]func(context.Context, http.ResponseWriter) bool, 0, len(cands))
 		for _, cand := range cands {
 			cand := cand
@@ -467,354 +651,19 @@ func (p *Pool) handleRoute(w http.ResponseWriter, r *http.Request, body []byte, 
 			return
 		}
 	} else {
-		for _, cand := range expandRouteAttempts(cands) {
+		list := cands
+		if repeat {
+			list = expandRouteAttempts(cands)
+		}
+		for _, cand := range list {
 			if try(w, cand) {
-				acclog.Printf("%s route=%s won on %s", reqID, key, cand)
+				acclog.Printf("%s %s=%s won on %s", reqID, name, key, cand)
 				return
 			}
 		}
 	}
-	acclog.Printf("<- 502 %s %s model=%s (route %q: all %d backends failed)", r.Method, r.URL.Path, model, key, len(cands))
-	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("route: all backends failed for %q", key))
-}
-
-// zenFallbackKeys are the route keys a zen-only id is served from while the
-// free budget is spent. big-pickle, flint-40b and the nemotron rows exist on no
-// other backend; answering with a mirrored model beats a 503, and the
-// substitution is named in the response header and the log. more than one key
-// because no single backend is always up: antseed, uno and freepi fail for
-// different reasons at different times.
-var zenFallbackKeys = []string{"glm-5.3-flash", "beam", "deepseek-v4.1-flash"}
-
-// zenFailoverCand is one attempt for a zen model while its budget is spent.
-// rank 0 is the caller's own model on another backend, 1 a family match and 2
-// the shared fallback: anything above 0 answers with a different model, which
-// the response header and the log both name.
-type zenFailoverCand struct {
-	id   string
-	rank int
-}
-
-// zenTierWords are the capability words a family substitution must match on:
-// answering a flash request with a pro model is a different product, not a
-// mirrored one.
-var zenTierWords = []string{"flash", "lite", "mini", "pro", "turbo", "max", "vl"}
-
-// zenTier returns the first tier word in a route key, "" when it has none.
-func zenTier(key string) string {
-	for _, tok := range strings.Split(key, "-") {
-		for _, w := range zenTierWords {
-			if tok == w {
-				return w
-			}
-		}
-	}
-	return ""
-}
-
-// zenFamily matches route keys from one model family: same vendor token and,
-// when either names a tier, the same tier (deepseek-v4.1-flash and
-// deepseek-v4-flash are one family; deepseek-v4.1-flash and deepseek-r1 are
-// not).
-func zenFamily(a, b string) bool {
-	if ta, tb := zenTier(a), zenTier(b); ta != tb {
-		return false
-	}
-	fa := strings.SplitN(a, "-", 2)[0]
-	fb := strings.SplitN(b, "-", 2)[0]
-	return fa != "" && fa == fb
-}
-
-// zenUnknownLatency is where a backend with no success sample ranks: neither
-// trusted to be fast nor demoted.
-const zenUnknownLatency = 1500
-
-// backendRank orders candidates by measured latency.
-func backendRank(cand string) float64 {
-	backend, _, _ := strings.Cut(cand, "/")
-	if ms := routeLatency(backend); ms > 0 {
-		return ms
-	}
-	return zenUnknownLatency
-}
-
-// zenFailoverCands lists attempts for a zen model while the free budget is
-// spent: its own route key first, then same-family keys (deepseek-v4.1-flash
-// exists only on freepi, while the family's deepseek-v4-flash is on antseed),
-// then one widely-mirrored model so a zen-only id still answers. opencode is
-// skipped — it is the backend that answered the cap — as is an excluded
-// backend. each rank is latency-ordered, so the half-second backend answers
-// before the eighteen-second one.
-func zenFailoverCands(p *Pool, realModel string) []zenFailoverCand {
-	key := routeKey("opencode", realModel)
-	var out []zenFailoverCand
-	seen := map[string]bool{}
-	add := func(k string, rank int) {
-		for _, cand := range routeCandidates(p, k) {
-			backend, _, _ := strings.Cut(cand, "/")
-			if backend == "opencode" || routeBackendOff(backend) || seen[cand] {
-				continue
-			}
-			seen[cand] = true
-			out = append(out, zenFailoverCand{id: cand, rank: rank})
-		}
-	}
-	add(key, 0)
-	t := routeTableFor(p)
-	fam := make([]string, 0, len(t))
-	for k := range t {
-		if k != key && !routeExclude(k) && zenFamily(key, k) {
-			fam = append(fam, k)
-		}
-	}
-	sort.Strings(fam)
-	for _, k := range fam {
-		add(k, 1)
-	}
-	for _, k := range zenFallbackKeys {
-		if k != key {
-			add(k, 2)
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].rank != out[j].rank {
-			return out[i].rank < out[j].rank
-		}
-		return backendRank(out[i].id) < backendRank(out[j].id)
-	})
-	return out
-}
-
-// zenFailoverBudget bounds one failover chain: the caller gets an answer or an
-// honest 503 within it, never a request parked on a slow backend.
-const zenFailoverBudget = 9 * time.Second
-
-// zenHedgeDelay is how long one candidate may stay silent before the next is
-// started alongside it. a fast failure moves on at once; a slow backend is
-// bypassed instead of serially waited on.
-const zenHedgeDelay = 1500 * time.Millisecond
-
-// a backend whose measured latency is past zenSlowBackend is hedged after
-// zenSlowHedgeDelay only: waiting on it is how a 2s answer turns into a 5s one.
-const zenSlowBackend = 4000
-const zenSlowHedgeDelay = 300 * time.Millisecond
-
-// zenClaim hands the client to the first candidate that answers 200.
-type zenClaim struct {
-	once    sync.Once
-	won     chan struct{}
-	mu      sync.Mutex
-	cancels []context.CancelFunc
-	winner  int
-}
-
-func newZenClaim() *zenClaim {
-	return &zenClaim{won: make(chan struct{}), winner: -1}
-}
-
-func (c *zenClaim) attempt(cancel context.CancelFunc) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cancels = append(c.cancels, cancel)
-	return len(c.cancels) - 1
-}
-
-func (c *zenClaim) take(i int) bool {
-	took := false
-	c.once.Do(func() {
-		took = true
-		c.winner = i
-	})
-	return took
-}
-
-// cancelLosers stops every attempt but the one that won.
-func (c *zenClaim) cancelLosers() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i, cancel := range c.cancels {
-		if i != c.winner {
-			cancel()
-		}
-	}
-}
-
-// zenLatch streams the winning candidate straight to the client and keeps a
-// losing one off it. buffering the whole body made every failover cost a full
-// generation before the caller saw a byte; here the caller sees the upstream's
-// first token, and only a non-200 stays buffered so the next candidate gets a
-// turn.
-type zenLatch struct {
-	real   http.ResponseWriter
-	claim  *zenClaim
-	index  int
-	head   http.Header
-	status int
-	live   bool
-}
-
-func newZenLatch(w http.ResponseWriter, claim *zenClaim, index int) *zenLatch {
-	return &zenLatch{real: w, claim: claim, index: index, head: http.Header{}}
-}
-
-func (l *zenLatch) Header() http.Header {
-	if l.live {
-		return l.real.Header()
-	}
-	return l.head
-}
-
-func (l *zenLatch) WriteHeader(code int) {
-	if l.live || l.status != 0 {
-		return
-	}
-	if code != http.StatusOK {
-		l.status = code
-		return
-	}
-	if !l.claim.take(l.index) {
-		l.status = http.StatusBadGateway
-		return
-	}
-	for k, v := range l.head {
-		l.real.Header()[k] = v
-	}
-	l.real.WriteHeader(code)
-	l.live = true
-	close(l.claim.won)
-}
-
-func (l *zenLatch) Write(b []byte) (int, error) {
-	if !l.live {
-		if l.status == 0 {
-			l.WriteHeader(http.StatusOK)
-		}
-		if !l.live {
-			return len(b), nil // losing attempt: its body never reaches the client
-		}
-	}
-	n, err := l.real.Write(b)
-	if f, ok := l.real.(http.Flusher); ok {
-		f.Flush()
-	}
-	return n, err
-}
-
-func (l *zenLatch) Flush() {
-	if !l.live {
-		return
-	}
-	if f, ok := l.real.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// zenFailoverRun hedges the candidate list: each attempt streams through its
-// own latch, the next starts after zenHedgeDelay (or at once when this one
-// failed), and the first 200 owns the client. the winner keeps its own context
-// so its stream is never cancelled; every loser is cut off.
-func (p *Pool) zenFailoverRun(w http.ResponseWriter, r *http.Request, cands []zenFailoverCand, model, reqID string, dial func(zenFailoverCand, http.ResponseWriter, *http.Request)) bool {
-	if len(cands) == 0 {
-		return false
-	}
-	claim := newZenClaim()
-	var wg sync.WaitGroup
-	budget := time.NewTimer(zenFailoverBudget)
-	defer budget.Stop()
-	launch := func(c zenFailoverCand) <-chan struct{} {
-		ctx, cancel := context.WithCancel(r.Context())
-		idx := claim.attempt(cancel)
-		done := make(chan struct{})
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer close(done)
-			lw := newZenLatch(w, claim, idx)
-			t0 := time.Now()
-			dial(c, lw, r.WithContext(ctx))
-			if lw.live {
-				backend, _, _ := strings.Cut(c.id, "/")
-				noteRouteLatency(backend, time.Since(t0))
-				acclog.Printf("%s zen free tier spent: %s served by %s (substituted=%t)", reqID, model, c.id, c.rank > 0)
-			}
-		}()
-		return done
-	}
-launchLoop:
-	for _, c := range cands {
-		done := launch(c)
-		// a backend already known to be slow is hedged at once instead of
-		// holding the client for the full delay: its ewma says it will not
-		// be the one that answers first.
-		hedge := zenHedgeDelay
-		if backendRank(c.id) > zenSlowBackend {
-			hedge = zenSlowHedgeDelay
-		}
-		select {
-		case <-claim.won:
-			break launchLoop
-		case <-done: // this one failed fast: the next starts now
-		case <-time.After(hedge):
-		case <-budget.C:
-			break launchLoop
-		case <-r.Context().Done():
-			break launchLoop
-		}
-	}
-	// the list is spent: give the attempts still running the rest of the
-	// budget instead of cutting off the last one the moment it was launched.
-	allDone := make(chan struct{})
-	go func() { wg.Wait(); close(allDone) }()
-	select {
-	case <-claim.won:
-	case <-allDone:
-	case <-budget.C:
-	case <-r.Context().Done():
-	}
-	claim.cancelLosers()
-	<-allDone
-	return claim.winner >= 0
-}
-
-// zenFreeFailover serves a zen model through the route ladder while zen's
-// anonymous free budget is spent. that budget is one bucket behind `Bearer
-// public` (see zenFreeUntil), so rotation cannot clear it: the same model
-// family on another backend is what keeps opencode/<model> answering instead
-// of failing the caller after a ladder of hops that all hit the same cap.
-func (p *Pool) zenFreeFailover(w http.ResponseWriter, r *http.Request, body []byte, realModel string, isStream bool, start time.Time, reqID string) bool {
-	if !routeEnabled() {
-		return false
-	}
-	return p.zenFailoverRun(w, r, zenFailoverCands(p, realModel), "opencode/"+realModel, reqID,
-		func(c zenFailoverCand, lw http.ResponseWriter, rr *http.Request) {
-			backend, id, _ := strings.Cut(c.id, "/")
-			nb, err := setReqModel(body, c.id)
-			if err != nil {
-				lw.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			lw.Header().Set("X-Nimroute-Served-By", c.id)
-			p.dispatchRouteOAI(lw, rr, nb, c.id, backend, id, isStream, start, reqID)
-		})
-}
-
-// zenFreeFailoverAnthropic is zenFreeFailover on /v1/messages: same candidate
-// order, anthropic-shaped dispatch, same streaming latch.
-func (p *Pool) zenFreeFailoverAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, realModel string, tnames toolNames, isStream bool, start time.Time, reqID string) bool {
-	if !routeEnabled() {
-		return false
-	}
-	return p.zenFailoverRun(w, r, zenFailoverCands(p, realModel), clientModel, reqID,
-		func(c zenFailoverCand, lw http.ResponseWriter, rr *http.Request) {
-			backend, id, _ := strings.Cut(c.id, "/")
-			nb, err := setReqModel(oaiBody, c.id)
-			if err != nil {
-				lw.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			lw.Header().Set("X-Nimroute-Served-By", c.id)
-			p.dispatchRouteAnthropic(lw, rr, body, nb, clientModel, c.id, backend, id, tnames, isStream, start, reqID)
-		})
+	acclog.Printf("<- 502 %s %s model=%s (%s %q: all %d backends failed)", r.Method, r.URL.Path, model, name, key, len(cands))
+	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("%s: all backends failed for %q", name, key))
 }
 
 // dispatchRouteOAI runs one candidate on openai-compat paths.
@@ -828,7 +677,7 @@ func (p *Pool) dispatchRouteOAI(w http.ResponseWriter, r *http.Request, body []b
 		p.handleFreepi(w, r, body, cand, isStream, start, reqID)
 	case "antseed":
 		p.handleAntseed(w, r, body, cand, isStream, start, reqID)
-	case "uno", "openrouter", "nous": // keyed handlers expect the bare id in and on the body
+	case "uno", "openrouter", "orcarouter", "nous": // keyed handlers expect the bare id in and on the body
 		nb := body
 		if b, err := setReqModel(body, id); err == nil {
 			nb = b
@@ -838,6 +687,8 @@ func (p *Pool) dispatchRouteOAI(w http.ResponseWriter, r *http.Request, body []b
 			p.keyedChat(w, r, nb, id, isStream, start, reqID, unoBackend)
 		case "openrouter":
 			p.keyedChat(w, r, nb, id, isStream, start, reqID, orChatBackend)
+		case "orcarouter":
+			p.keyedChat(w, r, nb, id, isStream, start, reqID, orcaBackend)
 		default:
 			p.handleNous(w, r, nb, id, isStream, start, reqID)
 		}
@@ -853,12 +704,22 @@ func (p *Pool) dispatchRouteOAI(w http.ResponseWriter, r *http.Request, body []b
 // handleRouteAnthropic serves route/<key> on /v1/messages: same candidate
 // order, anthropic-shaped handlers, buffered so fallback can retry.
 func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, key string, tnames toolNames, isStream bool, start time.Time, reqID string) {
-	cands := routeCandidates(p, key)
+	p.serveRouteAnthropic(w, r, body, oaiBody, clientModel, "route", key, routeCandidates(p, key), tnames, isStream, start, reqID, cfg().Route.Strategy, true)
+}
+
+// handleWRouteAnthropic serves wroute/<key> on /v1/messages.
+func (p *Pool) handleWRouteAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, key string, tnames toolNames, isStream bool, start time.Time, reqID string) {
+	p.serveRouteAnthropic(w, r, body, oaiBody, clientModel, "wroute", key, wrouteCandidates(p, key), tnames, isStream, start, reqID, "", false)
+}
+
+// serveRouteAnthropic runs one resolved candidate list under name.
+func (p *Pool) serveRouteAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, name, key string, cands []string, tnames toolNames, isStream bool, start time.Time, reqID string, strategy string, repeat bool) {
 	if len(cands) == 0 {
-		acclog.Printf("<- 404 POST /v1/messages model=%s (no route backends serve %q)", clientModel, key)
-		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "route: no backends serve "+key)
+		acclog.Printf("<- 404 POST /v1/messages model=%s (no %s backends serve %q)", clientModel, name, key)
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", name+": no backends serve "+key)
 		return
 	}
+	ttft := routeTTFTFor(name)
 	try := func(cand string) bool {
 		backend, id, _ := strings.Cut(cand, "/")
 		nb, err := setReqModel(oaiBody, cand)
@@ -866,9 +727,9 @@ func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body
 			return false
 		}
 		var dt time.Duration
-		won := routeTry(r.Context(), w, func(rw http.ResponseWriter) bool {
+		won := routeTry(r.Context(), w, ttft, func(ctx context.Context, rw http.ResponseWriter) bool {
 			t0 := time.Now()
-			p.dispatchRouteAnthropic(rw, r, body, nb, clientModel, cand, backend, id, tnames, isStream, start, reqID)
+			p.dispatchRouteAnthropic(rw, r.WithContext(ctx), body, nb, clientModel, cand, backend, id, tnames, isStream, start, reqID)
 			dt = time.Since(t0)
 			return true
 		})
@@ -877,7 +738,7 @@ func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body
 		}
 		return won
 	}
-	if strings.EqualFold(strings.TrimSpace(cfg().Route.Strategy), "race") && len(cands) > 1 {
+	if strings.EqualFold(strings.TrimSpace(strategy), "race") && len(cands) > 1 {
 		fns := make([]func(context.Context, http.ResponseWriter) bool, 0, len(cands))
 		for _, cand := range cands {
 			cand := cand
@@ -903,19 +764,26 @@ func (p *Pool) handleRouteAnthropic(w http.ResponseWriter, r *http.Request, body
 			return
 		}
 	} else {
-		for _, cand := range expandRouteAttempts(cands) {
+		list := cands
+		if repeat {
+			list = expandRouteAttempts(cands)
+		}
+		for _, cand := range list {
 			if try(cand) {
-				acclog.Printf("%s route=%s won on %s", reqID, key, cand)
+				acclog.Printf("%s %s=%s won on %s", reqID, name, key, cand)
 				return
 			}
 		}
 	}
-	acclog.Printf("<- 502 POST /v1/messages model=%s (route %q: all %d backends failed)", clientModel, key, len(cands))
-	writeAnthropicError(w, http.StatusBadGateway, "api_error", "route: all backends failed for "+key)
+	acclog.Printf("<- 502 POST /v1/messages model=%s (%s %q: all %d backends failed)", clientModel, name, key, len(cands))
+	writeAnthropicError(w, http.StatusBadGateway, "api_error", name+": all backends failed for "+key)
 }
 
 // dispatchRouteAnthropic runs one candidate on the messages path.
 func (p *Pool) dispatchRouteAnthropic(w http.ResponseWriter, r *http.Request, body, oaiBody []byte, clientModel, cand, backend, id string, tnames toolNames, isStream bool, start time.Time, reqID string) {
+	// these handlers log usage under the client's model: point the row at the
+	// model this attempt resolved to, so a routed request counts on it.
+	r = r.WithContext(withRouteUsage(r.Context(), cand))
 	switch backend {
 	case "opencode":
 		p.concurrentZen.Add(1)
@@ -925,7 +793,7 @@ func (p *Pool) dispatchRouteAnthropic(w http.ResponseWriter, r *http.Request, bo
 		p.handleFreepiAnthropic(w, r, oaiBody, clientModel, cand, tnames, isStream, start, reqID)
 	case "antseed":
 		p.handleAntseedAnthropic(w, r, oaiBody, clientModel, cand, tnames, isStream, start, reqID)
-	case "uno", "openrouter", "nous": // keyed handlers expect the bare id in and on the body
+	case "uno", "openrouter", "orcarouter", "nous": // keyed handlers expect the bare id in and on the body
 		nb := oaiBody
 		if b, err := setReqModel(oaiBody, id); err == nil {
 			nb = b
@@ -935,6 +803,8 @@ func (p *Pool) dispatchRouteAnthropic(w http.ResponseWriter, r *http.Request, bo
 			p.keyedChatAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID, unoBackend)
 		case "openrouter":
 			p.keyedChatAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID, orChatBackend)
+		case "orcarouter":
+			p.keyedChatAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID, orcaBackend)
 		default:
 			p.handleNousAnthropic(w, r, nb, clientModel, id, tnames, isStream, start, reqID)
 		}
@@ -981,10 +851,12 @@ func appendRouteModels(p *Pool, out *struct {
 	}
 }
 
-// routeRow is one /status route entry: the id plus which backends serve it.
+// routeRow is one /status route entry: the id, which backends serve it, and
+// the exact model behind each of them in attempt order.
 type routeRow struct {
-	ID  string   `json:"id"`
-	Via []string `json:"via"`
+	ID     string   `json:"id"`
+	Via    []string `json:"via"`
+	Models []string `json:"models,omitempty"`
 }
 
 // routeSummary is the /status view: strategy, per-backend latency, routes.
@@ -1017,13 +889,16 @@ func routeSnapshot(p *Pool) *routeSummary {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		var via []string
+		var via, models []string
 		for _, b := range routeBackends {
-			if _, ok := t[k][b]; ok {
+			if id, ok := t[k][b]; ok {
 				via = append(via, b)
+				models = append(models, b+"/"+id)
 			}
 		}
-		sum.Routes = append(sum.Routes, routeRow{ID: "route/" + k, Via: via})
+		// the row states the attempt order, so it shows what the request takes:
+		// the provider ladder, exactly as routeCandidates walks it.
+		sum.Routes = append(sum.Routes, routeRow{ID: "route/" + k, Via: via, Models: models})
 	}
 	sum.Count = len(sum.Routes)
 	return sum

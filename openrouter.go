@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -382,6 +383,47 @@ func withOROverlay(id string, e *modelInfoEntry) *modelInfoEntry {
 
 // orExtras is the openrouter payload for /v1/models: the fields we relay
 // verbatim plus the served-contract facts only this proxy knows.
+// orPrice1M is a model's openrouter price in usd per million tokens. the
+// catalog quotes usd per *token* as decimal strings, so the readable figure
+// is a scale of its own number, not a second source. ok is false when the
+// row is unknown or quotes no text price.
+func orPrice1M(infoID string) (in, out float64, ok bool) {
+	ix := openRouterIndex()
+	if ix == nil {
+		return 0, 0, false
+	}
+	m := ix.get(infoID)
+	if m == nil || len(m.Pricing) == 0 {
+		return 0, 0, false
+	}
+	pin, iok := orPriceValue(m.Pricing["prompt"])
+	pout, ook := orPriceValue(m.Pricing["completion"])
+	if !iok && !ook {
+		return 0, 0, false
+	}
+	return roundPrice(pin * 1e6), roundPrice(pout * 1e6), true
+}
+
+// orPriceValue reads one quoted price: a decimal string on most rows, a
+// number on a few.
+func orPriceValue(v any) (float64, bool) {
+	switch t := v.(type) {
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f, err == nil
+	case float64:
+		return t, true
+	case json.Number:
+		f, err := t.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// roundPrice trims float noise from the per-million scale (0.37, not
+// 0.37000000000000011).
+func roundPrice(f float64) float64 { return math.Round(f*1e6) / 1e6 }
+
 func orExtras(infoID string) map[string]any {
 	ix := openRouterIndex()
 	if ix == nil {

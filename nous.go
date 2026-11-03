@@ -138,6 +138,26 @@ type nousModel struct {
 	ID      string
 	Context int
 	MaxOut  int
+	// Facts is the portal's own metadata for this id: name, prose, modalities,
+	// supported params, reasoning. it describes the exact model the portal
+	// serves, so /v1/models prefers it over model_info.jsonc.
+	Facts *modelInfoEntry
+	// PriceIn / PriceOut are usd per million tokens as the portal quotes them.
+	PriceIn  float64
+	PriceOut float64
+	PriceOK  bool
+}
+
+// nousCatalogRow is one portal listing row. the portal publishes an
+// openrouter-shaped row, so orModel carries the metadata and only the free
+// gate's two prices need their own typed view (the rest of pricing is
+// polymorphic and would fail a map[string]string).
+type nousCatalogRow struct {
+	orModel
+	Pricing struct {
+		Prompt     string `json:"prompt"`
+		Completion string `json:"completion"`
+	} `json:"pricing"`
 }
 
 var (
@@ -232,20 +252,7 @@ func fetchNousCatalog() []nousModel {
 		return nousCached()
 	}
 	var payload struct {
-		Data []struct {
-			ID      string `json:"id"`
-			Context int    `json:"context_length"`
-			// only the two prices that decide free. pricing also carries
-			// per-modality strings, an "overrides" ARRAY and an "original"
-			// object, so a map[string]string would fail on the whole body.
-			Pricing struct {
-				Prompt     string `json:"prompt"`
-				Completion string `json:"completion"`
-			} `json:"pricing"`
-			Top struct {
-				MaxOut int `json:"max_completion_tokens"`
-			} `json:"top_provider"`
-		} `json:"data"`
+		Data []nousCatalogRow `json:"data"`
 	}
 	// cap the body: a compromised or bloated portal must not feed
 	// unbounded allocation into a /v1/models call.
@@ -254,12 +261,26 @@ func fetchNousCatalog() []nousModel {
 		return nousCached()
 	}
 	out := make([]nousModel, 0, len(payload.Data))
-	for _, m := range payload.Data {
-		if m.ID == "" || !nousPriceZero(m.Pricing.Prompt) ||
-			!nousPriceZero(m.Pricing.Completion) {
+	for _, row := range payload.Data {
+		m := row.orModel
+		if m.ID == "" || !nousPriceZero(row.Pricing.Prompt) ||
+			!nousPriceZero(row.Pricing.Completion) {
 			continue
 		}
-		out = append(out, nousModel{ID: m.ID, Context: m.Context, MaxOut: m.Top.MaxOut})
+		nm := nousModel{ID: m.ID, Context: m.ContextLength}
+		if m.TopProvider.MaxCompletionTokens != nil {
+			nm.MaxOut = *m.TopProvider.MaxCompletionTokens
+		}
+		f := orEntry(&m)
+		f.Source = "nous"
+		nm.Facts = &f
+		if in, ok := orPriceValue(row.Pricing.Prompt); ok {
+			nm.PriceIn, nm.PriceOK = in, true
+		}
+		if outPrice, ok := orPriceValue(row.Pricing.Completion); ok {
+			nm.PriceOut = outPrice
+		}
+		out = append(out, nm)
 	}
 	if len(out) == 0 {
 		return nousCached()
@@ -509,7 +530,7 @@ func (p *Pool) handleNousAnthropic(w http.ResponseWriter, r *http.Request,
 		errMsg := "nous: upstream unavailable"
 		logUsage(UsageRecord{
 			Ts:         time.Now().UTC().Format(time.RFC3339Nano),
-			Model:      clientModel,
+			Model:      usageModel(r, clientModel),
 			Method:     "POST",
 			Path:       "/v1/messages",
 			StatusCode: http.StatusBadGateway,
@@ -526,7 +547,7 @@ func (p *Pool) handleNousAnthropic(w http.ResponseWriter, r *http.Request,
 		acclog.Printf("!! nous upstream %d [%s] model=%s err=%q", res.Status, res.KeyName, clientModel, errMsg)
 		logUsage(UsageRecord{
 			Ts:           time.Now().UTC().Format(time.RFC3339Nano),
-			Model:        clientModel,
+			Model:        usageModel(r, clientModel),
 			KeyName:      "nous:" + res.KeyName,
 			Method:       "POST",
 			Path:         "/v1/messages",
@@ -549,7 +570,7 @@ func (p *Pool) handleNousAnthropic(w http.ResponseWriter, r *http.Request,
 		written, promptT, compT := streamAnthropic(w, res.Body, clientModel, tnames)
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-			Model:            clientModel,
+			Model:            usageModel(r, clientModel),
 			KeyName:          "nous:" + res.KeyName,
 			Method:           "POST",
 			Path:             "/v1/messages",
@@ -568,7 +589,7 @@ func (p *Pool) handleNousAnthropic(w http.ResponseWriter, r *http.Request,
 	if errMsg != "" {
 		logUsage(UsageRecord{
 			Ts:         time.Now().UTC().Format(time.RFC3339Nano),
-			Model:      clientModel,
+			Model:      usageModel(r, clientModel),
 			KeyName:    "nous:" + res.KeyName,
 			Method:     "POST",
 			Path:       "/v1/messages",
@@ -587,7 +608,7 @@ func (p *Pool) handleNousAnthropic(w http.ResponseWriter, r *http.Request,
 
 	logUsage(UsageRecord{
 		Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-		Model:            clientModel,
+		Model:            usageModel(r, clientModel),
 		KeyName:          "nous:" + res.KeyName,
 		Method:           "POST",
 		Path:             "/v1/messages",
@@ -616,13 +637,32 @@ func appendNousModels(out *struct {
 		}
 		seenIDs[id] = true
 		entry := infoModel(id, id)
-		// the portal publishes the served window and output cap; prefer them
-		// over the catalog fallback so the client is told the real numbers.
+		// the portal's own row wins over model_info.jsonc and the openrouter
+		// overlay: it is written for this exact model and stays current.
+		if m.Facts != nil {
+			applyFacts(&entry, m.Facts)
+		}
 		if m.Context > 0 {
 			entry.ContextLength = m.Context
+			if entry.TopProvider == nil {
+				entry.TopProvider = map[string]any{}
+			}
+			entry.TopProvider["context_length"] = m.Context
 		}
 		if m.MaxOut > 0 {
-			entry.TopProvider = map[string]any{"max_completion_tokens": m.MaxOut}
+			if entry.TopProvider == nil {
+				entry.TopProvider = map[string]any{}
+			}
+			entry.TopProvider["max_completion_tokens"] = m.MaxOut
+		}
+		if m.PriceOK {
+			in, out := roundPrice(m.PriceIn*1e6), roundPrice(m.PriceOut*1e6)
+			entry.Price1M = map[string]any{"input": in, "output": out, "source": "nous"}
+			entry.Pricing = map[string]string{
+				"prompt":     strconv.FormatFloat(roundPrice(in/1e6), 'g', -1, 64),
+				"completion": strconv.FormatFloat(roundPrice(out/1e6), 'g', -1, 64),
+				"request":    "0",
+			}
 		}
 		out.Data = append(out.Data, entry)
 	}

@@ -62,6 +62,18 @@ nous_keys:
 # master switch. false = uno/* 503 and hidden from /v1/models.
 uno:
   enabled: true
+  # serve the paid catalog too. off by default: a mistyped id must not bill.
+  paid_models: false
+  # names of the keys (from uno_keys) allowed to serve billed rows. with one
+  # named here, a paid or whitelisted-paid id draws only those keys while free
+  # rows keep drawing the whole pool. empty = every key serves both.
+  paid_keys: []
+  # extra ids served and listed even when the catalog omits them. write them
+  # bare or prefixed (uno/glm-5.3-flash:free).
+  model_whitelist: []
+  # hide paid rows priced above this many usd per million input tokens.
+  # 0 = no cap. free rows always pass, so this only trims costly ones.
+  max_price_1m: 0
 # --- uno router keys (required) ---
 # format: any name you like -> key. names show up in logs and /status.
 # requests use the uno/ prefixed form (uno/deepseek-ai/deepseek-v3.1:free);
@@ -72,6 +84,27 @@ uno:
 # drop out. cache lives 6h, last good list kept on fetch failure.
 uno_keys:
   # main: "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# --- orcarouter backend (https://api.orcarouter.ai) ---
+# openai-compatible gateway with provider-prefixed ids. master switch plus at
+# least one key: no keys = orcarouter/* 503 and hidden from /v1/models.
+# requests use the orcarouter/ prefixed form
+# (orcarouter/deepseek/deepseek-v4-flash-free); the prefix names the backend
+# and never reaches the gateway. free rows carry the -free suffix and run
+# under their own per-workspace limits; they never fall back to a paid model.
+# the catalog is anonymous, and a key it thinks is stale answers 401, so a
+# pool key is sent only when one exists.
+orcarouter:
+  enabled: true
+  # serve the paid catalog too. off by default: a mistyped id must not bill.
+  paid_models: false
+  # names of the keys (from orcarouter_keys) allowed to serve billed rows.
+  # empty = every key serves free and paid alike.
+  paid_keys: []
+  # extra ids served and listed even when the catalog omits them.
+  model_whitelist: []
+orcarouter_keys:
+  # main: "sk-orca-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # --- guardrails (recommended): strip baked-in system-prompt refusals ---
 # recommended, on by default: upstream free tiers inject refusal lines
@@ -168,7 +201,8 @@ anonymize:
 # --- nudge: continue tool-less answers with one reprompt round ---
 nudge:
   # master switch. false = never reprompt, first answer stands.
-  # per-model nudge in models.nudge / nudge_no_tools still applies.
+  # on = every model and provider is nudged, whatever the catalog says.
+  # opt one out with models.nudge or nudge_no_tools in model_info.jsonc.
   enabled: true
 
 # --- rtk (beta): tool_result compression (port of rtk-ai/rtk) ---
@@ -430,6 +464,26 @@ antseed:
 # opencode ids, one trailing :free dropped from uno/openrouter ids. nvidia
 # ids keep the org prefix (route/moonshotai/kimi-k3). every shared model
 # routes by default.
+#
+# wroute/<model> is route's wide sibling, and the split is by model line: route
+# keeps v4 and v4.1 apart, wroute folds every patch of one line into one row.
+# so wroute/deepseek-v4.1-flash, wroute/deepseek-v4-flash-free and
+# wroute/deepseek-v4-flash all hit the same row (v4, v4.1, the -0731 build, the
+# -free twins), listed as wroute/deepseek-v4-flash. a row is named after the
+# longest version its models share: all 2.6 builds list as
+# wroute/mimo-v2.6-flash, a mix of 4.5/4.6/4.7 falls back to wroute/glm-4-flash,
+# and glm-4.7 never joins a glm-5 row. a different name never merges either
+# (glm-5.3-flash does not reach glm-5.3). candidates stay grouped by provider
+# (the priority order below), and inside one provider the closest, most
+# specific id goes first: a version bump (v4 -> v4.1) and a dated build (-0731)
+# read as newer, a -free/-trial twin sits below the plain name.
+# both names share enabled/strategy/excludes; wroute ignores strategy (exact
+# models, tried in the order shown) and is listed under "wroute" in /status,
+# minus any row whose list is exactly the route row's list (the route id
+# already covers it). a route/<key> with no route row falls back to that same
+# wide list, so an old config naming a spelling that never merged
+# (route/foo-free while the route id is route/foo) still lands on the model it
+# points at.
 route:
   enabled: true          # false = route/* 503s, hidden from /v1/models
   strategy: "priority"   # priority (opencode, antseed, freepi, nvidia, uno,
@@ -467,6 +521,28 @@ openrouter:
   enabled: true          # false = no fetch, catalog gaps stay gaps
   url: ""                # override the models endpoint. "" = openrouter.ai
   refresh_hours: 6
+  # chat side only: serve the paid rows too. off by default: a mistyped id
+  # must not bill. the catalog fetch above is unaffected either way.
+  paid_models: false
+  # names of the keys (from openrouter_keys) allowed to serve billed rows.
+  # empty = every key serves free and paid alike.
+  paid_keys: []
+  # extra chat ids served and listed even when the index omits them.
+  model_whitelist: []
+  # hide paid rows priced above this many usd per million input tokens.
+  # 0 = no cap. free rows always pass, so this only trims costly ones.
+  max_price_1m: 0
+
+# --- models.dev: fills model_info.jsonc gaps ---
+# fetches https://models.dev/api.json and fills only what the catalog leaves
+# empty, or synthesizes an entry for an id the file never listed (instead of
+# the 131072 ctx fallback). curated values always win, and the file is never
+# written. ~6MB, fetched in the background at boot; a failed fetch keeps the
+# previous copy.
+modelsdev:
+  enabled: true
+  url: ""                # override the api.json fetch. "" = models.dev
+  refresh_hours: 24
 
 # --- openrouter chat backend (https://openrouter.ai/api/v1) ---
 # master switch for keyed chat requests is the key count below: no keys
@@ -497,8 +573,11 @@ status:
   show_nous: true             # nous section: portal keys, free models served
   show_uno: true              # uno section: keys, free models served
   show_openrouter: true       # openrouter section: keys, free models served
+  show_orcarouter: true       # orcarouter section: keys, free models served
   show_route: true            # route section: strategy, latency, route ids
+  show_wroute: true           # wroute section: wide route ids + exact models
   show_benchmarks: true       # aa scores per model, best first
+  show_prices: true           # provider-quoted $/1m in/out in the model table
   # status-only folding of the per-provider model rows. does NOT touch
   # /v1/models or route; those keep models.dedup_variants.
   dedup_versions: true        # hide older versions of one model

@@ -179,7 +179,14 @@ func anthropicRequestToOpenAI(body []byte) (oai []byte, clientModel, upstreamMod
 		return nil, "", "", nil, false, fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	clientModel = req.Model
+	// a message-body without a model or any user/assistant turns cannot
+	// succeed on any backend: fail here, not after a retry ladder.
+	if clientModel = req.Model; clientModel == "" {
+		return nil, "", "", nil, false, fmt.Errorf("model is required")
+	}
+	if len(req.Messages) == 0 {
+		return nil, "", "", nil, false, fmt.Errorf("messages: field is required and must be a non-empty array")
+	}
 	upstreamModel = mapClaudeModel(clientModel)
 	// claude code 1m alias: no backend serves a [1m] id, so strip the
 	// suffix unconditionally (a claude_map hit on the bare base still
@@ -708,6 +715,10 @@ func openAIToAnthropic(body []byte, clientModel string, tnames toolNames) (out [
 		text = stripWaitSentinel(text)
 		if text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
+		} else if len(msg.ToolCalls) == 0 && thinking != "" {
+			// reasoning-only turn (a capped max_tokens runs out inside the
+			// trace): the answer is the trace, not a blank bubble.
+			content = append(content, map[string]any{"type": "text", "text": thinking})
 		}
 
 		for _, tc := range msg.ToolCalls {
@@ -817,6 +828,10 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 		if textOpen {
 			return
 		}
+		// blocks close in index order: a client that assembles the turn by
+		// index drops the text when index 1 stops before index 0 does, which
+		// is exactly how claude code rendered a whole answer as nothing.
+		closeThinking()
 		textIdx = blockIdx
 		blockIdx++
 		written += writeSSE(w, "content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, textIdx))
@@ -833,6 +848,7 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 	}
 
 	var text strings.Builder
+	var thinkAll strings.Builder
 	finishReason := "stop"
 	for segment := 0; ; segment++ {
 		segmentPrompt, segmentComp := 0, 0
@@ -930,6 +946,7 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 				think = choice.Delta.ReasoningContent
 			}
 			if think != "" {
+				thinkAll.WriteString(think)
 				if thinkIdx < 0 || thinkClosed {
 					closeText()
 					thinkIdx = blockIdx
@@ -1010,6 +1027,19 @@ func streamAnthropicReader(ctx context.Context, w http.ResponseWriter, body io.R
 			}
 		}
 		break
+	}
+
+	// reasoning-only turn: the stream opened a thinking block and stopped
+	// inside it (max_tokens, or a model that answers with its trace). a
+	// client rendering only text blocks shows an empty answer, so the
+	// trace becomes the answer instead of nothing.
+	if !hasToolCalls && text.Len() == 0 && thinkAll.Len() > 0 {
+		closeThinking()
+		if d := strings.TrimSpace(stripWaitSentinel(thinkAll.String())); d != "" {
+			openText()
+			written += writeSSE(w, "content_block_delta", fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":%s}}`, textIdx, jsonStr(d)))
+			text.WriteString(d)
+		}
 	}
 
 	// finish reason follows trailing usage and any continuation.
@@ -1993,11 +2023,32 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		return
 	}
 
+	if strings.HasPrefix(upstreamModel, "wroute/") {
+		if !wrouteEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (wroute disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "wroute is disabled; set route.enabled: true in config.yml")
+			return
+		}
+		key := strings.TrimPrefix(upstreamModel, "wroute/")
+		if strings.TrimSpace(key) == "" {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "wroute: empty model name")
+			return
+		}
+		acclog.Printf("%s routed to wroute=%s", reqID, key)
+		p.handleWRouteAnthropic(w, r, body, oaiBody, clientModel, key, tnames, isStream, start, reqID)
+		return
+	}
+
 	// Route opencode/* models to zen endpoint
 	if strings.HasPrefix(upstreamModel, "opencode/") {
 		if !zenEnabled() {
 			acclog.Printf("<- 503 POST /v1/messages model=%s (zen disabled)", clientModel)
 			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "opencode zen is disabled; set zen.enabled: true in config.yml")
+			return
+		}
+		if !zenModelListed(upstreamModel) {
+			acclog.Printf("<- 404 POST /v1/messages model=%s (not in zen catalog)", clientModel)
+			writeAnthropicError(w, http.StatusNotFound, "not_found_error", "unknown model "+upstreamModel)
 			return
 		}
 		p.concurrentZen.Add(1)
@@ -2061,6 +2112,19 @@ func (p *Pool) handleAnthropic(w http.ResponseWriter, r *http.Request, start tim
 		p.keyedChatAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID, unoBackend)
 		return
 	}
+	if strings.HasPrefix(upstreamModel, "orcarouter/") {
+		if !orcaEnabled() {
+			acclog.Printf("<- 503 POST /v1/messages model=%s (orcarouter disabled)", clientModel)
+			writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "orcarouter is disabled or has no keys; set orcarouter.enabled: true and add orcarouter_keys to config.yml")
+			return
+		}
+		upstreamModel = strings.TrimPrefix(upstreamModel, "orcarouter/")
+		if b, err := setReqModel(oaiBody, upstreamModel); err == nil {
+			oaiBody = b
+		}
+		p.keyedChatAnthropic(w, r, oaiBody, clientModel, upstreamModel, tnames, isStream, start, reqID, orcaBackend)
+		return
+	}
 	if strings.HasPrefix(upstreamModel, "openrouter/") {
 		if !orChatEnabled() {
 			acclog.Printf("<- 503 POST /v1/messages model=%s (openrouter chat disabled)", clientModel)
@@ -2122,7 +2186,7 @@ func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oai
 		}
 		logUsage(UsageRecord{
 			Ts:         time.Now().UTC().Format(time.RFC3339Nano),
-			Model:      clientModel,
+			Model:      usageModel(r, clientModel),
 			Method:     "POST",
 			Path:       "/v1/messages",
 			StatusCode: 503,
@@ -2140,7 +2204,7 @@ func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oai
 
 		logUsage(UsageRecord{
 			Ts:          time.Now().UTC().Format(time.RFC3339Nano),
-			Model:       clientModel,
+			Model:       usageModel(r, clientModel),
 			KeyName:     u.Key,
 			Method:      "POST",
 			Path:        "/v1/messages",
@@ -2180,7 +2244,7 @@ func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oai
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-			Model:            clientModel,
+			Model:            usageModel(r, clientModel),
 			KeyName:          u.Key,
 			Method:           "POST",
 			Path:             "/v1/messages",
@@ -2233,7 +2297,7 @@ func (p *Pool) handleNvidiaAnthropic(w http.ResponseWriter, r *http.Request, oai
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-			Model:            clientModel,
+			Model:            usageModel(r, clientModel),
 			KeyName:          u.Key,
 			Method:           "POST",
 			Path:             "/v1/messages",
@@ -2523,16 +2587,6 @@ func estimateTokens(body []byte) int {
 // handleOpenCodeAnthropic routes opencode/* models through the zen endpoint.
 func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, origBody, oaiBody []byte, clientModel, upstreamModel string, tnames toolNames, isStream bool, start time.Time, reqID string) {
 	zenModel := strings.TrimPrefix(upstreamModel, "opencode/")
-	// a spent shared budget cannot be rotated past (see zenFreeUntil):
-	// serve the model elsewhere before spending a single exit on it.
-	if zenFreeCapped() {
-		acclog.Printf("%s opencode free budget spent until %s, model=%s", reqID, time.Unix(zenFreeUntil.Load(), 0).UTC().Format(time.RFC3339), clientModel)
-		if p.zenFreeFailoverAnthropic(w, r, origBody, oaiBody, clientModel, zenModel, tnames, isStream, start, reqID) {
-			return
-		}
-		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", zenFreeSpentMsg(clientModel))
-		return
-	}
 	endpoint := endpointForModel(zenModel)
 	isResponses := endpoint == "/responses"
 	acclog.Printf("%s routed to opencode model=%s endpoint=%s", reqID, zenModel, endpoint)
@@ -2544,7 +2598,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	if json.Unmarshal(oaiBody, &m) == nil {
 		m["model"] = zenModel
 		stripCacheFields(m)
-		ensureZenTools(m)
+		ensureZenGate(m)
 		if !isStream {
 			m["stream"] = true
 			m["stream_options"] = map[string]any{"include_usage": true}
@@ -2586,6 +2640,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		lastProxy := ""
 		var dialDeadErr error
 		dialDeadProxy := ""
+		// burned = exits this request already drew a 429 from: rotation must
+		// not hand one back for a second send (guard below).
+		burned := map[string]bool{}
 		rotating := true
 		// attempts is the ladder bound: a hop that finds the pool written off
 		// buys extra hops once a refill clears the marks (ladderExtend).
@@ -2638,6 +2695,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						return nil
 					}
 					continue
+				}
+				// rotation handed back an exit this request already drew a
+				// 429 from: a second send is a guaranteed cap answer, not a
+				// retry. end the ladder like the dial-dead guard below.
+				if proxy != "" && burned[proxy] {
+					acclog.Printf("  opencode re-picked %s after its own 429 by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
+					return nil
 				}
 				// rotation handed back the exit whose dial just failed: a
 				// second dial of the same corpse cannot succeed, so end the
@@ -2774,31 +2838,30 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				st := up.StatusCode
 				eb, _ := io.ReadAll(io.LimitReader(up.Body, 16<<10))
 				up.Body.Close()
-				// a free-tier 429 (FreeUsageLimitError) is the shared budget,
-				// not this exit's limit: the exit is healthy, so it is not
-				// marked, and the model goes to the failover instead.
+				// a free-tier 429 answers on whichever exit took the request,
+				// so it is that exit's mark like any other 429: rotate to a
+				// fresh exit and session and try again. treating it as a
+				// pool-wide cap is what parked every exit behind one answer
+				// and stopped rotation finding the ones with room left.
 				freeCap := zenFreeUsageCap(eb)
 				acclog.Printf("  opencode rate-limited %d (retry %d/%d) freetier=%t model=%s country=%s proxy=%s %s lane=%s, rotating exit+session",
 					st, zenRetries, zenRetryLabel(), freeCap, clientModel, proxyCountry(proxy), redactProxyUserinfo(proxy), tag, lane.id)
-				if freeCap {
-					noteZenFreeCap(up.Header)
-					noteExitOK(proxy, zenModel)
-					if p.zenFreeFailoverAnthropic(w, r, origBody, oaiBody, clientModel, zenModel, tnames, isStream, start, reqID) {
-						return zenAnswered
-					}
-					up, gaveUp = exhaustedExits(clientModel, st), true
-				} else {
-					if proxy == "" {
-						laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
-					}
-					noteExit429(proxy, zenModel)
+				if proxy == "" {
+					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
-				if !freeCap && zenLastRetry(zenRetries, attempts) {
+				noteExit429(proxy, zenModel)
+				if proxy != "" && st == http.StatusTooManyRequests {
+					// a 429 is this exit's own cap for the window; a 529
+					// is overload and may clear, so not written off here.
+					burned[proxy] = true
+				}
+				if freeCap && zenRetryAfterSecs(up.Header) >= zenTierCapParkSecs {
+					noteExitTierCap(proxy) // out for the day: stop drawing this ip
+				}
+				if zenLastRetry(zenRetries, attempts) {
 					// the ladder is spent on a written-off pool: refill and buy
 					// more hops instead of handing the caller a 503, as long as
 					// the marks (not a merely busy model) are what bounded it.
-					// a free-tier cap is upstream-wide, not a written-off pool:
-					// a forced refill would only wait out the recovery budget.
 					if ladderExtend(r.Context(), &poolRecoverUntil) {
 						attempts++
 						lane = laneHandoff(lane, laneFailover(lane))
@@ -2808,8 +2871,13 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 					}
 					// the client hears about the proxy pool, never the 429 we
 					// just absorbed.
-					up, gaveUp = exhaustedExits(clientModel, st), true
-				} else if !freeCap {
+					up, gaveUp = exhaustedExits(clientModel, st, zenRetries+1), true
+				} else {
+					// this exit will not serve: switch to another exit with
+					// a fresh session and keep going. noteExit429 above
+					// already steered the picker away from this pair, so the
+					// next hop lands on a different ip instead of the same
+					// one again.
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true
@@ -2839,7 +2907,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 						rotating = true
 						continue
 					}
-					up, gaveUp = exhaustedExits(clientModel, st), true
+					up, gaveUp = exhaustedExits(clientModel, st, zenRetries+1), true
 				} else {
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
@@ -2933,8 +3001,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 			}
 			resetZenNetErrs()
 			if up.StatusCode == http.StatusOK {
-				// a 200 proves the free budget is back.
-				clearZenFreeCap()
+
 				p.noteZenSuccess(sessionID, proxy)
 				noteExitOK(proxy, zenModel)
 				laneTouch(lane, proxy, zenModel)
@@ -2945,12 +3012,16 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 	}
 
 	resp = zenPost(oaiBody, isStream, "")
-	if resp == zenAnswered {
-		return
-	}
 	if resp == nil {
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", proxyUnavailableMsg(zenModel))
 		return
+	}
+	// a 429 can still leave the ladder (a raced or spent response is returned
+	// as-is): absorb it here too, so the caller never sees the one status the
+	// pool exists to hide.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
+		resp.Body.Close()
+		resp = exhaustedExits(zenModel, resp.StatusCode, 1)
 	}
 	defer resp.Body.Close()
 
@@ -3012,7 +3083,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-			Model:            clientModel,
+			Model:            usageModel(r, clientModel),
 			KeyName:          "opencode",
 			Method:           "POST",
 			Path:             "/v1/messages",
@@ -3091,7 +3162,7 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 
 		logUsage(UsageRecord{
 			Ts:               time.Now().UTC().Format(time.RFC3339Nano),
-			Model:            clientModel,
+			Model:            usageModel(r, clientModel),
 			KeyName:          "opencode",
 			Method:           "POST",
 			Path:             "/v1/messages",

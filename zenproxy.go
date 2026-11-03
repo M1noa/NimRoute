@@ -187,6 +187,63 @@ func schemeFor(protocols []string) string {
 // pool sized at three per lane parked itself after a handful of requests and
 // had nothing to rotate onto. never more than the configured pool_size,
 // never less than 24.
+// exitHost is a proxy url's egress address. zen meters the ip, not the
+// listening port, so forty ports on one host are one exit, one bucket.
+func exitHost(u string) string {
+	s := u
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		return h
+	}
+	return s
+}
+
+// exitSubnet is the /24 an exit sits in: a hoster publishing a range of
+// ports is still one network to anyone metering by ip.
+func exitSubnet(host string) string {
+	if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+		s := ip.String()
+		if i := strings.LastIndexByte(s, '.'); i > 0 {
+			return s[:i]
+		}
+	}
+	return host
+}
+
+// exitNetCap is how many exits one /24 may contribute to the pool.
+const exitNetCap = 3
+
+// dedupeExits keeps one exit per egress ip and at most exitNetCap per
+// network, preserving order: callers hand it the speed-sorted list, so the
+// fastest port on a host wins. a list that repeats one box's ports used to
+// fill the pool with 43 entries that all shared an ip — rotation looked
+// healthy while it handed out four addresses, and every one of them was
+// capped at the same moment.
+func dedupeExits(list []string) []string {
+	seenHost := make(map[string]bool, len(list))
+	perNet := map[string]int{}
+	out := make([]string, 0, len(list))
+	for _, u := range list {
+		h := exitHost(u)
+		if h == "" || seenHost[h] {
+			continue
+		}
+		sub := exitSubnet(h)
+		if perNet[sub] >= exitNetCap {
+			continue
+		}
+		seenHost[h] = true
+		perNet[sub]++
+		out = append(out, u)
+	}
+	return out
+}
+
 func poolTarget() int {
 	t := 8 * laneCap()
 	if t < 24 {
@@ -281,9 +338,6 @@ func refreshZenProxies(fresh bool) {
 		if zenBlocked(strings.ToUpper(strings.TrimSpace(e.Country))) {
 			continue
 		}
-		if !e.HTTPS && schemeFor(e.Protocols) == "http" {
-			continue // https-only zen, no-tls http proxies can't connect
-		}
 		fast = append(fast, e)
 	}
 	// dial order by claimed latency. the list's reliability figure looks
@@ -320,6 +374,10 @@ func refreshZenProxies(fresh bool) {
 		lats[u] = e.ResponseTimeMs
 		relis[u] = e.Reliability
 	}
+	// one exit per egress ip before anything sizes the sweep: the candidate
+	// budget and the verify fan-out both count entries, and forty ports on
+	// one host are forty entries that check the same rate-limit bucket.
+	cands = dedupeExits(cands)
 	// order the sweep: a periodic refresh re-checks the exits it is already
 	// serving first, so the pool it replaces keeps its known-good members and
 	// the early stop below spends most of the budget there. a fresh sweep
@@ -378,6 +436,11 @@ func refreshZenProxies(fresh bool) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	verified := make([]string, 0, len(cands))
+	// refused records the candidates this sweep dialed and could not admit. the
+	// merge below must not carry one over: an exit the sweep just failed to
+	// reach is not a working proxy, and keeping it is what handed lanes a pin
+	// the sweep had already written off.
+	refused := map[string]bool{}
 	verifyConc := 40
 	if n := c.Zen.VerifyConcurrency; n > 0 {
 		verifyConc = n
@@ -396,7 +459,7 @@ func refreshZenProxies(fresh bool) {
 	cold := coldSweep || fresh || full
 	lastPub := time.Time{}
 	var warmOnce sync.Once
-	mergeWithLive := func(snap []string) []string {
+	mergeWithLive := func(snap []string, refused map[string]bool) []string {
 		if !fresh || full {
 			return snap
 		}
@@ -406,7 +469,7 @@ func refreshZenProxies(fresh bool) {
 		seen := make(map[string]bool, len(cur)+len(snap))
 		out := make([]string, 0, len(cur)+len(snap))
 		for _, u := range cur {
-			if exitDead(u) || exitGateCooling(u) || seen[u] {
+			if exitDead(u) || exitGateCooling(u) || refused[u] || seen[u] {
 				continue
 			}
 			seen[u] = true
@@ -418,7 +481,7 @@ func refreshZenProxies(fresh bool) {
 				out = append(out, u)
 			}
 		}
-		return out
+		return dedupeExits(out)
 	}
 	publish := func() {
 		if !cold {
@@ -431,11 +494,15 @@ func refreshZenProxies(fresh bool) {
 		}
 		lastPub = time.Now()
 		snap := append([]string(nil), verified...)
+		refusedSnap := make(map[string]bool, len(refused))
+		for u := range refused {
+			refusedSnap[u] = true
+		}
 		mu.Unlock()
 		if len(snap) == 0 {
 			return
 		}
-		merged := mergeWithLive(snap)
+		merged := mergeWithLive(snap, refusedSnap)
 		kc, kl, kr := map[string]string{}, map[string]int{}, map[string]float64{}
 		for _, v := range merged {
 			if co, ok := countries[v]; ok {
@@ -471,14 +538,13 @@ func refreshZenProxies(fresh bool) {
 			log.Printf("  zen proxies: %d verified (pool warming, %d candidates left)", len(merged), len(cands)-len(snap))
 		})
 	}
-	// stop closes once the target is verified. every worker re-checks it
-	// after taking a verify slot, so the sweep ends within one wave of the
-	// target being met instead of dialing the rest of the list.
+	// stop closes once the target is reached. every worker re-checks it after
+	// taking a verify slot, so the sweep ends within one wave of the target
+	// instead of dialing the rest of the list.
 	//
-	// exits parked by the free-tier gate do not count: a 200 on GET /models
-	// proves connectivity, not that the IP may serve a completion, and a pool
-	// filled with gated exits would otherwise satisfy the target and stop the
-	// sweep before it ever reaches a fresh candidate.
+	// exits parked by the free-tier gate do not count toward it: they reached
+	// zen once and have since been written off by a real request, so counting
+	// them would let the sweep stop early with a pool it cannot send through.
 	stop := make(chan struct{})
 	var stopOnce sync.Once
 	hitTarget := func() {
@@ -515,14 +581,20 @@ func refreshZenProxies(fresh bool) {
 			r := verifyProxy(u)
 			mu.Lock()
 			mix.add(r)
-			ok := r == verifyOK || r == verifyCapped
+			// admission is serving: the exit dialed and a real one-token
+			// completion came back 200 — see verifyProxy. a cap only refuses the
+			// exit; parking it would write off the models it does serve.
+			ok := r == verifyOK
 			if ok {
 				verified = append(verified, u)
+			} else {
+				refused[u] = true
 			}
 			mu.Unlock()
 			if ok {
 				publish()
 				hitTarget()
+				return
 			}
 		}(u)
 	}
@@ -532,7 +604,7 @@ func refreshZenProxies(fresh bool) {
 	// clobber the live country/latency/reliability maps for the old exits.
 	// on a fresh sweep, merge surviving existing pool members so we never
 	// replace 20 working pins with just the 6 new exits found in the rest of the list.
-	finalPool := mergeWithLive(verified)
+	finalPool := mergeWithLive(verified, refused)
 	if len(finalPool) > 0 {
 		kc, kl, kr := map[string]string{}, map[string]int{}, map[string]float64{}
 		for _, v := range finalPool {
@@ -571,6 +643,39 @@ func refreshZenProxies(fresh bool) {
 	// the mix rides the summary so an upstream that starts answering 429/403
 	// to everything shows up next to the pool size with a reason attached.
 	acclog.Printf("  zen proxies: %d verified (%d total pool) of %d candidates dialed (target %d) mix: cap=%d 429=%d 403=%d other=%d dialerr=%d", len(verified), len(finalPool), len(cands), target, mix.capped, mix.rateLimited, mix.freeTier, mix.other, mix.dialErr)
+	// a sweep that verified nothing while exits kept answering zen's free-tier
+	// cap means the tier is out for every ip the list can offer, not that the
+	// list is thin: re-dialing it a moment later spends the same dials and gets
+	// the same caps, and the request that asked for the refill pays the wait.
+	// measured 2026-10-26: 1150 candidates, 76 capped, 0 verified, and a
+	// 503 that took 85s because every hop first waited on a fresh sweep.
+	//
+	// live again since admission became a serving probe: a sweep whose reachable
+	// exits all answer the cap verifies nothing and says so, instead of
+	// admitting them and letting every request discover it one hop at a time.
+	if len(verified) == 0 && mix.capped > 0 {
+		zenTierDownUntil.Store(time.Now().Add(zenTierDownBackoff).UnixNano())
+		acclog.Printf("  zen tier: no exit served, %d capped — holding sweeps for %v", mix.capped, zenTierDownBackoff)
+	}
+}
+
+// zenTierDownBackoff is how long a sweep that verified nothing while exits
+// were capped suppresses the next one. the list refetches its own candidates
+// and capacity appears and dies on minutes, so the hold is a throttle, not a
+// verdict: measured 2026-11-02, 1176 candidates held exactly one serving exit,
+// and the 10m hold that assumed "the same answer" could have missed a fresh
+// one for ten minutes. an empty pool answers 503 in ~1ms, so the cost of
+// sweeping again is dials, not client latency.
+const zenTierDownBackoff = 3 * time.Minute
+
+// zenTierDownUntil holds the unix-nano deadline of the last zero-yield sweep.
+var zenTierDownUntil atomic.Int64
+
+// zenTierDown reports whether recent sweeps proved the free tier is out for
+// every reachable exit.
+func zenTierDown() bool {
+	u := zenTierDownUntil.Load()
+	return u != 0 && time.Now().UnixNano() < u
 }
 
 // savedPool is the last verified pool, loaded at boot so requests serve
@@ -639,7 +744,7 @@ func loadZenPool() bool {
 	setProxyLatency(kl)
 	setProxyReliability(kr)
 	zenProxiesMu.Lock()
-	zenProxies = append([]string(nil), sp.Proxies...)
+	zenProxies = dedupeExits(sp.Proxies)
 	zenPoolRefreshed = time.Now()
 	zenProxiesMu.Unlock()
 	return true
@@ -651,10 +756,10 @@ func loadZenPool() bool {
 type verifyResult int
 
 const (
-	verifyOK          verifyResult = iota // 200 and a model-list body
-	verifyCapped                          // 429 free-usage answer: reachable, rotation's problem
+	verifyOK          verifyResult = iota // dialed and cleared the free-tier gate
+	verifyCapped                          // 429 free-usage answer: reachable but cannot serve
 	verifyRateLimited                     // 429 aimed at this exit
-	verifyFreeTier                        // 403 FreeTierError on GET /models
+	verifyFreeTier                        // 403 FreeTierError on the gate probe
 	verifyOther                           // any other rejection
 	verifyDialErr                         // no response came back at all
 )
@@ -686,54 +791,97 @@ func (m *verifyMix) add(r verifyResult) {
 	}
 }
 
-// verifyProbeBody is the zero-cost POST payload that checks whether an exit
-// IP passes zen's free-tier IP/reputation gate without invoking upstream
-// inference or consuming any of the IP's ~50-100 daily requests. zen runs the
-// IP/abuse gate before message role validation: an IP-blocked exit answers 403
-// FreeTierError, while a clean exit passes the gate and fails fast with 400
-// invalid_request_error on the invalid role. includes the full 11-tool
-// opencode 1.19.3 CLI toolset (zenOCDefsJSON) so tool-fingerprint checks pass.
-var verifyProbeBody = []byte(`{"model":"big-pickle","stream":true,"messages":[{"role":"invalid_role","content":"hi"}],"tools":` + zenOCDefsJSON + `}`)
-
-// verifyProxy confirms a proxy can reach the zen API AND passes the per-IP
-// free-tier gate via a zero-cost validation probe (verifyProbeBody). GET
-// /models does not run the IP reputation gate at all, so verifying with GET
-// admitted flagged datacenter proxies that 403'd every real completion.
+// verifyProxy admits an exit on reachability alone: GET /models answered 200
+// through the tunnel. no completion is ever sent here — a sweep must not spend
+// the caller's tier budget, invent a model, or add traffic nobody asked for.
+// /models skips the free-tier gate, so this proves the exit reaches zen and
+// nothing about capacity; capacity is learned from real requests only
+// (noteExitOK → noteExitBucket), and the marks below apply where the caller's
+// model is known: noteExit429 for the pair, noteExitGate/noteExitTierCap for an
+// ip with no serving history, noteExitTransportErr for a dead tunnel.
 func verifyProxy(proxyURL string) verifyResult {
+	r := verifyProxyOnce(proxyURL)
+	if r == verifyDialErr {
+		// a public proxy list is flaky by nature: one dead dial is not a
+		// verdict on the exit. measured 2026-11-02, the one exit serving
+		// completions in the whole list answered a bun client with a 15s
+		// timeout and this probe with nothing, while a second dial served.
+		r = verifyProxyOnce(proxyURL)
+	}
+	return r
+}
+
+func verifyProxyOnce(proxyURL string) verifyResult {
 	cl := zenClient(proxyURL)
-	// 10s, not the ~2s most exits take: a slow exit that still clears the gate
-	// is worth keeping, and cutting the probe short only shrinks the pool.
-	cl.Timeout = 10 * time.Second
-	req, err := http.NewRequest("POST", OpencodeBase+"/chat/completions", bytes.NewReader(verifyProbeBody))
+	// 20s, not the ~2s most exits take: the exits that still have free-tier
+	// budget are slow ones (a hybrid-key-share handshake through a congested
+	// public proxy), and cutting the probe short is what kept them out.
+	cl.Timeout = 20 * time.Second
+	req, err := http.NewRequest("GET", OpencodeBase+"/models", nil)
 	if err != nil {
-		return verifyDialErr
+		return verifyOther
 	}
 	setZenHeaders(req, zenSession())
 	resp, err := cl.Do(req)
 	if err != nil {
 		return verifyDialErr
 	}
-	defer resp.Body.Close()
-	// any parsed answer means the request cleared the free-tier gate: the
-	// probe body is invalid on purpose, so 400 (role rejected) is a pass.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	resp.Body.Close()
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusBadRequest:
+	case http.StatusOK:
 		return verifyOK
-	case http.StatusTooManyRequests:
-		// a 429 answers after the gate: the exit dialed and zen parsed the
-		// body, it just will not serve this request. rotation handles that
-		// (noteExit429 marks the pair for a cooldown), so excluding the exit
-		// here is what emptied the pool and left lanes pinless while the
-		// exits were all reachable.
-		if b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10)); zenFreeUsageCap(b) {
-			return verifyCapped
-		}
-		return verifyRateLimited
 	case http.StatusForbidden:
-		return verifyFreeTier
+		return verifyFreeTier // this ip/region is blocked outright
+	case http.StatusTooManyRequests:
+		return verifyCapped // metering even /models: reachable, nothing free
 	default:
 		return verifyOther
 	}
+}
+
+// zenExitBucket is the model each exit was last seen serving, learned from real
+// completions. capacity is per exit+model and an exit usually serves exactly one
+// id, so a random pin lands on an exit that serves another model and costs a 429
+// hop. the map is advisory: it only reorders picks, it never refuses an exit,
+// and a stale entry costs one hop.
+var (
+	zenBucketMu      sync.RWMutex
+	zenExitBucketMap = map[string]string{}
+)
+
+func noteExitBucket(proxy, model string) {
+	if proxy == "" || model == "" {
+		return
+	}
+	zenBucketMu.Lock()
+	zenExitBucketMap[proxy] = model
+	zenBucketMu.Unlock()
+}
+
+// exitBucketKnown reports whether this exit has ever served a real completion.
+// an ip with a known bucket serves somebody, so a cap on another model is that
+// bucket's mark, not proof the ip is out.
+func exitBucketKnown(proxy string) bool {
+	if proxy == "" {
+		return false
+	}
+	zenBucketMu.RLock()
+	b := zenExitBucketMap[proxy]
+	zenBucketMu.RUnlock()
+	return b != ""
+}
+
+// exitBucketServes reports whether the exit was seen serving model (the bare
+// upstream id, or the prefixed one the callers pass around).
+func exitBucketServes(proxy, model string) bool {
+	if proxy == "" || model == "" {
+		return false
+	}
+	zenBucketMu.RLock()
+	b := zenExitBucketMap[proxy]
+	zenBucketMu.RUnlock()
+	return b != "" && (b == model || strings.TrimPrefix(model, "opencode/") == b)
 }
 
 // setProxyLatency replaces the proxy->response-ms map after a refresh.
@@ -848,6 +996,7 @@ func sampleWeighted(pool []string, n int) []string {
 // was merely busy this cycle is usable again. dead marks survive until
 // their ttl (a dead exit must verify again before it is used).
 func applyVerifiedPool(verified []string) {
+	verified = dedupeExits(verified)
 	if len(verified) == 0 {
 		log.Printf("  zen proxies: verify found 0, keeping old pool")
 		clearExitRateLimits()
@@ -871,10 +1020,11 @@ func applyVerifiedPool(verified []string) {
 }
 
 // dropProxy removes a dead proxy from the pool so it is not picked again.
-// the last exit is never dropped and lanes keep the pin until they rotate:
-// removing a working exit before its replacement exists empties the pool
-// and leaves every lane with no proxy. a dead last exit at least attempts
-// until the next refresh refills the pool.
+// the last exit goes too: an exit that just failed is not a working proxy, and
+// keeping it only hands every lane a pin that cannot connect (measured
+// 2026-11-01: a lone socks5 exit whose handshake had been refused for hours
+// held the whole table, and requests sat on it until their own timeout). an
+// empty pool is the honest state, and it is what asks the sweep for a refill.
 func dropProxy(proxyURL string) {
 	if proxyURL == "" {
 		return
@@ -884,11 +1034,6 @@ func dropProxy(proxyURL string) {
 	left := 0
 	for i, p := range zenProxies {
 		if p == proxyURL {
-			if len(zenProxies) <= 1 {
-				zenProxiesMu.Unlock()
-				log.Printf("  zen proxies: keeping last exit %s (pool would drain)", redactProxyUserinfo(proxyURL))
-				return
-			}
 			zenProxies = append(zenProxies[:i], zenProxies[i+1:]...)
 			found = true
 			left = len(zenProxies)
@@ -1359,11 +1504,6 @@ func proxyUnavailableMsg(model string) string {
 		model, verified, countRateLimited(), countDeadExits(), countGateParked())
 }
 
-// zenAnswered is the zenPost sentinel for "the caller already has its
-// response": the free-tier failover wrote it, so the ladder stops without
-// touching w again (a nil return would draw a second, 503 error body).
-var zenAnswered = &http.Response{}
-
 // exhaustedExits is the retry ladder's last word: every attempt landed on an
 // exit that could not serve the request (rate limit, transport, overload).
 // the client gets a 503 that names the proxy pool as the problem and never a
@@ -1371,66 +1511,73 @@ var zenAnswered = &http.Response{}
 // caller that sees one retries against us instead of waiting us out. the
 // status that ended the ladder is in the body reason and the log, not in the
 // http status.
-func exhaustedExits(model string, status int) *http.Response {
+func exhaustedExits(model string, status, attempts int) *http.Response {
 	reason := "every exit rate-limited"
 	if status != http.StatusTooManyRequests && status != 529 {
 		reason = fmt.Sprintf("every exit failed (last upstream %d)", status)
 	}
-	msg := fmt.Sprintf("%s [%s, %d attempts]", proxyUnavailableMsg(model), reason, zenMaxRetries())
+	// the real hop count, not the retry ceiling: a free-tier cap stops the
+	// ladder after a few exits, and a message that claims 15 attempts sends
+	// the reader looking for 15 log lines that were never written.
+	if attempts <= 0 {
+		attempts = 1
+	}
+	msg := fmt.Sprintf("%s [%s, %d attempts]", proxyUnavailableMsg(model), reason, attempts)
 	eb, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "proxy_exhausted", "message": msg}})
 	h := make(http.Header)
 	h.Set("Content-Type", "application/json")
-	h.Set("Retry-After", "5")
-	acclog.Printf("!! opencode exits exhausted model=%s attempts=%d last=%d, synthesizing 503", model, zenMaxRetries(), status)
+	h.Set("Retry-After", strconv.Itoa(zenClientRetryAfterSecs))
+	acclog.Printf("!! opencode exits exhausted model=%s attempts=%d last=%d, synthesizing 503", model, attempts, status)
 	return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(eb)), Header: h}
 }
 
-// zenFreeUntil is when zen's anonymous free budget refills, in unix seconds.
-// the 429 body is FreeUsageLimitError with a retry-after that lands on 00:00
-// utc, and every exit answers it: measured on 140+ IPs across four cloudflare
-// colos, public proxies and a home line alike, all with the same countdown.
-// one bucket sits behind `Bearer public`, so rotating exits cannot clear it
-// and the only way to keep opencode/<model> answering is another backend
-// (zenFreeFailover in route.go).
-var zenFreeUntil atomic.Int64
+// zenClientRetryAfterSecs is the only rate-limit window a client ever sees from
+// this proxy. zen's own retry-after counts down to utc midnight and describes a
+// pool of exits the caller can neither see nor act on, so forwarding it just
+// parks the caller for hours on our behalf; a short fixed window keeps their
+// retry quick instead.
+const zenClientRetryAfterSecs = 10
 
-// noteZenFreeCap records the refill deadline from a free-usage 429's
-// retry-after, keeping the latest one seen.
-func noteZenFreeCap(h http.Header) {
-	secs := 0
-	if v := strings.TrimSpace(h.Get("Retry-After")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			secs = n
+// zenClientHeaders copies the only upstream headers a client may see.
+// x-ratelimit-* and retry-after are this proxy's pool state and stop here: on a
+// rate-limit answer the caller gets zenClientRetryAfterSecs, never the
+// upstream's midnight countdown.
+func zenClientHeaders(w http.ResponseWriter, h http.Header, status int) {
+	for k, v := range h {
+		if strings.EqualFold(k, "content-type") {
+			w.Header()[k] = v
 		}
 	}
-	if secs <= 0 {
-		secs = 60
-	}
-	until := time.Now().Add(time.Duration(secs) * time.Second).Unix()
-	for {
-		cur := zenFreeUntil.Load()
-		if until <= cur || zenFreeUntil.CompareAndSwap(cur, until) {
-			return
-		}
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", strconv.Itoa(zenClientRetryAfterSecs))
 	}
 }
 
-// zenFreeCapped reports whether the shared budget is still spent.
-func zenFreeCapped() bool { return zenFreeUntil.Load() > time.Now().Unix() }
+// zenTierCapParkSecs is the retry-after that turns a free-tier 429 from "this
+// exit's short window" into "this ip is out for a while": the tier cap
+// answers with seconds until the next utc midnight (measured: 76440 at 02:46
+// utc), while a short window reports minutes. below the threshold the 429
+// stays a plain rate limit (noteExit429) and only the pair rotates.
+const zenTierCapParkSecs = 600
 
-// zenFreeSpentMsg says why a zen model cannot be served: the shared free
-// budget is spent and no other backend carries the model.
-func zenFreeSpentMsg(model string) string {
-	until := time.Unix(zenFreeUntil.Load(), 0).UTC().Format("2006-01-02 15:04 MST")
-	return fmt.Sprintf("opencode zen: %s rides zen's free tier, whose budget is shared by every exit and spent until %s; no other backend serves it.", model, until)
+// zenRetryAfterSecs reads a retry-after header as whole seconds, 0 when the
+// header is absent or unparsable (http-date is not worth chasing here).
+func zenRetryAfterSecs(h http.Header) int {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
-
-// clearZenFreeCap drops the marker: a 200 proves the budget is back.
-func clearZenFreeCap() { zenFreeUntil.Store(0) }
 
 // zenFreeUsageCap reports whether a 429 body is zen's free-usage answer
 // (429 FreeUsageLimitError) rather than a limit aimed at this exit. both are
-// reachability, not exclusion; the split only feeds the sweep summary.
+// reachability, not exclusion; the split only feeds the sweep summary and the
+// freetier field of the rate-limit log line.
 func zenFreeUsageCap(body []byte) bool {
 	s := strings.ToLower(string(body))
 	return strings.Contains(s, "freeusagelimiterror") ||
@@ -1529,27 +1676,43 @@ func zenTransport(proxyURL string, pu *url.URL) *http.Transport {
 	tr.ResponseHeaderTimeout = 60 * time.Second
 	tr.ExpectContinueTimeout = 1 * time.Second
 	tr.MaxIdleConnsPerHost = 4
-	dialer := &net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}
-	switch pu.Scheme {
-	case "socks4":
-		tr.Proxy = nil
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			c, cancel := context.WithTimeout(ctx, 8*time.Second)
-			defer cancel()
-			return socks4Dial(c, network, addr, pu.Host)
-		}
-	case "socks5":
-		tr.Proxy = nil
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			c, cancel := context.WithTimeout(ctx, 8*time.Second)
-			defer cancel()
-			return socks5Dial(c, network, addr, pu)
-		}
-	default:
-		tr.Proxy = http.ProxyURL(pu)
-		tr.DialContext = dialer.DialContext
-	}
+	// the tls layer is ours, not crypto/tls: zen's free-tier gate fingerprints
+	// the ClientHello (see zentls.go), so every zen connect — direct or through
+	// an exit — completes its handshake with the client's own hello. a plain
+	// DialContext here left the transport to wrap the tunnel with go's stack,
+	// which the gate answers 429 no matter how correct the body is.
+	tr.Proxy = nil
+	tr.DialContext = nil
+	tr.DialTLSContext = zenDialTLS(proxyURL, pu, 8*time.Second)
 	zenTransports[proxyURL] = tr
+	return tr
+}
+
+// zenDirectTransport is the no-exit client: same client hello as the proxied
+// transports, so a direct send is gated the same way instead of falling back
+// to go's tls stack and 429ing every time.
+var (
+	zenDirectMu sync.Mutex
+	zenDirectTr *http.Transport
+)
+
+func zenDirectTransport() *http.Transport {
+	zenDirectMu.Lock()
+	defer zenDirectMu.Unlock()
+	if zenDirectTr != nil {
+		return zenDirectTr
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = nil
+	tr.ForceAttemptHTTP2 = false
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetHTTP1(true)
+	tr.TLSHandshakeTimeout = 8 * time.Second
+	tr.ResponseHeaderTimeout = 60 * time.Second
+	tr.MaxIdleConnsPerHost = 4
+	tr.DialContext = nil
+	tr.DialTLSContext = zenDialTLS("", &url.URL{}, 8*time.Second)
+	zenDirectTr = tr
 	return tr
 }
 
@@ -1608,11 +1771,11 @@ func zenClient(proxyURL string) *http.Client {
 		direct = time.Duration(s) * time.Second
 	}
 	if proxyURL == "" {
-		return dbgClient(&http.Client{Timeout: direct}, "opencode")
+		return dbgClient(&http.Client{Timeout: direct, Transport: dbgRT{base: zenDirectTransport(), backend: "opencode"}}, "opencode")
 	}
 	pu, err := url.Parse(proxyURL)
 	if err != nil {
-		return dbgClient(&http.Client{Timeout: direct}, "opencode")
+		return dbgClient(&http.Client{Timeout: direct, Transport: dbgRT{base: zenDirectTransport(), backend: "opencode"}}, "opencode")
 	}
 	proxied := 120 * time.Second
 	if s := cfg().Zen.ZenTimeoutSecs; s > 0 {

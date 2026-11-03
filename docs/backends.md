@@ -1,6 +1,6 @@
 # Backends
 
-Every model ID starts with a provider prefix (`opencode/`, `freeepi/`, `antseed/`, `nous/`, `nvidia/`, or `route/`). The proxy picks the upstream from that prefix and strips it before forwarding.
+Every model ID starts with a provider prefix (`opencode/`, `freeepi/`, `antseed/`, `nous/`, `nvidia/`, `uno/`, `orcarouter/`, `openrouter/`, or `route/`). The proxy picks the upstream from that prefix and strips it before forwarding.
 
 `/v1/models` returns the live merged catalog. Context window sizes, max output limits, and nudge settings live in `model_info.jsonc` and hot-reload with `config.yml`.
 
@@ -58,6 +58,35 @@ Zero-priced models from `https://inference-api.nousresearch.com/v1`.
 | Config section | `nous`, `nous_keys` |
 
 NimRoute filters the Nous catalog to models where both `pricing.prompt == 0` and `pricing.completion == 0` (some free Nous models have `:free` in the ID and some don't; paid and non-zero embedding models are excluded). A `429` cools that key and rotates to the next available key.
+
+## `orcarouter/` — OrcaRouter
+
+OpenAI-compatible gateway at `https://api.orcarouter.ai/v1` with provider-prefixed IDs (`openai/`, `anthropic/`, `google/`, `deepseek/`, `z-ai/`, …).
+
+| | |
+|---|---|
+| Upstream | `https://api.orcarouter.ai/v1` |
+| Auth | Bearer API keys in `orcarouter_keys` |
+| Config section | `orcarouter`, `orcarouter_keys` |
+
+Only `-free` IDs are served and listed by default. Free rows are priced at zero and run under their own per-workspace limits; they never fall back to a paid model. A `429` cools that key and rotates to the next one, and the gateway's own `max_retries`-style fallback chains are not used.
+
+## Paid models on keyed routers
+
+`uno`, `orcarouter`, and the `openrouter` chat backend serve free rows only unless you opt in:
+
+```yaml
+uno:
+  paid_models: true          # serve the paid catalog too
+  model_whitelist:           # extra exact IDs, even when the listing omits them
+    - "glm-5.3-flash:free"
+```
+
+Both keys apply to the listing **and** the request path: with `paid_models: false`, a paid ID returns `400 model_not_served` instead of reaching upstream and billing. `model_whitelist` entries always pass, prefixed or bare.
+
+## Model facts: `model_info.jsonc`, OpenRouter, models.dev
+
+Curated facts live in `model_info.jsonc`. Two network overlays fill only what stays empty — OpenRouter's `/v1/models` first, then `https://models.dev/api.json` (`modelsdev.enabled`, refreshed every `refresh_hours`). An ID neither the file nor OpenRouter knows gets a synthetic entry from models.dev, so it serves with a real context window instead of the 131072 fallback. Neither overlay writes to the file; `./nim models sync` is the only writer.
 
 ## `nvidia/` — NVIDIA NIM
 

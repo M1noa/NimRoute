@@ -1060,16 +1060,15 @@ func antTry(ctx context.Context, o antOffer, oaiBody []byte) ([]byte, int, bool)
 	switch {
 	case status == 200:
 		return rb, status, false
-	case status == 429 || status == 529:
-		antFailover(o.peerID, o.service, fmt.Sprintf("http %d", status))
-		return nil, status, true
 	case status == 402:
 		return nil, status, false // paid: fail the request, never retry
 	case status == 429 || status == 529 || status >= 500:
 		// retryable: rate limits and seller-side failures. a 400 is the
 		// client's fault (long context, bad shape) and must not park a
-		// working seller for a minute.
-		antCoolModel(o.peerID, o.service)
+		// working seller for a minute. one cooling path for every
+		// retryable status: a second 429 branch above this one made the
+		// rate-limit handling depend on which duplicate matched.
+		antFailover(o.peerID, o.service, fmt.Sprintf("http %d", status))
 		return nil, status, true
 	default:
 		return nil, status, false

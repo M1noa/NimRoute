@@ -122,19 +122,26 @@ func lookupModelInfo(id string) *modelInfoEntry {
 	modelInfoMu.RLock()
 	defer modelInfoMu.RUnlock()
 	if e, ok := modelInfo[id]; ok {
-		return withOROverlay(id, &e)
+		return withOrMD(id, &e)
 	}
 	if s := strings.TrimPrefix(id, "nvidia/"); s != id {
 		if e, ok := modelInfo[s]; ok {
-			return withOROverlay(id, &e)
+			return withOrMD(id, &e)
 		}
 	}
 	if s, ok := baseModelID(id); ok {
 		if e, ok := modelInfo[s]; ok {
-			return withOROverlay(id, &e)
+			return withOrMD(id, &e)
 		}
 	}
-	return withOROverlay(id, nil)
+	return withOrMD(id, nil)
+}
+
+// withOrMD applies the network overlays in order: openrouter (per-model, and
+// the source of the /v1/models extras) then models.dev (the wider catalog).
+// each only fills what the one before it left empty.
+func withOrMD(id string, e *modelInfoEntry) *modelInfoEntry {
+	return withMDOverlay(id, withOROverlay(id, e))
 }
 
 // baseModelID strips the trailing [1m] context alias: ("<id>[1m]", "<id>",
@@ -280,8 +287,10 @@ func setNudgeOverrides(v []nudgeOverride) {
 	nudgeOverrides = v
 }
 
-// modelNudge reports the nudge_no_tools flag: config override first, then
-// the catalog entry, else spark-shaped models default on.
+// modelNudge reports whether a model takes part in nudging. nudge.enabled is
+// the master switch and it means every model: config overrides (models.nudge)
+// and an explicit catalog nudge_no_tools are the only ways to opt one out, so
+// a provider the catalog has never heard of still gets nudged.
 func modelNudge(id string) bool {
 	nudgeMu.RLock()
 	ml := strings.ToLower(id)
@@ -295,7 +304,7 @@ func modelNudge(id string) bool {
 	if e := lookupModelInfo(id); e != nil && e.Nudge != nil {
 		return *e.Nudge
 	}
-	return strings.Contains(ml, "spark")
+	return true
 }
 
 // multRe parses the usage multiplier out of a freepi catalog display name:

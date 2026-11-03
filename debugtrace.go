@@ -162,12 +162,16 @@ func backendForModel(m string) string {
 		return "antseed"
 	case strings.HasPrefix(m, "route/"):
 		return "route"
+	case strings.HasPrefix(m, "wroute/"):
+		return "wroute"
 	case strings.HasPrefix(m, "nous/"):
 		return "nous"
 	case strings.HasPrefix(m, "uno/"):
 		return "uno"
 	case strings.HasPrefix(m, "openrouter/"):
 		return "openrouter"
+	case strings.HasPrefix(m, "orcarouter/"):
+		return "orcarouter"
 	default:
 		return "nvidia"
 	}

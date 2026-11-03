@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nimroute/pii"
@@ -341,6 +342,11 @@ type exitMark429 struct {
 	total  int
 	at     time.Time // when the mark was placed (secondChancePick's ordering)
 	until  time.Time
+	// cap marks an until that came from the 429's own retry-after rather than
+	// the burst policy. a sweep clears burst marks to give the next cycle a
+	// clean slate; a cap mark is upstream stating when it will serve again, so
+	// it survives the sweep and only its own deadline (or utc midnight) lifts it.
+	cap bool
 }
 
 // lapsed drops a tripped mark whose cycle is over, leaving the counters in
@@ -536,11 +542,23 @@ func poolUnusable() bool {
 	return true
 }
 
+// poolEmpty reports whether the verified pool holds no exit at all. a draw
+// cannot help and a refill is the whole answer, so a lane must not sit out the
+// recovery wait on it (measured 2026-11-01: 30s to a 503 with an empty pool).
+func poolEmpty() bool {
+	zenProxiesMu.RLock()
+	defer zenProxiesMu.RUnlock()
+	return len(zenProxies) == 0
+}
+
 // gatePoolRefill asks for a full recheck when the pool has nothing left but
 // parked exits. a capped IP never comes back inside its window, so re-probing
 // the live set buys nothing; only the rest of the list can help. paced by
 // dryRefillCooldown so waiting lanes see a fresh sweep within seconds.
 func gatePoolRefill() {
+	if zenTierDown() {
+		return // sweeps are held: the last one found no exit with budget
+	}
 	dryRefillMu.Lock()
 	due := time.Since(dryRefillAt) >= dryRefillCooldown
 	if due {
@@ -573,6 +591,35 @@ func noteExitGate(proxy string) {
 	exitStateMu.Unlock()
 	if !was {
 		acclog.Printf("  zen exit %s parked for %v (free-tier 403)", redactProxyUserinfo(proxy), park)
+	}
+	dropProxy(proxy)
+}
+
+// noteExitTierCap parks an exit whose 429 carried zen's free-tier answer
+// with a long retry-after. measured 2026-10-26 over ~180 live exits: that
+// cap answers every free model on the ip and outlives the 30m pool refresh,
+// so it is the exit's own state, not the one model noteExit429 marks. measured
+// 2026-11-02 that is too strong: an exit serves about one free id and answers
+// this cap to the others, so the callers park only an exit whose probe found no
+// serving bucket (exitBucketKnown) and leave the rest to the pair mark.
+// leaving
+// such an exit in the pool made the pool lie ("56 verified" naming ips that
+// answered nothing) and every hop spend itself on it: a request that should
+// fail fast sat 85s before the 503. parking drops it like a 403 gate park, so
+// the ladder still rotates but never draws it again until the burn expires.
+func noteExitTierCap(proxy string) {
+	if proxy == "" {
+		return
+	}
+	park := deadTTL()
+	st := exitStateFor(proxy)
+	exitStateMu.Lock()
+	was := !st.gateUntil.IsZero() && time.Now().Before(st.gateUntil)
+	st.gateUntil = time.Now().Add(park)
+	st.reason = "free-tier 429 (usage cap)"
+	exitStateMu.Unlock()
+	if !was {
+		acclog.Printf("  zen exit %s parked for %v (free-tier 429 cap)", redactProxyUserinfo(proxy), park)
 	}
 	dropProxy(proxy)
 }
@@ -795,6 +842,38 @@ func noteExitTransportErr(proxy string) bool {
 	return true
 }
 
+// noteExit429Cap records a 429's own retry-after for one exit+model. the header
+// is the upstream saying when this pair will serve again — measured 2026-11-02
+// it is seconds to the next utc midnight from every exit — so the pair sits out
+// exactly that window instead of the generic burst cooldown, and the sweep no
+// longer hands it back out mid-window. capped at a day so a bogus header cannot
+// retire an exit forever.
+func noteExit429Cap(proxy, model string, secs int) {
+	if proxy == "" || model == "" || secs <= 0 {
+		return
+	}
+	d := time.Duration(secs) * time.Second
+	if d > 24*time.Hour {
+		d = 24 * time.Hour
+	}
+	st := exitStateFor(proxy)
+	now := time.Now()
+	exitStateMu.Lock()
+	if st.rl == nil {
+		st.rl = map[string]exitMark429{}
+	}
+	mk := st.rl[model]
+	mk.streak++
+	mk.total++
+	mk.at = now
+	mk.until = now.Add(d)
+	mk.cap = true
+	st.rl[model] = mk
+	st.reason = "429 cap " + strconv.Itoa(secs) + "s on " + model
+	exitStateMu.Unlock()
+	acclog.Printf("  zen exit %s capped on %s for %v (retry-after %ds)", redactProxyUserinfo(proxy), model, d.Round(time.Second), secs)
+}
+
 // noteExitOK clears an exit+model's 429 streak on a success. the cycle total
 // stays until the next refresh so a flapping pair still gets retired.
 // the exit stays pinned to its lane and keeps serving (~50-100 requests per IP
@@ -803,6 +882,10 @@ func noteExitOK(proxy, model string) {
 	if proxy == "" {
 		return
 	}
+	// a real completion is the only evidence of which bucket an exit serves:
+	// admission asks /models and nothing else, so this is where capacity is
+	// learned. the picker uses it to skip exits known to serve another model.
+	noteExitBucket(proxy, model)
 	st := exitStateFor(proxy)
 	exitStateMu.Lock()
 	if mk, ok := st.rl[model]; ok {
@@ -865,12 +948,28 @@ func clearAllExitMarks() {
 // counters. runs after a successful pool refresh: the swept pool gets a
 // clean slate, so an exit that was merely busy this cycle is usable again.
 // dead marks survive: a dead exit must verify again before it comes back.
+// retry-after marks survive too, for as long as the upstream said: clearing
+// them on the 30m tick is what put an exit capped-until-midnight straight back
+// in the rotation.
 func clearExitRateLimits() {
 	exitStateMu.Lock()
 	defer exitStateMu.Unlock()
+	now := time.Now()
 	cleared := 0
 	for _, st := range exitStates {
-		if len(st.rl) > 0 {
+		if len(st.rl) == 0 {
+			st.models = nil
+			continue
+		}
+		kept := 0
+		for model, mk := range st.rl {
+			if mk.cap && !now.After(mk.until) {
+				kept++
+				continue
+			}
+			delete(st.rl, model)
+		}
+		if kept == 0 {
 			st.rl = nil
 			cleared++
 		}
@@ -878,6 +977,54 @@ func clearExitRateLimits() {
 	}
 	if cleared > 0 {
 		acclog.Printf("  zen proxies: %d rate-limited exit(s) cleared on refresh", cleared)
+	}
+}
+
+// untilNextUTCMidnight is the wait until zen's daily allowance resets. every
+// free-tier retry-after counts down to this instant (measured 2026-11-02:
+// now+retry-after == next 00:00 utc to the second from every exit), so it is
+// the one time the pool is known to come back.
+func untilNextUTCMidnight() time.Duration {
+	now := time.Now().UTC()
+	next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+	return time.Until(next)
+}
+
+// clearDailyExitMarks releases every mark that tracks zen's daily meter: the
+// retry-after caps, the per-model 429 marks, the per-model 403 burns and the
+// free-tier gate parks. all of them expire at utc midnight and nothing else in
+// the tree clears a gate park, so before this a capped exit sat out the whole
+// next day too. dead stamps stay: a tunnel that died is not a daily meter.
+func clearDailyExitMarks() {
+	exitStateMu.Lock()
+	n := 0
+	for _, st := range exitStates {
+		if len(st.rl) > 0 || len(st.models) > 0 || !st.gateUntil.IsZero() {
+			n++
+		}
+		st.rl = nil
+		st.models = nil
+		st.gateUntil = time.Time{}
+	}
+	exitStateMu.Unlock()
+	if n > 0 {
+		acclog.Printf("  zen proxies: daily marks cleared at utc midnight (%d exit(s))", n)
+	}
+}
+
+// watchZenMidnight runs the midnight release: drop the daily marks and then
+// sweep, so the first request after the reset draws exits that just regained
+// budget instead of the parked set from yesterday.
+func watchZenMidnight() {
+	for {
+		// a sweep started a hair before the tick lands inside the old day and
+		// re-marks everything it finds, so wait out the boundary first.
+		time.Sleep(untilNextUTCMidnight() + 5*time.Second)
+		if !zenEnabled() {
+			continue
+		}
+		clearDailyExitMarks()
+		refreshZenProxiesAsync(true)
 	}
 }
 
@@ -1658,6 +1805,9 @@ var (
 // failed to serve, so re-verifying them first buys nothing. force skips the
 // pacing, for a caller that is already waiting on the sweep to land.
 func dryPoolRefill(force bool) {
+	if !force && zenTierDown() {
+		return // sweeps are held: the last one found no exit with budget
+	}
 	dryRefillMu.Lock()
 	due := force || time.Since(dryRefillAt) >= dryRefillCooldown
 	if due {
@@ -1688,6 +1838,25 @@ func poolRefreshCooldown() time.Duration {
 	return time.Duration(s) * time.Second
 }
 
+// thinPoolLoggedAt and dryPoolLoggedAt pace the cooldown-skip notices below.
+var thinPoolLoggedAt, dryPoolLoggedAt atomic.Int64
+
+// skipLogOnce reports whether a skip notice may print now: once per window.
+// both callers sit on the pin path, which runs once per retry hop, so a thin
+// pool printed the same line dozens of times a second — 292k of the 308k lines
+// in one day's debug log. one line per window says the same thing.
+func skipLogOnce(at *atomic.Int64, window time.Duration) bool {
+	if window <= 0 {
+		return true // cooldown disabled: nothing is being skipped, nothing to pace
+	}
+	now := time.Now().UnixNano()
+	last := at.Load()
+	if last != 0 && now-last < int64(window) {
+		return false
+	}
+	return at.CompareAndSwap(last, now)
+}
+
 // maybeRefreshPoolThin refills the pool when it holds fewer exits than the
 // lane table. every exit then ends up pinned, no lane can draw a unique
 // one, and the pins that verify pile up instead of spreading. cooldown-gated
@@ -1710,7 +1879,9 @@ func maybeRefreshPoolThin() {
 		zenProxiesMu.RLock()
 		ago := time.Since(zenPoolRefreshed)
 		zenProxiesMu.RUnlock()
-		dbglog.Printf("  zen: pool %d < %d lanes, refresh skipped (last %v ago, cooldown %v)", pool, n, ago.Round(time.Second), poolRefreshCooldown())
+		if skipLogOnce(&thinPoolLoggedAt, poolRefreshCooldown()) {
+			dbglog.Printf("  zen: pool %d < %d lanes, refresh skipped (last %v ago, cooldown %v)", pool, n, ago.Round(time.Second), poolRefreshCooldown())
+		}
 		return
 	}
 	acclog.Printf("  zen: pool %d exits for %d lanes, refreshing proxy pool", pool, n)
@@ -1741,6 +1912,16 @@ func marksOut() bool {
 	return total == 0 || off*2 >= total
 }
 
+// oneExitPool reports whether at most one exit is left to rotate onto, so a
+// spent ladder has nowhere to go: extending it only re-sends to the exit that
+// already answered, and the sweep it would wait on has nothing to add.
+func oneExitPool() bool {
+	zenProxiesMu.RLock()
+	n := len(zenProxies) + len(getCustomProxies())
+	zenProxiesMu.RUnlock()
+	return n-countDeadExits()-countGateParked() <= 1
+}
+
 // recoverDeadline returns this request's pool-recovery deadline, starting the
 // clock on the first wait. every wait of one request (a dry pick, a spent
 // ladder) draws on the same budget, so a request never stacks waits into a
@@ -1760,6 +1941,14 @@ func recoverDeadline(until *time.Time) time.Time {
 // more hops": nothing written off, budget gone, or the client left.
 func ladderExtend(ctx context.Context, until *time.Time) bool {
 	if !marksOut() && !poolUnusable() {
+		return false
+	}
+	// nothing to rotate onto: extra hops re-send to the exit that just
+	// answered. measured 2026-11-02, a pool holding one verified exit whose
+	// bucket was capped spent the whole recovery budget (30-38s) before the
+	// 503. fire the sweep for the next request and answer this one now.
+	if oneExitPool() {
+		dryPoolRefill(true)
 		return false
 	}
 	deadline := recoverDeadline(until)
@@ -1908,6 +2097,18 @@ func pickLaneProxyExcluding(taken map[string]bool, model string) string {
 		}
 		cands = append(cands, p)
 	}
+	// prefer an exit already seen serving this model at admission: capacity is
+	// per exit+bucket and an exit usually serves one id, so a random pin spends
+	// a 429 hop discovering that it serves another model.
+	var match []string
+	for _, p := range cands {
+		if exitBucketServes(p, model) {
+			match = append(match, p)
+		}
+	}
+	if len(match) > 0 {
+		cands = match
+	}
 	if len(cands) == 0 {
 		// every exit is taken or marked for this model. lanes never share an
 		// exit, so kick off a fresh sweep (exits other than the ones that
@@ -1992,7 +2193,9 @@ func recheckAllExits() bool {
 		zenProxiesMu.RLock()
 		ago := time.Since(zenPoolRefreshed)
 		zenProxiesMu.RUnlock()
-		dbglog.Printf("  zen pool dry: %d marked exit(s), fresh sweep skipped (last %v ago, cooldown %v)", marked, ago.Round(time.Second), poolRefreshCooldown())
+		if skipLogOnce(&dryPoolLoggedAt, poolRefreshCooldown()) {
+			dbglog.Printf("  zen pool dry: %d marked exit(s), fresh sweep skipped (last %v ago, cooldown %v)", marked, ago.Round(time.Second), poolRefreshCooldown())
+		}
 		return false
 	}
 	zenProxiesMu.Lock()
@@ -2381,6 +2584,13 @@ func sweepLanes() {
 	}
 	lanesMu.Lock()
 	for k, l := range lanes {
+		// shared lanes are pre-opened seats, not conversations: they hold
+		// a pin and no identity, so an idle sweep that drops them empties
+		// the table (and /status) between zen traffic. trimLanesToPool is
+		// what bounds them when the pool shrinks.
+		if strings.HasPrefix(k, "shared:") {
+			continue
+		}
 		if l.lastUsed.Before(cutoff) {
 			delete(lanes, k)
 			dropConvoSeen(k)
@@ -2642,6 +2852,13 @@ func laneProxyWait(ctx context.Context, l *zenLane, model string, until *time.Ti
 	for {
 		if p := laneProxyFor(l, model); p != "" {
 			return l, p
+		}
+		// the last sweeps proved the tier is out for every exit: no draw and no
+		// refill can help for the backoff window, so answer now instead of
+		// holding the caller through a wait that already spent itself.
+		if zenTierDown() && (poolAllGateParked() || poolEmpty()) {
+			trimLanesToPool()
+			return l, ""
 		}
 		if poolAllGateParked() {
 			gatePoolRefill()

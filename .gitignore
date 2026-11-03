@@ -61,3 +61,8 @@ nim-perf.jsonl
 pii/testdata/*.onnx
 pii/model/
 __pycache__/
+
+# benchmark runner artifacts (datasets, venv, raw results)
+scripts/benchdata/
+bench-results/
+guardrail-stripper/

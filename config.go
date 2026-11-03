@@ -239,6 +239,18 @@ type nousConfig struct {
 
 type unoConfig struct {
 	Enabled bool `yaml:"enabled"`
+	// PaidModels serves the router's paid rows too. off by default: a
+	// mistyped id must not bill.
+	PaidModels bool `yaml:"paid_models"`
+	// PaidKeys names the keys allowed to serve billed rows. with at least
+	// one named, a billed id draws only those keys while free ids keep
+	// drawing the whole pool.
+	PaidKeys []string `yaml:"paid_keys"`
+	// Whitelist adds exact model ids even when the catalog omits them.
+	Whitelist []string `yaml:"model_whitelist"`
+	// MaxPrice1M hides paid rows priced above this many usd per million
+	// input tokens. 0 = no cap; free rows always pass.
+	MaxPrice1M float64 `yaml:"max_price_1m"`
 }
 
 // routeConfig gates cross-provider route/<model> ids: one name that fans
@@ -287,6 +299,42 @@ type openrouterConfig struct {
 	// URL is the models endpoint. "" = https://openrouter.ai/api/v1/models
 	URL string `yaml:"url"`
 	// RefreshHours is the refetch interval. 0 = 6.
+	RefreshHours int `yaml:"refresh_hours"`
+	// PaidModels serves the router's paid rows too. off by default.
+	PaidModels bool `yaml:"paid_models"`
+	// PaidKeys names the keys allowed to serve billed rows. with at least
+	// one named, a billed id draws only those keys while free ids keep
+	// drawing the whole pool.
+	PaidKeys []string `yaml:"paid_keys"`
+	// Whitelist adds exact model ids even when the catalog omits them.
+	Whitelist []string `yaml:"model_whitelist"`
+	// MaxPrice1M hides paid rows priced above this many usd per million
+	// input tokens. 0 = no cap; free rows always pass.
+	MaxPrice1M float64 `yaml:"max_price_1m"`
+}
+
+// orcaConfig gates the orcarouter backend (https://api.orcarouter.ai/v1),
+// an openai-compatible gateway whose free rows carry the -free suffix.
+type orcaConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// PaidModels serves the paid catalog too. off by default: a mistyped id
+	// must not bill.
+	PaidModels bool `yaml:"paid_models"`
+	// PaidKeys names the keys allowed to serve billed rows. with at least
+	// one named, a billed id draws only those keys while free ids keep
+	// drawing the whole pool.
+	PaidKeys []string `yaml:"paid_keys"`
+	// Whitelist adds exact model ids even when the catalog omits them.
+	Whitelist []string `yaml:"model_whitelist"`
+}
+
+// modelsDevConfig gates the models.dev catalog overlay that fills gaps in
+// model_info.jsonc for ids the file does not know.
+type modelsDevConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// URL is the api.json fetch. "" = https://models.dev/api.json
+	URL string `yaml:"url"`
+	// RefreshHours is the refetch interval. 0 = 24.
 	RefreshHours int `yaml:"refresh_hours"`
 }
 
@@ -350,8 +398,11 @@ type statusConfig struct {
 	ShowNous           bool `yaml:"show_nous"`
 	ShowUno            bool `yaml:"show_uno"`
 	ShowOpenRouter     bool `yaml:"show_openrouter"`
+	ShowOrcarouter     bool `yaml:"show_orcarouter"`
 	ShowRoute          bool `yaml:"show_route"`
+	ShowWroute         bool `yaml:"show_wroute"`
 	ShowBenchmarks     bool `yaml:"show_benchmarks"`
+	ShowPrices         bool `yaml:"show_prices"`
 	// status-only model folding; never touches /v1/models or route.
 	DedupVersions bool `yaml:"dedup_versions"`
 	DedupVariants bool `yaml:"dedup_variants"`
@@ -388,6 +439,8 @@ type appConfig struct {
 	NousKeys       map[string]string `yaml:"nous_keys"`
 	Uno            unoConfig         `yaml:"uno"`
 	UnoKeys        map[string]string `yaml:"uno_keys"`
+	Orca           orcaConfig        `yaml:"orcarouter"`
+	OrcaKeys       map[string]string `yaml:"orcarouter_keys"`
 	Guardrails     guardrailsConfig  `yaml:"guardrails"`
 	Inject         injectConfig      `yaml:"inject"`
 	Anonymize      anonymizeConfig   `yaml:"anonymize"`
@@ -401,6 +454,7 @@ type appConfig struct {
 	Benchmarks     benchmarksConfig  `yaml:"benchmarks"`
 	OpenRouter     openrouterConfig  `yaml:"openrouter"`
 	OpenRouterKeys map[string]string `yaml:"openrouter_keys"`
+	ModelsDev      modelsDevConfig   `yaml:"modelsdev"`
 	Status         statusConfig      `yaml:"status"`
 	Usage          usageConfig       `yaml:"usage"`
 	Models         modelsConfig      `yaml:"models"`
@@ -484,6 +538,13 @@ func defaultConfig() appConfig {
 		Uno: unoConfig{
 			Enabled: true,
 		},
+		Orca: orcaConfig{
+			Enabled: true,
+		},
+		ModelsDev: modelsDevConfig{
+			Enabled:      true,
+			RefreshHours: 24,
+		},
 		Zen: zenConfig{
 			Enabled:                  true,
 			BlockedCountries:         []string{"PK", "RU", "VE", "HK", "BY", "TJ", "IQ", "MM"},
@@ -525,11 +586,14 @@ func defaultConfig() appConfig {
 			ShowUsage:          true,
 			ShowPool:           true,
 			ShowRoute:          true,
+			ShowWroute:         true,
 			ShowFreepi:         true,
 			ShowNous:           true,
 			ShowUno:            true,
 			ShowOpenRouter:     true,
+			ShowOrcarouter:     true,
 			ShowBenchmarks:     true,
+			ShowPrices:         true,
 			DedupVersions:      true,
 			DedupVariants:      true,
 		},
@@ -589,6 +653,9 @@ func loadConfigFile(path string) (*appConfig, error) {
 	}
 	if c.OpenRouterKeys == nil {
 		c.OpenRouterKeys = map[string]string{}
+	}
+	if c.OrcaKeys == nil {
+		c.OrcaKeys = map[string]string{}
 	}
 	return &c, nil
 }
@@ -751,65 +818,15 @@ func missingLeafKeys(userDoc, seedDoc *yaml.Node) []string {
 	return missing
 }
 
-// seedValue renders the example's value for a dotted path, commented.
-// "usage.path" -> "# usage.path: \"nim-usage.jsonl\"". "" when absent.
-func seedValue(seedDoc *yaml.Node, path string) string {
-	node := seedDoc
-	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
-		node = node.Content[0]
-	}
-	parts := strings.Split(path, ".")
-	for _, part := range parts {
-		if node.Kind != yaml.MappingNode {
-			return ""
-		}
-		found := false
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			if node.Content[i].Value == part {
-				node = node.Content[i+1]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return ""
-		}
-	}
-	raw, err := yaml.Marshal(node)
-	if err != nil {
-		return ""
-	}
-	// indent under a "# path:" header; the example's own comment lines
-	// stay single-# (no double-prefix noise), value lines get commented.
-	indent := func(l string) string {
-		if strings.HasPrefix(strings.TrimSpace(l), "#") || strings.TrimSpace(l) == "" {
-			return "  " + l + "\n"
-		}
-		return "  # " + l + "\n"
-	}
-	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-	var b strings.Builder
-	last := parts[len(parts)-1]
-	if node.Kind == yaml.MappingNode {
-		b.WriteString("# " + path + ":\n")
-		for _, l := range lines {
-			b.WriteString(indent(l))
-		}
-		return b.String()
-	}
-	if len(lines) == 1 {
-		return "# " + strings.Join(parts[:len(parts)-1], ".") + "." + last + ": " + lines[0] + "\n"
-	}
-	b.WriteString("# " + path + ":\n")
-	for _, l := range lines {
-		b.WriteString(indent(l))
-	}
-	return b.String()
-}
-
-// mergeMissingKeys appends example keys absent from the user file as
-// commented defaults. append-only: user content is never touched.
-// returns the added key paths.
+// mergeMissingKeys inserts example options absent from the user file, in place
+// and carrying the example's default, so the file always lists every option
+// while every value already in it stays exactly as written. the tree is read
+// and written as yaml nodes, so key order and comments survive.
+// returns the inserted key paths.
+//
+// a value the user set is never touched, even when it equals an old default:
+// the file records no history of which values were defaults, and guessing is
+// how a config loses a deliberate setting.
 func mergeMissingKeys(path string) []string {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -821,53 +838,105 @@ func mergeMissingKeys(path string) []string {
 	}
 	var userDoc, seedDoc yaml.Node
 	if yaml.Unmarshal(raw, &userDoc) != nil || yaml.Unmarshal(seed, &seedDoc) != nil {
+		return nil // never rewrite a file we cannot parse
+	}
+	if len(userDoc.Content) == 0 {
 		return nil
 	}
-	missing := missingLeafKeys(&userDoc, &seedDoc)
-	if len(missing) == 0 {
-		return nil
-	}
-	// commented stubs are invisible to yaml, so without dedup every restart
-	// would re-append the same block. the header records added keys; only
-	// keys not already recorded are appended.
-	recorded := map[string]bool{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(line, "# added: ") {
-			for _, k := range strings.Split(strings.TrimPrefix(line, "# added: "), ",") {
-				if k = strings.TrimSpace(k); k != "" {
-					recorded[k] = true
-				}
-			}
+	var added []string
+	for _, k := range missingLeafKeys(&userDoc, &seedDoc) {
+		if setLeaf(&userDoc, &seedDoc, k) {
+			added = append(added, k)
 		}
 	}
-	var fresh []string
-	for _, k := range missing {
-		if !recorded[k] {
-			fresh = append(fresh, k)
-		}
-	}
-	if len(fresh) == 0 {
+	if len(added) == 0 {
 		return nil
 	}
 	var b strings.Builder
-	b.WriteString("\n# --- auto-added: keys from config.yml.example missing here ---\n")
-	b.WriteString("# uncomment, move under the right section, edit to use.\n")
-	b.WriteString("# added: " + strings.Join(fresh, ", ") + "\n")
-	for _, k := range fresh {
-		b.WriteString(seedValue(&seedDoc, k))
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		log.Printf("WARN: cannot merge keys into %s: %v", path, err)
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(2)
+	if err := enc.Encode(userDoc.Content[0]); err != nil {
+		log.Printf("WARN: cannot encode %s: %v", path, err)
 		return nil
 	}
-	defer f.Close()
-	if _, err := f.WriteString(b.String()); err != nil {
-		log.Printf("WARN: cannot merge keys into %s: %v", path, err)
+	enc.Close()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0600); err != nil {
+		log.Printf("WARN: cannot write %s: %v", tmp, err)
 		return nil
 	}
-	log.Printf("  %s: added %d missing key(s) as commented defaults", path, len(fresh))
-	return fresh
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("WARN: cannot replace %s: %v", path, err)
+		os.Remove(tmp)
+		return nil
+	}
+	log.Printf("  %s: added %d missing option(s) with their defaults in place", path, len(added))
+	return added
+}
+
+// setLeaf inserts one seed key/value at a dotted path in the user tree,
+// creating missing parent mappings. an existing key is never touched.
+func setLeaf(doc, seed *yaml.Node, path string) bool {
+	user := doc
+	if user.Kind == yaml.DocumentNode {
+		if len(user.Content) == 0 {
+			return false
+		}
+		user = user.Content[0]
+	}
+	seedCur := seed
+	if seedCur.Kind == yaml.DocumentNode && len(seedCur.Content) > 0 {
+		seedCur = seedCur.Content[0]
+	}
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		if user.Kind != yaml.MappingNode || seedCur.Kind != yaml.MappingNode {
+			return false
+		}
+		uk, uv := yamlPair(user, part)
+		sk, sv := yamlPair(seedCur, part)
+		if sk == nil || sv == nil {
+			return false
+		}
+		if i == len(parts)-1 {
+			if uk != nil {
+				return false // the user's own value wins
+			}
+			user.Content = append(user.Content, copyNode(sk), copyNode(sv))
+			return true
+		}
+		if uk == nil {
+			nv := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			user.Content = append(user.Content, copyNode(sk), nv)
+			user, seedCur = nv, sv
+			continue
+		}
+		user, seedCur = uv, sv
+	}
+	return false
+}
+
+// yamlPair finds one key node and its value in a mapping.
+func yamlPair(m *yaml.Node, key string) (*yaml.Node, *yaml.Node) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i], m.Content[i+1]
+		}
+	}
+	return nil, nil
+}
+
+// copyNode deep-copies a yaml node so the seed tree is never aliased.
+func copyNode(n *yaml.Node) *yaml.Node {
+	if n == nil {
+		return nil
+	}
+	c := *n
+	c.Content = nil
+	for _, ch := range n.Content {
+		c.Content = append(c.Content, copyNode(ch))
+	}
+	return &c
 }
 
 // equalStrings is order-sensitive equality for reload change detection.
@@ -896,6 +965,9 @@ func applyConfig(c *appConfig) {
 	}
 	if c.OpenRouterKeys == nil {
 		c.OpenRouterKeys = map[string]string{}
+	}
+	if c.OrcaKeys == nil {
+		c.OrcaKeys = map[string]string{}
 	}
 	appCfg.Store(c)
 
@@ -1013,8 +1085,9 @@ func watchConfig(p *Pool, path string) {
 			// portal keys are a separate pool: the reload rebuilds it too.
 			nousSyncKeys(c.NousKeys)
 			// keyed openai backends swap their pools the same way.
-			unoSyncKeys(c.UnoKeys)
-			orChatSyncKeys(c.OpenRouterKeys)
+			unoSyncKeys(c.UnoKeys, c.Uno.PaidKeys)
+			orChatSyncKeys(c.OpenRouterKeys, c.OpenRouter.PaidKeys)
+			orcaSyncKeys(c.OrcaKeys, c.Orca.PaidKeys)
 			// keyless cap follows zen lanes, so a lanes edit takes
 			// effect here without a restart.
 			p.syncSemLimit(c.NvidiaKeys)
@@ -1132,11 +1205,20 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 	if !c.Status.ShowOpenRouter {
 		sr.OpenRouter = nil
 	}
+	if !c.Status.ShowOrcarouter {
+		sr.Orcarouter = nil
+	}
 	if !c.Status.ShowRoute {
 		sr.Route = nil
 	}
+	if !c.Status.ShowWroute {
+		sr.Wroute = nil
+	}
 	if !c.Status.ShowBenchmarks {
 		sr.Benchmarks = nil
+	}
+	if !c.Status.ShowPrices {
+		sr.Prices = nil
 	}
 	if authRequired() && !authed {
 		sr.Keys, sr.Locks = nil, nil
@@ -1147,12 +1229,15 @@ func (p *Pool) StatusFor(authed bool) StatusResponse {
 		sr.Nous = nil
 		sr.Uno = nil
 		sr.OpenRouter = nil
+		sr.Orcarouter = nil
 		sr.LaneCap = 0
 		sr.Usage = nil
 		sr.Health = nil
 		sr.Pool = nil
 		sr.Route = nil
+		sr.Wroute = nil
 		sr.Benchmarks = nil
+		sr.Prices = nil
 	}
 	return sr
 }

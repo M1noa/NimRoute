@@ -2,6 +2,7 @@ package pii
 
 import (
 	"container/list"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -86,11 +87,20 @@ func SessionKey(apiKey string) string {
 }
 
 func vaultKey() []byte {
-	// per-process secret: stable across restarts is NOT wanted for the
-	// hmac key itself (surrogate stability comes from the map, which
-	// lives in-process per session). fixed process key is fine.
-	return []byte("nimroute-pii-v1")
+	// per-process secret, minted once from crypto/rand: stable across
+	// requests in a run (which is what keeps surrogates identical), but a
+	// restart re-mints it. nothing needs cross-restart stability, and a
+	// constant here made every surrogate computable offline from the
+	// binary. the vault map holding the mapping dies with the process too.
+	return procKey
 }
+
+// procKey is the process-wide hmac key for surrogate derivation.
+var procKey = func() []byte {
+	k := make([]byte, 32)
+	rand.Read(k) // never fails on a supported platform
+	return k
+}()
 
 // ForRequest returns the session guard, or nil when disabled (zero
 // overhead: callers check nil and pass bodies through untouched).

@@ -77,6 +77,9 @@ type aaIndex struct {
 	byFamily map[string][]aaRow
 	updated  string
 	fetched  time.Time
+	// scored counts the rows that carry an intelligence index: bySlug now
+	// holds every listed model, not only the scored ones.
+	scored int
 }
 
 func buildAAIndex(rows []aaRow, updated string) *aaIndex {
@@ -87,17 +90,26 @@ func buildAAIndex(rows []aaRow, updated string) *aaIndex {
 		fetched:  time.Now(),
 	}
 	for _, r := range rows {
-		// a row with no score can't be matched on or sorted by one.
-		if r.IntelligenceIndex == nil {
-			continue
-		}
+		// an unscored row still names a model, and that name is what a lookup
+		// needs: AA publishes the number on a sibling effort level or build of
+		// the same release (deepseek-v4-1-flash-1017 vs deepseek-v4-1-flash),
+		// so the score is resolved from the family afterwards.
 		if s := normModelID(r.Slug); s != "" {
-			if _, dup := ix.bySlug[s]; !dup {
+			if prev, dup := ix.bySlug[s]; !dup || (prev.IntelligenceIndex == nil && r.IntelligenceIndex != nil) {
 				ix.bySlug[s] = r
 			}
 		}
 		if s := normModelID(r.Release.Slug); s != "" {
 			ix.byFamily[s] = append(ix.byFamily[s], r)
+			// a dated build is the same model as the plain release: index both
+			// spellings, or a scored dated row never meets the plain id the
+			// gateway serves.
+			if b := stripModelVariants(s); b != s && b != "" {
+				ix.byFamily[b] = append(ix.byFamily[b], r)
+			}
+		}
+		if r.IntelligenceIndex != nil {
+			ix.scored++
 		}
 	}
 	return ix
@@ -144,6 +156,9 @@ func (m benchMatch) index() float64 {
 // benchFor matches one model id against the live catalog. the exact
 // org/name form first, then the bare and variant-stripped forms, then the
 // release family (highest scoring member wins).
+//
+// a slug that names the model without scoring it is not a miss: AA scores one
+// build or effort level of a release, so the number comes from its family.
 func benchFor(id string) benchMatch {
 	benchMu.RLock()
 	ix := benchIndex
@@ -155,29 +170,46 @@ func benchFor(id string) benchMatch {
 	if len(forms) == 0 {
 		return benchMatch{}
 	}
-	// the full id is only an exact hit when aa itself carries a slash.
-	if r, ok := ix.bySlug[forms[0]]; ok {
-		return benchMatch{Row: r, Kind: "exact"}
-	}
-	for _, cand := range forms[1:] {
-		if r, ok := ix.bySlug[cand]; ok {
-			return benchMatch{Row: r, Kind: "slug"}
+	for i, cand := range forms {
+		r, ok := ix.bySlug[cand]
+		if !ok {
+			continue
+		}
+		// the full id is only an exact hit when aa itself carries a slash.
+		kind := "slug"
+		if i == 0 {
+			kind = "exact"
+		}
+		if r.IntelligenceIndex != nil {
+			return benchMatch{Row: r, Kind: kind}
+		}
+		if b, ok := ix.bestScored(ix.byFamily[normModelID(r.Release.Slug)]); ok {
+			return benchMatch{Row: b, Kind: kind}
 		}
 	}
-	// family: the catalog row may be one effort level or modality of the
+	// family: the catalog row may be one effort level, build or modality of the
 	// model we serve, and those rows disagree on score.
 	for _, cand := range forms {
-		var best aaRow
-		for _, r := range ix.byFamily[cand] {
-			if best.Slug == "" || *r.IntelligenceIndex > *best.IntelligenceIndex {
-				best = r
-			}
-		}
-		if best.Slug != "" {
-			return benchMatch{Row: best, Kind: "family"}
+		if b, ok := ix.bestScored(ix.byFamily[cand]); ok {
+			return benchMatch{Row: b, Kind: "family"}
 		}
 	}
 	return benchMatch{}
+}
+
+// bestScored is the highest-scoring row of a family: an unscored sibling is a
+// name, and the number lives on another effort level or build of it.
+func (ix *aaIndex) bestScored(rows []aaRow) (aaRow, bool) {
+	var best aaRow
+	for _, r := range rows {
+		if r.IntelligenceIndex == nil {
+			continue
+		}
+		if best.Slug == "" || *r.IntelligenceIndex > *best.IntelligenceIndex {
+			best = r
+		}
+	}
+	return best, best.Slug != ""
 }
 
 // benchSnapshot returns the current index metadata for /status.
@@ -187,7 +219,7 @@ func benchSnapshot() (updated string, fetched time.Time, rows int, ok bool) {
 	if benchIndex == nil {
 		return "", time.Time{}, 0, false
 	}
-	return benchIndex.updated, benchIndex.fetched, len(benchIndex.bySlug), true
+	return benchIndex.updated, benchIndex.fetched, benchIndex.scored, true
 }
 
 func benchLastError() string {
@@ -303,24 +335,23 @@ func peelDateStamp(s string) string {
 
 // dedup listing: keyed providers (uno, openrouter, nous) list minor
 // refreshes and small sizes beside a family's lead model, so
-// "glm-4.5-flash:free" hides behind "glm-5.3-flash-search:free". a row is
-// dropped when a same-provider sibling in the same family is not older,
-// not smaller, and strictly better in version or size; equal twins stay.
-// ids without a version token are never compared, so embedded-lead-digit
-// names like qwen3.8-27b keep every row. tier suffixes (lite, mini, pro,
-// turbo) are their own families: flash-lite is a cheaper model, not an
-// older flash.
+// "glm-4.5-flash:free" hides behind "glm-5.3-flash:free". a row is dropped
+// when a same-provider sibling of the same shape is not older, not smaller,
+// and strictly better in version or size; equal twins stay. ids without a
+// version token are never compared, so embedded-lead-digit names like
+// qwen3.8-27b keep every row. the shape key is the whole name minus version
+// and size tokens, so tier suffixes (lite, mini, pro, turbo) and other
+// qualifiers (search, argon) are their own families: flash-lite is a
+// cheaper model, not an older flash.
 
 var variantVerRe = regexp.MustCompile(`^v?(\d+(?:\.\d+)*)v?$`)
 var variantSizeRe = regexp.MustCompile(`^(\d+)b$`)
 var variantSizeAnyRe = regexp.MustCompile(`^(?:a)?(\d+)b$`)
 var variantMoeRe = regexp.MustCompile(`^a\d+b$`)
-var variantTierWords = map[string]bool{"lite": true, "mini": true, "pro": true, "turbo": true}
 
 type variantRow struct {
 	pref string
-	fam  string // legacy key: tokens before the version, first tier suffix
-	full string // status key: whole name shape minus version and size tokens
+	full string // shape key: whole name minus version and size tokens
 	ver  []int  // nil = no version token
 	size int    // biggest plain b-suffix token after the version token
 	// like size, but aNb (gemma a4b active-param) tokens count too
@@ -330,7 +361,7 @@ type variantRow struct {
 }
 
 // variantPrefixes are the keyed listings the /v1/models fold compares.
-var variantPrefixes = []string{"openrouter/", "uno/", "nous/"}
+var variantPrefixes = []string{"openrouter/", "orcarouter/", "uno/", "nous/"}
 
 // parseVariantFields splits one listing id into provider prefix, keys, and
 // version/size facts. any provider works; the caller picks the scope.
@@ -359,7 +390,6 @@ func parseVariantFields(id string) variantRow {
 		// unversioned: the whole id is its own identity
 		return row
 	}
-	row.fam = strings.Join(toks[:vi], "-")
 	name := make([]string, 0, len(toks))
 	for k, t := range toks {
 		if k == vi {
@@ -387,12 +417,6 @@ func parseVariantFields(id string) variantRow {
 			if n > row.size {
 				row.size = n
 			}
-			continue
-		}
-		if variantTierWords[t] {
-			// first tier suffix only; it takes the row out of the plain family
-			row.fam += "-" + t
-			break
 		}
 	}
 	return row
@@ -431,7 +455,7 @@ func verSegLess(a, b []int) int {
 	return 0
 }
 
-// variantDrop marks ids superseded by a same-provider family sibling.
+// variantDrop marks ids superseded by a same-provider, same-shape sibling.
 // ids must carry their backend prefix; unversioned ones are never dropped.
 func variantDrop(ids []string) []bool {
 	rows := make([]variantRow, len(ids))
@@ -442,7 +466,7 @@ func variantDrop(ids []string) []bool {
 	drop := make([]bool, len(ids))
 	for i := range ids {
 		pi := rows[i]
-		if !ok[i] || pi.ver == nil || pi.fam == "" {
+		if !ok[i] || pi.ver == nil || pi.full == "" {
 			continue
 		}
 		for j := range ids {
@@ -450,8 +474,8 @@ func variantDrop(ids []string) []bool {
 				continue
 			}
 			pj := rows[j]
-			if pj.pref != pi.pref || pj.fam != pi.fam ||
-				pj.fam == "" || pj.ver == nil || pj.moe != pi.moe {
+			if pj.pref != pi.pref || pj.full != pi.full ||
+				pj.full == "" || pj.ver == nil || pj.moe != pi.moe {
 				continue
 			}
 			cmp := verSegLess(pj.ver, pi.ver)
@@ -998,6 +1022,11 @@ func servedBenchIDs(known map[string]bool) []string {
 	if orChatEnabled() {
 		for _, m := range orChatModels() {
 			add("openrouter/" + m.ID)
+		}
+	}
+	if orcaEnabled() {
+		for _, m := range orcaModels() {
+			add("orcarouter/" + m.ID)
 		}
 	}
 	if nousEnabled() {

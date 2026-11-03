@@ -27,7 +27,6 @@ import (
 // styles mirror nimstatus.py's palette.
 var (
 	cDim     = lipgloss.NewStyle().Faint(true)
-	cBold    = lipgloss.NewStyle().Bold(true)
 	cWhite   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	cGreen   = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
 	cSpring  = lipgloss.NewStyle().Foreground(lipgloss.Color("85"))
@@ -46,6 +45,7 @@ var provColor = map[string]lipgloss.Style{
 	"uno":        lipgloss.NewStyle().Foreground(lipgloss.Color("220")),
 	"openrouter": lipgloss.NewStyle().Foreground(lipgloss.Color("69")),
 	"route":      lipgloss.NewStyle().Foreground(lipgloss.Color("176")),
+	"wroute":     lipgloss.NewStyle().Foreground(lipgloss.Color("214")),
 }
 
 func provStyle(p string) lipgloss.Style {
@@ -342,9 +342,15 @@ func usageTotalsFor(path string) nimStats {
 	reset := func() {
 		c.path, c.off, c.day, c.st, c.valid = path, 0, today, nimStats{}, false
 	}
-	if !c.valid || c.path != path || c.day != today {
+	if !c.valid || c.path != path {
 		reset()
 		c.path, c.day, c.valid = path, today, true
+	} else if c.day != today {
+		// the day rolled over under a running dashboard: every row already
+		// read is yesterday's, so keep the offset and the all-time totals and
+		// only restart today's window. re-reading the whole log here cost
+		// seconds (134MB, 485k lines) once a day, mid-frame.
+		c.day, c.st.todayReq, c.st.todayTok, c.st.todayByModel = today, 0, 0, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -540,11 +546,22 @@ func nimLogs(e nimEnv, n int) error {
 
 type dashTickMsg struct{}
 
+// dashAnimMsg drives the sub-second repaints a lit model row needs; the 2s
+// poll tick is far too slow to animate anything.
+type dashAnimMsg struct{}
+
 type dashMsg struct {
 	d   *StatusResponse
 	st  nimStats
 	err error
 }
+
+// flashFor is how long a model row stays lit after it serves a request.
+const flashFor = 500 * time.Millisecond
+
+// flashFrames spin in the gutter around a model id that just served. each is
+// one terminal cell, so the row never shifts while it animates.
+var flashFrames = []string{"✦", "✧", "✺", "✳", "✩", "·"}
 
 type dashModel struct {
 	port, dir string
@@ -554,6 +571,17 @@ type dashModel struct {
 	st        nimStats
 	err       error
 	at        time.Time
+	// seen is the request count per model at the last frame; a model whose
+	// count grew lands in flashes and lights up for flashFor.
+	seen    map[string]int
+	flashes map[string]time.Time
+	// loading holds a fetch in flight: the tick is 2s and the client timeout
+	// 3s, so a slow /status would otherwise stack polls (and concurrent
+	// writes to statsCache) on every tick.
+	loading bool
+	// pins are the table headers and where they sit in the rendered list,
+	// recorded by render() so the view can hold one at the top while scrolled.
+	pins []dashPin
 }
 
 func nimStatusTail(e nimEnv) {
@@ -627,7 +655,12 @@ func dashTick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return dashTickMsg{} })
 }
 
+func dashAnimTick() tea.Cmd {
+	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg { return dashAnimMsg{} })
+}
+
 func (m *dashModel) Init() tea.Cmd {
+	m.loading = true
 	return tea.Batch(dashLoad(m.port, m.dir), dashTick())
 }
 
@@ -636,15 +669,42 @@ func (m *dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case dashTickMsg:
-		return m, tea.Batch(dashLoad(m.port, m.dir), dashTick())
-	case dashMsg:
-		// one slow /status must not wedge the view: keep the last good frame
-		// and try again on the next tick
-		if msg.err != nil {
-			m.err = msg.err
+		if m.loading {
 			return m, dashTick()
 		}
+		m.loading = true
+		return m, tea.Batch(dashLoad(m.port, m.dir), dashTick())
+	case dashAnimMsg:
+		// repaint while anything is lit, then let the chain die so an idle
+		// dashboard is back to one wake-up per poll.
+		live := false
+		for id, at := range m.flashes {
+			if time.Since(at) >= flashFor {
+				delete(m.flashes, id)
+				continue
+			}
+			live = true
+		}
+		if live {
+			return m, dashAnimTick()
+		}
+		return m, nil
+	case dashMsg:
+		m.loading = false
+		// one slow /status must not wedge the view: keep the last good frame
+		// and let the tick chain already in flight try again. scheduling a tick
+		// here added a second chain per failed fetch, so an hour of intermittent
+		// timeouts ended up polling and redrawing dozens of times a second.
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
 		m.err, m.d, m.st, m.at = nil, msg.d, msg.st, time.Now()
+		was := len(m.flashes) > 0
+		m.trackUsage()
+		if !was && len(m.flashes) > 0 {
+			return m, dashAnimTick()
+		}
 	case tea.KeyMsg:
 		page := m.bodyHeight()
 		switch msg.String() {
@@ -670,6 +730,80 @@ func (m *dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// trackUsage lights a model row when its request count grew between
+// refreshes: the server's own counters, or today's log rows when the server
+// restarted under the dashboard and its totals went back to zero.
+func (m *dashModel) trackUsage() {
+	cur := make(map[string]int, len(m.seen))
+	if m.d.Usage != nil {
+		for id, t := range m.d.Usage.ByModel {
+			cur[id] = t.Requests
+		}
+	}
+	for id, u := range m.st.todayByModel {
+		if n := int(u.req); n > cur[id] {
+			cur[id] = n
+		}
+	}
+	if m.seen != nil {
+		if m.flashes == nil {
+			m.flashes = map[string]time.Time{}
+		}
+		now := time.Now()
+		for id, n := range cur {
+			if n > m.seen[id] {
+				m.flashes[id] = now
+			}
+		}
+	}
+	m.seen = cur
+}
+
+// flashAt reports how far through its flash a model is (1 = just lit, 0 =
+// settled) and whether it is lit at all.
+func (m *dashModel) flashAt(id string) (float64, bool) {
+	at, ok := m.flashes[id]
+	if !ok {
+		return 0, false
+	}
+	el := time.Since(at)
+	if el < 0 || el >= flashFor {
+		return 0, false
+	}
+	return 1 - float64(el)/float64(flashFor), true
+}
+
+// flashStyle eases the highlight from bright white back to the provider's
+// colour, so a used row settles instead of snapping.
+func flashStyle(ease float64, prov string) lipgloss.Style {
+	ease = ease * ease * (3 - 2*ease)
+	switch {
+	case ease > 0.8:
+		return cWhite
+	case ease > 0.55:
+		return cSpring
+	case ease > 0.3:
+		return cGreen
+	}
+	return provStyle(prov)
+}
+
+// flashCell draws a model id in its reserved gutter: two blank cells either
+// side normally, a pair of spinning sparks while the row is lit. the gutter
+// is always there, so a flash never shifts the rest of the table.
+func (m *dashModel) flashCell(full, prov string) string {
+	ease, on := m.flashAt(full)
+	if !on {
+		return provStyle(prov).Render("  " + full + "  ")
+	}
+	f := flashFrames[int((1-ease)*float64(len(flashFrames)))%len(flashFrames)]
+	out := flashStyle(ease, prov).Render(f + " " + full + " " + f)
+	if w := lipgloss.Width(out); w < lipgloss.Width(full)+4 {
+		out = padR(out, lipgloss.Width(full)+4)
+	}
+	return out
+}
+
 func (m *dashModel) bodyHeight() int {
 	h := m.h - 3
 	if h < 5 {
@@ -688,18 +822,33 @@ func (m *dashModel) View() string {
 	}
 	lines := m.render()
 	body := m.bodyHeight()
-	max := len(lines) - body
+	// a pinned header spends rows the viewport would have shown, so the scroll
+	// limit shrinks by exactly what it takes.
+	pinned := m.pinnedHeader(m.top)
+	room := body - len(pinned)
+	if room < 1 {
+		pinned, room = nil, body
+	}
+	max := len(lines) - room
 	if max < 0 {
 		max = 0
 	}
 	if m.top > max {
 		m.top = max
+		pinned = m.pinnedHeader(m.top)
+		room = body - len(pinned)
+		if room < 1 {
+			pinned, room = nil, body
+		}
 	}
-	end := m.top + body
+	end := m.top + room
 	if end > len(lines) {
 		end = len(lines)
 	}
 	shown := make([]string, 0, body)
+	for _, ln := range pinned {
+		shown = append(shown, ansi.Truncate(ln, m.w, "…"))
+	}
 	for _, ln := range lines[m.top:end] {
 		shown = append(shown, ansi.Truncate(ln, m.w, "…"))
 	}
@@ -823,17 +972,56 @@ func (m *dashModel) render() []string {
 	mrows, hasHealth, hasTail := m.modelRows()
 	head, tail := m.headLines(), m.tailLines()
 	wantL := len(m.d.ZenLanes)
+	// the lane table draws every seat zen.lanes buys, empty ones dim, so the
+	// row count follows the configured capacity rather than the live table.
+	seats := m.d.LaneCap
+	if seats < wantL {
+		seats = wantL
+	}
 	// everything is rendered and the viewport scrolls: capping rows to the
 	// terminal height left the rest of the catalog unreachable, so a short
 	// pane could never show the models below the fold.
 	out := append([]string{}, head...)
-	if wantL > 0 {
-		out = append(out, m.laneLines(wantL)...)
+	m.pins = m.pins[:0]
+	if seats > 0 {
+		ll := m.laneLines(seats)
+		// laneLines leads with a blank row, so its header starts one line in.
+		m.pins = append(m.pins, dashPin{start: len(out) + 1, end: len(out) + len(ll), lines: ll[1:3]})
+		out = append(out, ll...)
 	}
 	if len(mrows) > 0 {
-		out = append(out, modelLines(mrows, len(mrows), hasHealth, hasTail, wantL == 0)...)
+		lead := seats == 0
+		ml := modelLines(mrows, len(mrows), hasHealth, hasTail, lead)
+		at := len(out)
+		if lead {
+			at++
+		}
+		m.pins = append(m.pins, dashPin{start: at, end: len(out) + len(ml), lines: ml[at-len(out) : at-len(out)+2]})
+		out = append(out, ml...)
 	}
 	return append(out, tail...)
+}
+
+// dashPin is one table's header (column names plus the rule under them) and
+// where it sits in the rendered list, so the view can hold it at the top once
+// scrolling has taken it away.
+type dashPin struct {
+	start, end int
+	lines      []string
+}
+
+// pinnedHeader is the header to hold above the viewport for one scroll offset:
+// the table the first visible row belongs to, once its own header has scrolled
+// off. past the last table's rows nothing is pinned, so the footer lines never
+// sit under a stale table head.
+func (m *dashModel) pinnedHeader(top int) []string {
+	for i := len(m.pins) - 1; i >= 0; i-- {
+		p := m.pins[i]
+		if top >= p.start+len(p.lines) && top < p.end {
+			return p.lines
+		}
+	}
+	return nil
 }
 
 type modelGroup struct {
@@ -904,11 +1092,30 @@ func (m *dashModel) modelGroups() []modelGroup {
 	if d.OpenRouter != nil && len(d.OpenRouter.Models) > 0 {
 		gs = append(gs, modelGroup{prov: "openrouter", ids: prefixed("openrouter/", d.OpenRouter.Models)})
 	}
+	if d.Orcarouter != nil && len(d.Orcarouter.Models) > 0 {
+		gs = append(gs, modelGroup{prov: "orcarouter", ids: prefixed("orcarouter/", d.Orcarouter.Models)})
+	}
 	if d.Route != nil && d.Route.Enabled {
 		g := modelGroup{prov: "route"}
 		for _, r := range d.Route.Routes {
 			g.ids = append(g.ids, r.ID)
-			g.tails = append(g.tails, strings.Join(r.Via, " · "))
+			// the exact models, not just the backends: an older server only
+			// fills via.
+			t := strings.Join(r.Via, " · ")
+			if len(r.Models) > 0 {
+				t = strings.Join(r.Models, " · ")
+			}
+			g.tails = append(g.tails, t)
+		}
+		if len(g.ids) > 0 {
+			gs = append(gs, g)
+		}
+	}
+	if d.Wroute != nil && d.Wroute.Enabled {
+		g := modelGroup{prov: "wroute"}
+		for _, r := range d.Wroute.Routes {
+			g.ids = append(g.ids, r.ID)
+			g.tails = append(g.tails, strings.Join(r.Models, " · "))
 		}
 		if len(g.ids) > 0 {
 			gs = append(gs, g)
@@ -940,6 +1147,14 @@ func (m *dashModel) modelGroups() []modelGroup {
 		g.ids, g.tails = ids, tails
 	}
 	return gs
+}
+
+// groupID restores the provider prefix a group's bare ids drop.
+func groupID(prov, id string) string {
+	if strings.Contains(id, "/") {
+		return id
+	}
+	return prov + "/" + id
 }
 
 // bareID is python's full.split("/", 1)[-1].
@@ -976,6 +1191,19 @@ func (m *dashModel) modelRows() (rows [][]string, hasHealth, hasTail bool) {
 				hasTail = true
 			}
 		}
+		// a quoted price rides that same trailing column, like freepi's
+		// multiplier: one column for row facts, never a second one.
+		for i, id := range g.ids {
+			if i < len(g.tails) && g.tails[i] != "" {
+				continue
+			}
+			if _, ok := d.Prices[groupID(g.prov, id)]; ok {
+				hasTail = true
+			}
+			if freeBackend(g.prov) && !strings.HasPrefix(id, "nvidia/keys:") {
+				hasTail = true
+			}
+		}
 	}
 	for _, g := range gs {
 		for i, val := range g.ids {
@@ -1004,9 +1232,19 @@ func (m *dashModel) modelRows() (rows [][]string, hasHealth, hasTail bool) {
 			tail := ""
 			if i < len(g.tails) && g.tails[i] != "" {
 				tail = cDim.Render(g.tails[i])
+			} else if p, ok := d.Prices[full]; ok {
+				tail = priceCell(p)
+			} else if freeBackend(g.prov) && !strings.HasPrefix(val, "nvidia/keys:") {
+				// a free backend quotes $0 on every model it lists: nothing
+				// upstream ever sends a price for these ids.
+				tail = priceCell(pricePair{})
+			}
+			if ease, on := m.flashAt(full); on {
+				// the count that grew is part of the “this just served” read.
+				req = flashStyle(ease, g.prov).Render(req)
 			}
 			row := []string{
-				provStyle(g.prov).Render(full),
+				m.flashCell(full, g.prov),
 				scoreCell(bench(full)),
 				req, tok, tps,
 			}
@@ -1020,6 +1258,30 @@ func (m *dashModel) modelRows() (rows [][]string, hasHealth, hasTail bool) {
 		}
 	}
 	return rows, hasHealth, hasTail
+}
+
+// freeBackend is a backend whose whole catalog costs nothing, so every row it
+// lists quotes a zero price instead of leaving the column blank. nvidia's key
+// row is not a model and is excluded by the caller.
+func freeBackend(prov string) bool {
+	switch prov {
+	case "opencode", "antseed", "freepi", "nvidia":
+		return true
+	}
+	return false
+}
+
+// priceCell draws one provider-quoted price as usd per million input/output
+// tokens: "0.15/0.6". a zero pair is the free tier, quoted as $0 like any
+// other price rather than labelled.
+func priceCell(p pricePair) string {
+	if p.In == 0 && p.Out == 0 {
+		return cSpring.Render("$0")
+	}
+	// four significant digits: the catalog carries float noise (0.059999)
+	// and the column is a pointer, not an invoice.
+	fmtP := func(v float64) string { return strconv.FormatFloat(v, 'g', 4, 64) }
+	return cDim.Render(fmtP(p.In) + "/" + fmtP(p.Out))
 }
 
 // modelLines draws the model table, capped at limit rows.
@@ -1041,9 +1303,10 @@ func modelLines(rows [][]string, limit int, hasHealth, hasTail, lead bool) []str
 	cols = append(cols, colSpec{"model", false}, colSpec{"score", true}, colSpec{"req", true},
 		colSpec{"tokens", true}, colSpec{"tok/s*", true})
 	if hasTail {
-		// route rows list their backends here, freepi rows their speed
-		// multiple: one header for both, or the column reads like a bug.
-		cols = append(cols, colSpec{"via / ×", false})
+		// route and wroute rows list the exact models behind them here,
+		// freepi rows their speed multiple: one header for both, or the
+		// column reads like a bug.
+		cols = append(cols, colSpec{"models / ×", false})
 	}
 	out := drawTable(cols, rows)
 	if lead {
@@ -1115,10 +1378,17 @@ func cell(v string, w int, right bool) string {
 	return padR(v, w)
 }
 
-// laneLines draws the lane table, capped at limit rows.
+// laneLines draws the lane table, capped at limit rows. seats the table has
+// room for but no live lane in (the pool is smaller than zen.lanes, so
+// trimLanesToPool dropped them) are drawn dim, so a thin pool reads as empty
+// seats rather than as a router that only ever had two lanes.
 func (m *dashModel) laneLines(limit int) []string {
 	lanes := append([]laneStatus(nil), m.d.ZenLanes...)
-	if len(lanes) == 0 {
+	slots := m.d.LaneCap
+	if slots < len(lanes) {
+		slots = len(lanes)
+	}
+	if slots == 0 {
 		return nil
 	}
 	exits := map[string]poolExit{}
@@ -1134,12 +1404,21 @@ func (m *dashModel) laneLines(limit int) []string {
 		return lanes[i].ID < lanes[j].ID
 	})
 
-	want := len(lanes)
 	if limit < 0 {
 		limit = 0
 	}
-	if want > limit {
+	if limit < len(lanes) {
 		lanes = lanes[:limit]
+	}
+	spare := slots - len(lanes)
+	if spare > 4 {
+		// a short pool would otherwise fill the pane with placeholders and
+		// push the whole model catalog off screen; the count line carries
+		// the rest.
+		spare = 4
+	}
+	if room := limit - len(lanes); spare > room {
+		spare = room
 	}
 	var rows [][]string
 	anyCC := false
@@ -1180,6 +1459,11 @@ func (m *dashModel) laneLines(limit int) []string {
 			fmtMs(l.AvgMs), fmtTok(l.Tokens),
 		})
 	}
+	for i := 0; i < spare; i++ {
+		dash := cDim.Render("—")
+		dot := cDim.Render("·")
+		rows = append(rows, []string{dash, dash, dot, dot, dot, dot, dot, dot})
+	}
 	cols := []colSpec{{"lane", false}, {"exit", false}, {"cc", false}, {"ttfb", true},
 		{"req", true}, {"429", true}, {"avg turn", true}, {"tokens", true}}
 	if !anyCC {
@@ -1191,8 +1475,8 @@ func (m *dashModel) laneLines(limit int) []string {
 		}
 	}
 	out := append([]string{""}, drawTable(cols, rows)...)
-	if len(lanes) < want {
-		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more lanes · taller terminal shows more", want-len(lanes))))
+	if len(rows) < slots {
+		out = append(out, cDim.Render(fmt.Sprintf("⋮ %d more lanes · no exit to pin them to", slots-len(rows))))
 	}
 	return append(out, "")
 }

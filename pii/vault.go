@@ -13,7 +13,8 @@ import (
 
 // vault maps originals to stable surrogates per session. surrogates derive
 // from hmac(key, category|normalized original) so they stay identical across
-// requests and restarts; collisions re-derive with a counter.
+// requests in the run (the key is minted per process); collisions re-derive
+// with a counter.
 
 type vaultEntry struct {
 	original  string

@@ -14,6 +14,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -640,8 +641,19 @@ type StatusResponse struct {
 	Nous          *nousSummary           `json:"nous,omitempty"`
 	Uno           *keyedSummary          `json:"uno,omitempty"`
 	OpenRouter    *keyedSummary          `json:"openrouter,omitempty"`
+	Orcarouter    *keyedSummary          `json:"orcarouter,omitempty"`
 	Route         *routeSummary          `json:"route,omitempty"`
+	Wroute        *wrouteSummary         `json:"wroute,omitempty"`
 	Benchmarks    *benchSummary          `json:"benchmarks,omitempty"`
+	Prices        map[string]pricePair   `json:"prices,omitempty"`
+}
+
+// pricePair is one model's usd price per million tokens as its own provider
+// quotes it. a present row means the price is known: 0/0 is free, absent is
+// unknown. it feeds the status model table, never the request path.
+type pricePair struct {
+	In  float64 `json:"in"`
+	Out float64 `json:"out"`
 }
 
 // freepiAcctStatus is one account's /status row. jwt never leaves config.
@@ -776,13 +788,48 @@ func (p *Pool) Status() StatusResponse {
 	if orChatBackend.enabled() && cfg().Status.ShowOpenRouter {
 		sr.OpenRouter = keyedSnapshot(orChatBackend)
 	}
+	if orcaBackend.enabled() && cfg().Status.ShowOrcarouter {
+		sr.Orcarouter = keyedSnapshot(orcaBackend)
+	}
 	if cfg().Status.ShowRoute {
 		sr.Route = routeSnapshot(p)
+	}
+	if cfg().Status.ShowWroute {
+		sr.Wroute = wrouteSnapshot(p)
 	}
 	if cfg().Status.ShowBenchmarks {
 		sr.Benchmarks = buildBenchSummary()
 	}
+	if cfg().Status.ShowPrices {
+		sr.Prices = priceSnapshot()
+	}
 	return sr
+}
+
+// priceSnapshot maps served id -> the price its own catalog quotes. only
+// backends that publish one take part; the rest stay absent (unknown), which
+// is what the model table draws as a dot.
+func priceSnapshot() map[string]pricePair {
+	out := map[string]pricePair{}
+	for _, b := range []*keybackend{unoBackend, orChatBackend, orcaBackend} {
+		if !b.enabled() || b.priceFor == nil {
+			continue
+		}
+		for _, m := range b.models() {
+			if in, o, ok := b.priceFor(m.ID); ok {
+				out[b.name+"/"+m.ID] = pricePair{In: roundPrice(in), Out: roundPrice(o)}
+			}
+		}
+	}
+	for _, m := range nousFreeModels() {
+		if m.PriceOK {
+			out["nous/"+m.ID] = pricePair{
+				In:  roundPrice(m.PriceIn * 1e6),
+				Out: roundPrice(m.PriceOut * 1e6),
+			}
+		}
+	}
+	return out
 }
 
 // noteZenSuccess records the last working zen session/proxy for /status,
@@ -955,7 +1002,11 @@ func initLogging() {
 		acclog.Printf("WARN: cannot open debug log %s: %v", df, err)
 		dbglog = log.New(io.Discard, "", 0)
 	} else {
-		dbglog = log.New(f, "", log.LstdFlags)
+		// mirrored to stdout: the skip/refusal reasons are what explain a
+		// request that took a substitute or failed, and they belong in the
+		// running log instead of a second file nobody opens. body dumps stay
+		// debug-only, so this does not grow per-request output.
+		dbglog = log.New(io.MultiWriter(f, os.Stdout), "", log.LstdFlags)
 	}
 	debugMode = os.Getenv("DEBUG") == "1" || os.Getenv("DEBUG") == "true"
 }
@@ -974,17 +1025,20 @@ func short(s string) string {
 // already parse openrouter find every field they expect here; anything extra
 // we know lives under Benchmarks or Nim so it cannot collide.
 type openRouterModel struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Description      string            `json:"description,omitempty"`
-	Created          int64             `json:"created,omitempty"`
-	ContextLength    int               `json:"context_length"`
-	Pricing          map[string]string `json:"pricing"`
-	Architecture     map[string]any    `json:"architecture"`
-	TopProvider      map[string]any    `json:"top_provider"`
-	PerRequestLimits any               `json:"per_request_limits"`
-	CanonicalSlug    string            `json:"canonical_slug,omitempty"`
-	HuggingFaceID    string            `json:"hugging_face_id,omitempty"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Description   string            `json:"description,omitempty"`
+	Created       int64             `json:"created,omitempty"`
+	ContextLength int               `json:"context_length"`
+	Pricing       map[string]string `json:"pricing"`
+	// Price1M is the same price scaled to usd per million tokens: the form
+	// a person reads, and the one route ranks by.
+	Price1M          map[string]any `json:"price_1m,omitempty"`
+	Architecture     map[string]any `json:"architecture"`
+	TopProvider      map[string]any `json:"top_provider"`
+	PerRequestLimits any            `json:"per_request_limits"`
+	CanonicalSlug    string         `json:"canonical_slug,omitempty"`
+	HuggingFaceID    string         `json:"hugging_face_id,omitempty"`
 	// SupportedParams is the openrouter request-parameter list. empty =
 	// no record, not "nothing supported".
 	SupportedParams []string       `json:"supported_parameters,omitempty"`
@@ -1012,6 +1066,42 @@ var unlistedFreeModels = map[string]bool{
 	"jev-1.13-free":                   true,
 	"deepseek-v4-flash-free":          true,
 	"muse-spark-1.2-contributor-free": true,
+}
+
+// zenModelListed reports whether an opencode/<id> request names a model zen
+// actually serves: the live catalog, the unlisted ids that still route, or
+// big-pickle. false when the id is in none of them. unknown true: the
+// catalog is loaded at startup and refreshed on a timer, and a fetch
+// failure must not 404 every zen request until it recovers.
+func zenModelListed(model string) bool {
+	id := strings.TrimPrefix(model, "opencode/")
+	if unlistedFreeModels[id] {
+		return true
+	}
+	for _, e := range extraFreeModels {
+		if e == id {
+			return true
+		}
+	}
+	info := ocInfo.Load()
+	if info == nil {
+		return true
+	}
+	return slices.Contains(info.Models, model)
+}
+
+// isEmptyMessageList reports whether v is absent, not a list, or a list
+// with no entries: the shape every chat upstream rejects on arrival.
+func isEmptyMessageList(v any) bool {
+	arr, ok := v.([]any)
+	if !ok {
+		// a string input on /v1/responses is a valid prompt
+		if s, isStr := v.(string); isStr {
+			return strings.TrimSpace(s) == ""
+		}
+		return true
+	}
+	return len(arr) == 0
 }
 
 // endpointForModel returns the Zen API endpoint path for a model.
@@ -2432,6 +2522,7 @@ func (p *Pool) handleModels(w http.ResponseWriter, r *http.Request) {
 	appendNousModels(&out, seenIDs)
 	appendKeyedModels(unoBackend, &out, seenIDs)
 	appendKeyedModels(orChatBackend, &out, seenIDs)
+	appendKeyedModels(orcaBackend, &out, seenIDs)
 	appendRouteModels(p, &out, seenIDs)
 	dedupVariants(&out)
 	sortModelsByBench(out.Data)
@@ -3685,6 +3776,47 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tr.setModel(model, backendForModel(model), isStream)
 	}
 
+	// a body every upstream would reject must fail here, fast: dispatching
+	// it burns a retry ladder and the nvidia fallthrough answers a
+	// misleading "no nvidia keys" 503 for what is really a bad request.
+	if model == "" {
+		// judge the path and method before the body: a request to a
+		// path this server does not own, or a GET to a chat endpoint,
+		// is a routing error, not a JSON error.
+		isChatPath := r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/messages"
+		if !isChatPath {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"only POST is supported"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var probe any
+		if err := json.Unmarshal(body, &probe); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	// the chat endpoints also require a payload no upstream can fill in:
+	// empty messages (or empty input on /v1/responses) must 400 on arrival.
+	if r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses") {
+		var top map[string]any
+		if json.Unmarshal(body, &top) == nil {
+			fld := "messages"
+			if r.URL.Path == "/v1/responses" {
+				fld = "input"
+			}
+			v, ok := top[fld]
+			if !ok || isEmptyMessageList(v) {
+				writeJSONError(w, http.StatusBadRequest, fld+" is required and must be a non-empty list")
+				return
+			}
+		}
+	}
+
 	if strings.HasPrefix(model, "route/") {
 		if !routeEnabled() {
 			acclog.Printf("<- 503 %s %s model=%s (route disabled)", r.Method, r.URL.Path, model)
@@ -3701,10 +3833,34 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasPrefix(model, "wroute/") {
+		if !wrouteEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (wroute disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"wroute is disabled; set route.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		key := strings.TrimPrefix(model, "wroute/")
+		if strings.TrimSpace(key) == "" {
+			http.Error(w, `{"error":"wroute: empty model name"}`, http.StatusBadRequest)
+			return
+		}
+		acclog.Printf("%s routed to wroute=%s", reqID, key)
+		p.handleWRoute(w, r, body, model, key, isStream, start, reqID)
+		return
+	}
+
 	if strings.HasPrefix(model, "opencode/") {
 		if !zenEnabled() {
 			acclog.Printf("<- 503 %s %s model=%s (zen disabled)", r.Method, r.URL.Path, model)
 			http.Error(w, `{"error":"opencode zen is disabled; set zen.enabled: true in config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		// a typo'd id must 404, not get silently substituted by the
+		// free-budget failover. only 404 when the catalog is loaded;
+		// a catalog fetch failure must not break every zen request.
+		if !zenModelListed(model) {
+			acclog.Printf("<- 404 %s %s model=%s (not in zen catalog)", r.Method, r.URL.Path, model)
+			writeJSONError(w, http.StatusNotFound, "unknown model "+model)
 			return
 		}
 		p.concurrentZen.Add(1)
@@ -3765,6 +3921,21 @@ func (p *Pool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body = b
 		}
 		p.keyedChat(w, r, body, model, isStream, start, reqID, unoBackend)
+		return
+	}
+
+	// orcarouter/<model> is the listed form; ids keep their provider prefix.
+	if strings.HasPrefix(model, "orcarouter/") {
+		if !orcaEnabled() {
+			acclog.Printf("<- 503 %s %s model=%s (orcarouter disabled)", r.Method, r.URL.Path, model)
+			http.Error(w, `{"error":"orcarouter is disabled or has no keys; set orcarouter.enabled: true and add orcarouter_keys to config.yml"}`, http.StatusServiceUnavailable)
+			return
+		}
+		model = strings.TrimPrefix(model, "orcarouter/")
+		if b, err := setReqModel(body, model); err == nil {
+			body = b
+		}
+		p.keyedChat(w, r, body, model, isStream, start, reqID, orcaBackend)
 		return
 	}
 
@@ -3847,6 +4018,10 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 
 	exclude := make(map[string]bool)
 	cl := dbgClient(&http.Client{Timeout: 300 * time.Second}, "nvidia")
+	// same rule as the zen path: no total deadline on a streamed body.
+	if isStream {
+		cl.Timeout = 0
+	}
 	var lastResp *http.Response
 	var used *Key
 	var retries int
@@ -4083,19 +4258,6 @@ func (p *Pool) handleNvidia(w http.ResponseWriter, r *http.Request, body []byte,
 // /chat/completions.
 func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byte, model string, isStream bool, start time.Time, reqID string) {
 	realModel := strings.TrimPrefix(model, "opencode/")
-	// failBody is the caller's own body, kept for zenFreeFailover: the zen
-	// reshaping below rewrites model and injects zen's tool ballast.
-	failBody := body
-	// a spent shared budget cannot be rotated past, so it is not worth a
-	// ladder of hops: serve the model elsewhere, or say why not.
-	if zenFreeCapped() {
-		acclog.Printf("%s opencode free budget spent until %s, model=%s", reqID, time.Unix(zenFreeUntil.Load(), 0).UTC().Format(time.RFC3339), model)
-		if p.zenFreeFailover(w, r, failBody, realModel, isStream, start, reqID) {
-			return
-		}
-		writeJSONError(w, http.StatusServiceUnavailable, zenFreeSpentMsg(model))
-		return
-	}
 	// shape follows the client path, not the model: a responses-shaped body
 	// to a chat-only model (or vice versa) is converted so zen sees the
 	// shape its endpoint accepts and the client gets its own shape back.
@@ -4116,7 +4278,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	if json.Unmarshal(body, &m) == nil {
 		m["model"] = realModel
 		stripCacheFields(m)
-		ensureZenTools(m)
+		ensureZenGate(m)
 		if !isStream {
 			// zen 403s stream=false; stream upstream and fold it back below.
 			m["stream"] = true
@@ -4129,6 +4291,11 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			convertToResponses(m)
 		} else {
 			chatFromResponses(m)
+			// chatFromResponses rebuilds messages from input/instructions,
+			// so a responses-shaped body drops the system message the gate
+			// needs: re-apply it on the converted body. idempotent, and a
+			// no-op for bodies that already carried a valid block.
+			ensureZenEnv(m)
 			sanitizeZenChatMessages(m)
 		}
 		if b, err := json.Marshal(m); err == nil {
@@ -4153,12 +4320,19 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	}
 
 	cl := &http.Client{Timeout: 300 * time.Second}
+	// a streamed turn can outlast five minutes: the cap is for buffered calls.
+	if isStream {
+		cl.Timeout = 0
+	}
 	var resp *http.Response
 	var prompT, compT, totalT int
 	var recErr string
 	var usedProxy string
 	var dialDeadErr error
 	dialDeadProxy := ""
+	// burned = exits this request already drew a 429 from: rotation must not
+	// hand one back for a second send (guard in the ladder below).
+	burned := map[string]bool{}
 	rotating := true
 	// attempts is the ladder bound: a hop that finds the pool written off buys
 	// extra hops once a refill clears the marks (ladderExtend), so it grows.
@@ -4211,6 +4385,15 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					return
 				}
 				continue
+			}
+			// rotation handed back an exit this request already drew a 429
+			// from: the re-send is a guaranteed cap answer, not a retry
+			// (measured: a 2-exit pool burned 13 of 15 hops this way, ~2s
+			// apiece). end the ladder with the same honest 502.
+			if proxy != "" && burned[proxy] {
+				acclog.Printf("  opencode re-picked %s after its own 429 by lane %s, ending retry ladder", redactProxyUserinfo(proxy), lane.id)
+				writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
+				return
 			}
 			// rotation handed back the exit whose dial just failed: a
 			// second dial of the same corpse cannot succeed, so end the
@@ -4381,32 +4564,31 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			st := resp.StatusCode
 			eb, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 			resp.Body.Close()
-			// zen's free-tier 429 answers "FreeUsageLimitError" on whichever
-			// exit took the request. the budget behind it is shared by the
-			// whole pool, so the exit is fine and marking it would only
-			// park healthy plumbing: that cap goes to the failover instead.
+			// a free-tier 429 answers on whichever exit took the
+			// request, so it is that exit's mark like any other 429:
+			// the ladder rotates to a fresh exit and session and tries
+			// again. treating it as a pool-wide cap is what parked
+			// every exit behind one answer and stopped rotation from
+			// ever finding the ones with room left.
 			freeCap := zenFreeUsageCap(eb)
 			acclog.Printf("  opencode rate-limited %d (retry %d/%d) freetier=%t model=%s country=%s proxy=%s lane=%s, rotating exit+session",
 				st, zenRetries, zenRetryLabel(), freeCap, model, proxyCountry(proxy), redactProxyUserinfo(proxy), lane.id)
-			if freeCap {
-				noteZenFreeCap(resp.Header)
-				noteExitOK(proxy, realModel)
-				if p.zenFreeFailover(w, r, failBody, realModel, isStream, start, reqID) {
-					return
-				}
-				resp, gaveUp = exhaustedExits(model, st), true
-			} else {
-				if proxy == "" {
-					laneEscalate(lane, realModel) // direct got limited: give the lane an exit
-				}
-				noteExit429(proxy, realModel)
+			if proxy == "" {
+				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
-			if !freeCap && zenLastRetry(zenRetries, attempts) {
+			noteExit429(proxy, realModel)
+			if proxy != "" && st == http.StatusTooManyRequests {
+				// a 429 is this exit's own cap for the window; a 529 is
+				// overload and may clear, so it is not written off here.
+				burned[proxy] = true
+			}
+			if freeCap && zenRetryAfterSecs(resp.Header) >= zenTierCapParkSecs {
+				noteExitTierCap(proxy) // out for the day: stop drawing this ip
+			}
+			if zenLastRetry(zenRetries, attempts) {
 				// the ladder is spent on a written-off pool: refill and buy
 				// more hops instead of handing the caller a 503, as long as
 				// the marks (not a merely busy model) are what bounded it.
-				// a free-tier cap is upstream-wide, not a written-off pool:
-				// a forced refill would only wait out the recovery budget.
 				if ladderExtend(r.Context(), &poolRecoverUntil) {
 					attempts++
 					lane = laneHandoff(lane, laneFailover(lane))
@@ -4416,8 +4598,12 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				}
 				// the client hears about the proxy pool, never the 429 we
 				// just absorbed.
-				resp, gaveUp = exhaustedExits(model, st), true
-			} else if !freeCap {
+				resp, gaveUp = exhaustedExits(model, st, zenRetries+1), true
+			} else {
+				// this exit will not serve: switch to another exit with a
+				// fresh session and keep going. noteExit429 above already
+				// steered the picker away from this pair, so the next hop
+				// lands on a different ip instead of the same one again.
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
@@ -4447,7 +4633,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 					rotating = true
 					continue
 				}
-				resp, gaveUp = exhaustedExits(model, st), true
+				resp, gaveUp = exhaustedExits(model, st, zenRetries+1), true
 			} else {
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
@@ -4550,9 +4736,7 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		resetZenNetErrs()
 		if resp.StatusCode == http.StatusOK {
-			// a 200 proves the free budget is back, whatever the last
-			// retry-after said.
-			clearZenFreeCap()
+
 			p.noteZenSuccess(sessionID, usedProxy)
 			noteExitOK(usedProxy, realModel)
 			laneTouch(lane, usedProxy, realModel)
@@ -4564,6 +4748,16 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 		acclog.Printf("!! opencode zen unreachable model=%s (no usable exit)", model)
 		writeJSONError(w, http.StatusServiceUnavailable, proxyUnavailableMsg(model))
 		return
+	}
+
+	// a 429 can still leave the ladder (the lane race path returns a response
+	// as-is, and a spent attempt budget breaks out with whatever the last hop
+	// said). the client contract is that zen's rate limit is never forwarded,
+	// so absorb it here too instead of handing the caller the one status the
+	// whole pool exists to hide.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
+		resp.Body.Close()
+		resp = exhaustedExits(model, resp.StatusCode, 1)
 	}
 
 	if usedProxy != "" {
@@ -4800,20 +4994,113 @@ func stripCacheFields(v any) any {
 	return v
 }
 
-// ensureZenTools appends the ballast toolset the zen free tier demands. the
-// gate at opencode.ai/inference fingerprints the tools array (a minimum of six
-// exact opencode CLI definitions must be present verbatim); fabricated stubs
-// 403 FreeTierError. client tools ride along unrestricted, so the client's own
-// spelling stays authoritative and response translators map upstream tool
-// call names back via tnames.resolve.
-// bodies with no tools at all (plain chat clients, title gen, summaries)
-// still get the ballast or zen 403s FreeTierError, but a callable toolset
-// makes a summarizer emit calls opencode rejects ("tool call not allowed while
-// generating summary"). so they get the defs with tool_choice "none":
-// the gate passes and the model cannot call them.
+// ensureZenGate makes a body look like the v2 client: the <env> block in its
+// system prompt and the `read` tool in its tools array. the free-tier gate
+// answers 429 FreeUsageLimitError to a body missing either half, which is the
+// shape every client hit before this landed — see zenEnvPrompt.
+func ensureZenGate(m map[string]any) {
+	ensureZenEnv(m)
+	ensureZenTools(m)
+}
 
-// zenBallastDefs returns the embedded opencode toolset as a fresh slice; the
-// caller may mutate elements (schema sanitize), so storage is copied.
+// ensureZenEnv appends the CLI's <env> block to whichever system prompt the
+// body carries. every shape is covered: responses instructions, anthropic
+// top-level system, and the leading system message of a chat body. the caller's
+// own prompt is kept — the gate reads the block's presence, not its contents.
+func ensureZenEnv(m map[string]any) {
+	if ins, ok := m["instructions"].(string); ok {
+		m["instructions"] = zenEnvInto(ins)
+		return
+	}
+	if sys, ok := m["system"].(string); ok {
+		m["system"] = zenEnvInto(sys)
+		return
+	}
+	if blocks, ok := m["system"].([]any); ok {
+		m["system"] = zenEnvBlocks(blocks)
+		return
+	}
+	msgs, _ := m["messages"].([]any)
+	for _, raw := range msgs {
+		mm, ok := raw.(map[string]any)
+		if !ok || mm["role"] != "system" {
+			continue
+		}
+		switch c := mm["content"].(type) {
+		case string:
+			mm["content"] = zenEnvInto(c)
+		case []any:
+			mm["content"] = zenEnvBlocks(c)
+		}
+		return
+	}
+	m["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvPrompt()}}, msgs...)
+}
+
+// zenEnvOK reports whether a system text satisfies the gate: the first
+// <env>...</env> pair has to hold a Working directory line (measured 2026-10-26:
+// the other fields are not read, but a block without this one is refused, and
+// so is a valid block placed *after* an invalid one).
+func zenEnvOK(text string) bool {
+	i := strings.Index(text, "<env>")
+	if i < 0 {
+		return false
+	}
+	j := strings.Index(text[i:], "</env>")
+	return j >= 0 && strings.Contains(text[i:i+j], "Working directory")
+}
+
+// zenEnvInto leaves a system text the gate already accepts alone, repairs a
+// client <env> that lacks the working-directory line in place, and appends the
+// block when there is none. appending next to a partial block does not work:
+// the gate reads the first pair and stops there.
+func zenEnvInto(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return zenEnvPrompt()
+	}
+	if zenEnvOK(text) {
+		return text
+	}
+	if i := strings.Index(text, "<env>"); i >= 0 {
+		if j := strings.Index(text[i:], "</env>"); j >= 0 {
+			at := i + len("<env>")
+			return text[:at] + "\n" + zenEnvLine + text[at:]
+		}
+	}
+	return text + "\n\n" + zenEnvPrompt()
+}
+
+// zenEnvBlocks applies zenEnvInto to an anthropic-style system block list.
+func zenEnvBlocks(blocks []any) []any {
+	for _, b := range blocks {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, ok := bm["text"].(string)
+		if !ok || !strings.Contains(t, "<env>") {
+			continue
+		}
+		bm["text"] = zenEnvInto(t)
+		return blocks
+	}
+	return append(blocks, map[string]any{"type": "text", "text": zenEnvPrompt()})
+}
+
+// ensureZenTools appends the `read` declaration the zen free tier demands. the
+// gate at opencode.ai/inference fingerprints the tools array by name; a body
+// with no tool named `read` is answered 429 FreeUsageLimitError like any other
+// non-client request. client tools ride along unrestricted, so the client's own spelling
+// stays authoritative and response translators map upstream tool call names
+// back via tnames.resolve.
+// bodies with no tools at all (plain chat clients, title gen, summaries)
+// still get the ballast or the gate refuses them, but a callable toolset makes
+// a summarizer emit calls opencode rejects ("tool call not allowed while
+// generating summary"). so they get the def with tool_choice "none": the gate
+// passes and the model cannot call it.
+
+// zenBallastDefs returns the embedded ballast (the placeholder `read`) as a
+// fresh slice; the caller may mutate elements, so storage is copied.
 func zenBallastDefs() []any {
 	src := zenOpenCodeDefs()
 	out := make([]any, len(src))
@@ -5563,8 +5850,12 @@ func serverMainFlags(f cliFlags) {
 
 	pool := newPool(c.NvidiaKeys)
 	nousSyncKeys(c.NousKeys)
-	unoSyncKeys(c.UnoKeys)
-	orChatSyncKeys(c.OpenRouterKeys)
+	unoSyncKeys(c.UnoKeys, c.Uno.PaidKeys)
+	orChatSyncKeys(c.OpenRouterKeys, c.OpenRouter.PaidKeys)
+	orcaSyncKeys(c.OrcaKeys, c.Orca.PaidKeys)
+	// seed the keyed price catalogs off the request path, so the first
+	// /v1/models after a restart already quotes prices.
+	go unoPriceRows()
 	go watchConfig(pool, cpath)
 
 	port := c.Server.Port
@@ -5651,8 +5942,10 @@ func serverMainFlags(f cliFlags) {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      310 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// no write deadline: a streamed turn legitimately runs for minutes,
+		// and this is what was cutting long answers off mid-response.
+		WriteTimeout: 0,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
