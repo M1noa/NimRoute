@@ -1261,11 +1261,12 @@ func (m *dashModel) modelRows() (rows [][]string, hasHealth, hasTail bool) {
 }
 
 // freeBackend is a backend whose whole catalog costs nothing, so every row it
-// lists quotes a zero price instead of leaving the column blank. nvidia's key
-// row is not a model and is excluded by the caller.
+// lists quotes a zero price instead of leaving the column blank. freepi is not
+// here: it is ad-supported, not free, and its unknown price stays blank. nvidia's
+// key row is not a model and is excluded by the caller.
 func freeBackend(prov string) bool {
 	switch prov {
-	case "opencode", "antseed", "freepi", "nvidia":
+	case "opencode", "antseed", "nvidia":
 		return true
 	}
 	return false

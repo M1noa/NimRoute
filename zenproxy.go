@@ -162,6 +162,8 @@ type proxyEntry struct {
 	Reliability    float64  `json:"reliability"`
 	Quality        float64  `json:"quality"`
 	ResponseTimeMs int      `json:"response_time_ms"`
+	// ip_type is the list's own classification: isp, business, hosting.
+	IPType string `json:"ip_type"`
 }
 
 func schemeFor(protocols []string) string {
@@ -327,6 +329,12 @@ func refreshZenProxies(fresh bool) {
 	var fast []proxyEntry
 	for _, e := range list {
 		if e.Port == 0 || e.IP == "" {
+			continue
+		}
+		// datacenter exits are refused by the free tier on every model:
+		// measured 2026-11-03, 200 isp/business candidates served 2 and
+		// 120 hosting candidates served 0. they only spend verify slots.
+		if e.IPType == "hosting" {
 			continue
 		}
 		if schemeFor(e.Protocols) == "" {

@@ -27,17 +27,38 @@
 // repairs a client's own partial block in place.
 package main
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
-// zenEnvLine is the single line the gate reads out of the first <env> block.
-// the value after the colon is never checked, so nothing about this proxy's
-// cwd leaks into the caller's prompt.
-const zenEnvLine = "  Working directory:"
+// zenEnvLine is the field the gate reads out of the first <env> block. the
+// value has to be non-empty: an empty `Working directory:` is refused.
+const zenEnvLine = "  Working directory: /workspace"
 
-// zenEnvPrompt is the block appended when a body has none: just enough to
-// satisfy the gate. the real client sends a heading and five fields; none of
-// that is read, and a client that ships its own block keeps it untouched.
-func zenEnvPrompt() string { return "<env>\n" + zenEnvLine + "\n</env>" }
+// zenEnvPrompt is the block appended when a body has none. re-measured live
+// 2026-11-03 with the zero-cost invalid-role probe (gate pass = 400, refusal =
+// 429) across ~150 exits per variant:
+//
+//	heading + <env> + one real field          400 on 2 exits
+//	heading + all five fields (full client)   400 on 3 exits
+//	five fields, no heading                   400 on 1 exit
+//	<env> + real field, no heading            400 on 0 of 36
+//	<env> + empty Working directory (old)     400 on 0 of 77
+//
+// so the heading line and a non-empty value are both read now; the older "one
+// empty line is enough" reading is stale, and the empty-line block is refused
+// before quota on every exit — which parked nearly the whole pool as
+// "free-tier capped". this emits the real client's block, with a fixed cwd so
+// nothing about this machine leaks into the caller's prompt.
+func zenEnvPrompt() string {
+	return "Here is some useful information about the environment you are running in:\n" +
+		"<env>\n" + zenEnvLine + "\n" +
+		"  Workspace root folder: /workspace\n" +
+		"  Is directory a git repo: yes\n" +
+		"  Platform: linux\n" +
+		"  Today's date: " + time.Now().Format("Mon Jan 2 2006") + "\n</env>"
+}
 
 // zenOCDefsJSON is the tools-side half of the fingerprint: one tool named
 // `read`. the gate matches the name and stops, so the rest is a placeholder —

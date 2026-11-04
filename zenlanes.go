@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -331,6 +332,16 @@ type exitState struct {
 	models     map[string]time.Time // model -> refusing it until (403 free-tier)
 	lastOK     time.Time
 	strikes    []time.Time // >15s first-byte stalls in the last hour
+	// first-answer ledger: the first reply this process ever got from the
+	// exit and the retry-after it carried. a 429 there is the free tier
+	// refusing an ip this process never spent anything on. it does not say
+	// the exit was already used: every capped answer counts down to utc
+	// midnight (22079s at 17:51 utc, measured 2026-11-03), so the header is
+	// the daily deadline, never a measure of this exit's own window.
+	firstAt    time.Time
+	firstState int
+	retryAfter int
+	spentUntil time.Time
 }
 
 // exitMark429 is one exit+model pair's 429 bookkeeping: the streak and cycle
@@ -478,11 +489,77 @@ func exitModelBurned(proxy, model string) bool {
 }
 
 // exitUsableFor reports whether an exit may serve one model: not dead, not
-// cooling off the free-tier gate, not marked for that model, and not refusing
-// it this cycle. a mark for a different model never blocks this one.
+// cooling off the free-tier gate, not marked for that model, not refusing it
+// this cycle, and not geo-gated for that model's region. a mark for a
+// different model never blocks this one.
 func exitUsableFor(proxy, model string) bool {
 	return proxy != "" && !exitDead(proxy) && !exitGateCooling(proxy) &&
-		!exitRateLimitedModel(proxy, model) && !exitModelBurned(proxy, model)
+		!exitRateLimitedModel(proxy, model) && !exitModelBurned(proxy, model) &&
+		!zenRegionGated(proxy, model)
+}
+
+// zenRegionGates caches zen's 403 RegionError per model+country. some free ids
+// are geo-gated per region independently of quota, so an exit in a gated place
+// still serves every model the region is allowed — keyed by country rather than
+// by exit, one refusal spares a hop on every other exit in the same region
+// (measured 2026-11-03: 119 exits refused beam-free for one country while exits
+// elsewhere served it).
+var (
+	zenRegionMu    sync.Mutex
+	zenRegionGates = map[string]time.Time{}
+)
+
+func zenRegionKey(country, model string) string { return country + "\x00" + model }
+
+// noteZenRegionBlock records that model is geo-gated for this exit's country
+// until the next pool refresh, and returns the country it filed under.
+func noteZenRegionBlock(proxy, model string) string {
+	country := proxyCountry(proxy)
+	if model == "" || country == "" || country == "??" || country == "direct" {
+		return country
+	}
+	k := zenRegionKey(country, model)
+	zenRegionMu.Lock()
+	_, had := zenRegionGates[k]
+	zenRegionGates[k] = time.Now().Add(poolInterval())
+	zenRegionMu.Unlock()
+	if !had {
+		acclog.Printf("  zen region gate: %s not available in %s, other regions keep the model", model, country)
+	}
+	return country
+}
+
+// zenRegionGated reports whether model is known geo-gated for this exit's
+// country. an unknown country is never gated: ?? is missing data, not a
+// region, and treating it as one would write off the whole pool.
+func zenRegionGated(proxy, model string) bool {
+	if proxy == "" || model == "" {
+		return false
+	}
+	k := zenRegionKey(proxyCountry(proxy), model)
+	zenRegionMu.Lock()
+	defer zenRegionMu.Unlock()
+	until, ok := zenRegionGates[k]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(zenRegionGates, k)
+		return false
+	}
+	return true
+}
+
+// clearZenRegionGates forgets the geo-gate cache on a pool refresh and at utc
+// midnight: a gate is a region's current catalog, not a permanent verdict.
+func clearZenRegionGates() {
+	zenRegionMu.Lock()
+	n := len(zenRegionGates)
+	zenRegionGates = map[string]time.Time{}
+	zenRegionMu.Unlock()
+	if n > 0 {
+		acclog.Printf("  zen region gates: %d model/region pair(s) re-checked", n)
+	}
 }
 
 // exitGateCooling reports whether the exit IP is parked after hitting its
@@ -607,21 +684,74 @@ func noteExitGate(proxy string) {
 // answered nothing) and every hop spend itself on it: a request that should
 // fail fast sat 85s before the 503. parking drops it like a 403 gate park, so
 // the ladder still rotates but never draws it again until the burn expires.
-func noteExitTierCap(proxy string) {
+// the retry-after on that answer is not a window: it is the countdown to the
+// next utc midnight from every exit (22079s at 17:51 utc, measured 2026-11-03),
+// and the same exit answered 429, 429, 200 seconds apart, so it is a deadline
+// display, never a measurement of what this exit has left.
+// retry-after ledger counters, one per fresh exit answer.
+var (
+	zenFreshSeen   atomic.Int64
+	zenFreshSpent  atomic.Int64
+	zenFreshServed atomic.Int64
+)
+
+// noteExitFirst records the first answer an exit gave this process. a fresh
+// exit answered 429 before this process spent anything on it; the retry-after
+// riding that answer is the countdown to utc midnight, not a measure of the
+// exit's window, so the ledger reports the status and leaves the reason to the
+// sweep.
+func noteExitFirst(proxy string, status, retryAfter int) {
 	if proxy == "" {
 		return
 	}
-	park := deadTTL()
 	st := exitStateFor(proxy)
 	exitStateMu.Lock()
-	was := !st.gateUntil.IsZero() && time.Now().Before(st.gateUntil)
-	st.gateUntil = time.Now().Add(park)
-	st.reason = "free-tier 429 (usage cap)"
-	exitStateMu.Unlock()
-	if !was {
-		acclog.Printf("  zen exit %s parked for %v (free-tier 429 cap)", redactProxyUserinfo(proxy), park)
+	first := st.firstState == 0
+	if first {
+		st.firstState = status
+		st.retryAfter = retryAfter
 	}
-	dropProxy(proxy)
+	exitStateMu.Unlock()
+	if !first {
+		return
+	}
+	zenFreshSeen.Add(1)
+	switch status {
+	case http.StatusOK:
+		zenFreshServed.Add(1)
+		acclog.Printf("  zen ledger: %s first answer 200 (fresh, served)", redactProxyUserinfo(proxy))
+	case http.StatusTooManyRequests, 529:
+		zenFreshSpent.Add(1)
+		acclog.Printf("  zen ledger: %s first answer %d retry-after=%ds (refused before we spent anything)", redactProxyUserinfo(proxy), status, retryAfter)
+	}
+}
+
+// zenLedgerLine is the ledger aggregate for logs.
+func zenLedgerLine() string {
+	return fmt.Sprintf("fresh=%d served=%d refused-on-first=%d",
+		zenFreshSeen.Load(), zenFreshServed.Load(), zenFreshSpent.Load())
+}
+
+// noteExitTierCap records zen's free-tier 429 for one exit+model.
+//
+// it never parks the exit: the cap is per ip x model (measured 2026-11-03, one
+// exit answered it for glm and deepseek while serving nemotron and beam-free in
+// the same minute) and its retry-after counts down to utc midnight from every
+// exit (22079s at 17:51 utc), so it measures nothing about this ip. noteExit429
+// already marked the pair, the picker skips that pair, and every other model
+// keeps drawing the exit — parking here locked models out of an ip that still
+// had budget for them.
+func noteExitTierCap(proxy, model string, retryAfter int) {
+	if proxy == "" {
+		return
+	}
+	st := exitStateFor(proxy)
+	exitStateMu.Lock()
+	st.retryAfter = retryAfter
+	st.reason = fmt.Sprintf("free-tier 429 (usage cap, retry-after %ds) on %s", retryAfter, model)
+	exitStateMu.Unlock()
+	acclog.Printf("  zen exit %s capped on %s (retry-after %ds = seconds to utc midnight), pair mark only",
+		redactProxyUserinfo(proxy), model, retryAfter)
 }
 
 // noteExitModelBurned marks an exit refusing one model for the rest of the
@@ -978,6 +1108,7 @@ func clearExitRateLimits() {
 	if cleared > 0 {
 		acclog.Printf("  zen proxies: %d rate-limited exit(s) cleared on refresh", cleared)
 	}
+	clearZenRegionGates()
 }
 
 // untilNextUTCMidnight is the wait until zen's daily allowance resets. every
@@ -1010,6 +1141,7 @@ func clearDailyExitMarks() {
 	if n > 0 {
 		acclog.Printf("  zen proxies: daily marks cleared at utc midnight (%d exit(s))", n)
 	}
+	clearZenRegionGates()
 }
 
 // watchZenMidnight runs the midnight release: drop the daily marks and then
@@ -1725,6 +1857,15 @@ func laneRotate(l *zenLane, model string) string {
 	laneReproxy(l, model)
 	noteRateLimit()
 	return laneSession(l)
+}
+
+// laneNewSession re-mints a lane's session id without moving its pin: a
+// transient 429 wants a fresh session on the same exit, not a new exit.
+func laneNewSession(l *zenLane) string {
+	lanesMu.Lock()
+	defer lanesMu.Unlock()
+	l.session = zenSession()
+	return l.session
 }
 
 // noteRateLimit counts lanes rate-limited since the last pool refresh.

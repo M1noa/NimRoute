@@ -2643,6 +2643,10 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 		// burned = exits this request already drew a 429 from: rotation must
 		// not hand one back for a second send (guard below).
 		burned := map[string]bool{}
+		// sameExitRetried is the one free re-send on the same exit after a
+		// 429: the answer flaps (429, 429, then 200 seconds apart on one
+		// exit, measured 2026-11-03), so one refusal is not a verdict.
+		sameExitRetried := false
 		rotating := true
 		// attempts is the ladder bound: a hop that finds the pool written off
 		// buys extra hops once a refill clears the marks (ladderExtend).
@@ -2849,14 +2853,26 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				if proxy == "" {
 					laneEscalate(lane, zenModel) // direct got limited: give the lane an exit
 				}
+				// a 429 is a cached PoP answer as often as a real cap, so the
+				// first one re-sends once on this same exit with a fresh
+				// session instead of spending the exit and a rotation on it.
+				if proxy != "" && st == http.StatusTooManyRequests && !sameExitRetried && !zenLastRetry(zenRetries, attempts) {
+					sameExitRetried = true
+					sessionID = laneNewSession(lane)
+					acclog.Printf("  opencode 429 transient (retry %d/%d) model=%s proxy=%s %s, resending on the same exit with a fresh session",
+						zenRetries, zenRetryLabel(), clientModel, redactProxyUserinfo(proxy), tag)
+					zenBackoffCtx(r.Context(), zenRetries)
+					continue
+				}
 				noteExit429(proxy, zenModel)
 				if proxy != "" && st == http.StatusTooManyRequests {
 					// a 429 is this exit's own cap for the window; a 529
 					// is overload and may clear, so not written off here.
 					burned[proxy] = true
 				}
+				noteExitFirst(proxy, st, zenRetryAfterSecs(up.Header))
 				if freeCap && zenRetryAfterSecs(up.Header) >= zenTierCapParkSecs {
-					noteExitTierCap(proxy) // out for the day: stop drawing this ip
+					noteExitTierCap(proxy, zenModel, zenRetryAfterSecs(up.Header)) // pair only: the cap is per ip x model
 				}
 				if zenLastRetry(zenRetries, attempts) {
 					// the ladder is spent on a written-off pool: refill and buy
@@ -2933,7 +2949,9 @@ func (p *Pool) handleOpenCodeAnthropic(w http.ResponseWriter, r *http.Request, o
 				}
 				if zenGeoBlocked(eb) {
 					logZenBlocked("geo", zenRetries, up.StatusCode, clientModel, proxy, tag, eb)
-					dropProxy(proxy)
+					// region-scoped per model, not an ip ban: keep the exit for
+					// every model this region is allowed and pick another region.
+					noteZenRegionBlock(proxy, zenModel)
 					lane = laneHandoff(lane, laneFailover(lane))
 					sessionID = laneRotate(lane, zenModel)
 					rotating = true

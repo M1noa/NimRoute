@@ -835,6 +835,7 @@ func priceSnapshot() map[string]pricePair {
 // noteZenSuccess records the last working zen session/proxy for /status,
 // and pins it sticky so the next request skips the race probe.
 func (p *Pool) noteZenSuccess(session, proxy string) {
+	noteExitFirst(proxy, http.StatusOK, 0)
 	p.mu.Lock()
 	p.lastZenSession = session
 	p.lastZenProxy = proxy
@@ -4333,6 +4334,10 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 	// burned = exits this request already drew a 429 from: rotation must not
 	// hand one back for a second send (guard in the ladder below).
 	burned := map[string]bool{}
+	// sameExitRetried is the one free re-send on the same exit after a 429:
+	// the answer flaps (429, 429, then 200 seconds apart on one exit,
+	// measured 2026-11-03), so one refusal is not enough to write it off.
+	sameExitRetried := false
 	rotating := true
 	// attempts is the ladder bound: a hop that finds the pool written off buys
 	// extra hops once a refill clears the marks (ladderExtend), so it grows.
@@ -4576,6 +4581,17 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			if proxy == "" {
 				laneEscalate(lane, realModel) // direct got limited: give the lane an exit
 			}
+			// a 429 is a cached PoP answer as often as a real cap, so the first
+			// one re-sends once on this same exit with a fresh session instead
+			// of spending the exit and a rotation on it.
+			if proxy != "" && st == http.StatusTooManyRequests && !sameExitRetried && !zenLastRetry(zenRetries, attempts) {
+				sameExitRetried = true
+				sessionID = laneNewSession(lane)
+				acclog.Printf("  opencode 429 transient (retry %d/%d) model=%s proxy=%s, resending on the same exit with a fresh session",
+					zenRetries, zenRetryLabel(), model, redactProxyUserinfo(proxy))
+				zenBackoffCtx(r.Context(), zenRetries)
+				continue
+			}
 			noteExit429(proxy, realModel)
 			if proxy != "" && st == http.StatusTooManyRequests {
 				// a 429 is this exit's own cap for the window; a 529 is
@@ -4583,7 +4599,8 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 				burned[proxy] = true
 			}
 			if freeCap && zenRetryAfterSecs(resp.Header) >= zenTierCapParkSecs {
-				noteExitTierCap(proxy) // out for the day: stop drawing this ip
+				noteExitFirst(proxy, st, zenRetryAfterSecs(resp.Header))
+				noteExitTierCap(proxy, realModel, zenRetryAfterSecs(resp.Header)) // pair only: the cap is per ip x model
 			}
 			if zenLastRetry(zenRetries, attempts) {
 				// the ladder is spent on a written-off pool: refill and buy
@@ -4659,7 +4676,9 @@ func (p *Pool) handleOpenCode(w http.ResponseWriter, r *http.Request, body []byt
 			}
 			if zenGeoBlocked(eb) {
 				logZenBlocked("geo", zenRetries, resp.StatusCode, model, proxy, "", eb)
-				dropProxy(proxy)
+				// region-scoped per model, not an ip ban: keep the exit for
+				// every model this region is allowed and pick another region.
+				noteZenRegionBlock(proxy, realModel)
 				lane = laneHandoff(lane, laneFailover(lane))
 				sessionID = laneRotate(lane, realModel)
 				rotating = true
@@ -5037,17 +5056,35 @@ func ensureZenEnv(m map[string]any) {
 	m["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvPrompt()}}, msgs...)
 }
 
+// zenEnvHeading is the line the real client prints before its <env> block.
+// measured 2026-11-03 with the zero-cost invalid-role probe: a block with the
+// heading passed the gate, the same block without it was refused on every exit.
+const zenEnvHeading = "Here is some useful information about the environment you are running in:"
+
 // zenEnvOK reports whether a system text satisfies the gate: the first
-// <env>...</env> pair has to hold a Working directory line (measured 2026-10-26:
-// the other fields are not read, but a block without this one is refused, and
-// so is a valid block placed *after* an invalid one).
+// <env>...</env> pair has to hold a Working directory line *with a value*, and
+// the client's heading has to precede it (measured 2026-11-03: an empty value
+// and a missing heading are both refused, and a valid block placed after an
+// invalid one is never read).
 func zenEnvOK(text string) bool {
 	i := strings.Index(text, "<env>")
 	if i < 0 {
 		return false
 	}
 	j := strings.Index(text[i:], "</env>")
-	return j >= 0 && strings.Contains(text[i:i+j], "Working directory")
+	if j < 0 {
+		return false
+	}
+	block := text[i : i+j]
+	k := strings.Index(block, "Working directory:")
+	if k < 0 {
+		return false
+	}
+	value := block[k+len("Working directory:"):]
+	if nl := strings.IndexAny(value, "\r\n"); nl >= 0 {
+		value = value[:nl]
+	}
+	return strings.TrimSpace(value) != "" && strings.Contains(text[:i], zenEnvHeading)
 }
 
 // zenEnvInto leaves a system text the gate already accepts alone, repairs a
@@ -5063,8 +5100,25 @@ func zenEnvInto(text string) string {
 	}
 	if i := strings.Index(text, "<env>"); i >= 0 {
 		if j := strings.Index(text[i:], "</env>"); j >= 0 {
-			at := i + len("<env>")
-			return text[:at] + "\n" + zenEnvLine + text[at:]
+			open, close := i+len("<env>"), i+j
+			block := text[open:close]
+			// an empty Working directory line is refused exactly like a
+			// missing one, so it is rewritten rather than joined by a second
+			// block the gate would never read.
+			if k := strings.Index(block, "Working directory:"); k >= 0 {
+				end := k + len("Working directory:")
+				for end < len(block) && block[end] != '\n' && block[end] != '\r' {
+					end++
+				}
+				block = block[:k] + zenEnvLine + block[end:]
+			} else {
+				block = "\n" + zenEnvLine + block
+			}
+			out := text[:open] + block + text[close:]
+			if !strings.Contains(text[:i], zenEnvHeading) {
+				out = text[:i] + zenEnvHeading + "\n" + out[i:]
+			}
+			return out
 		}
 	}
 	return text + "\n\n" + zenEnvPrompt()

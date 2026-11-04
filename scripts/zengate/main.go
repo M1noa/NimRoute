@@ -609,7 +609,12 @@ type entry struct {
 	Protocols []string `json:"protocols"`
 	HTTPS     bool     `json:"https"`
 	Country   string   `json:"country"`
+	IPType    string   `json:"ip_type"`
 }
+
+// filterTypes limits a sweep to some ip_type values (isp, business, hosting).
+// empty means the whole list, which is what every earlier run measured.
+var filterTypes map[string]bool
 
 func fetchList() ([]string, error) {
 	for _, u := range []string{poolList, poolFallback} {
@@ -630,6 +635,9 @@ func fetchList() ([]string, error) {
 		out := make([]string, 0, len(list))
 		for _, e := range list {
 			if !e.HTTPS {
+				continue
+			}
+			if len(filterTypes) > 0 && !filterTypes[e.IPType] {
 				continue
 			}
 			for _, p := range e.Protocols {
@@ -654,6 +662,7 @@ func main() {
 	flag.Var(&proxies, "proxy", "exit url to test (repeatable)")
 	sweep := flag.Bool("sweep", false, "dial the pool list and report which exits answer")
 	limit := flag.Int("n", 0, "sweep: stop after this many candidates (0 = all)")
+	types := flag.String("types", "", "sweep: only these ip_type values, comma separated (isp,business,hosting)")
 	workers := flag.Int("c", 100, "sweep: concurrent dials")
 	model := flag.String("model", "deepseek-v4.1-flash-free", "zen model id")
 	variant := flag.String("variant", "minimal", "body variant: "+strings.Join(variantNames(), ", "))
@@ -672,6 +681,12 @@ func main() {
 
 	useClientHeaders = *clientHdrs
 	endpointURL = *ep
+	if *types != "" {
+		filterTypes = map[string]bool{}
+		for _, t := range strings.Split(*types, ",") {
+			filterTypes[strings.TrimSpace(t)] = true
+		}
+	}
 	forceV6 = *v6
 	useRawHTTP = *rawHTTP
 	mk, ok := variants[*variant]
