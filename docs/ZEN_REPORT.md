@@ -48,11 +48,14 @@ served real completions from `122.52.157.170`, `203.205.49.2` and
 same minute. No wire-level check produces a serve/refuse split across exits
 with one hello.
 
-**Limitation, stated plainly:** a JA3/JA4 hash-for-hash comparison against the
-released binary was attempted and did not complete. A CONNECT-level tee
-recorded zero ClientHello records, so there is no hash table here to show. The
-A/B above and the same-hello serve/refuse spread already rule a wire-level
-discriminator out; a hash table would only restate it.
+**Stated plainly, the byte-level answer:** an earlier CONNECT-level tee attempt
+recorded zero ClientHello records and was reported here as a limitation; the
+11-04 passive capture replaced it and completed. nimroute's hello and the
+official Bun CLI's hello are **byte-identical** on a local MITM tee: same JA3
+and JA4 hashes, the same 13 extensions, same groups, same hybrid X25519MLKEM768
+key share, ALPN `http/1.1` only. The transport layer is therefore excluded as
+a discriminator by direct evidence — not only by the serve/refuse spread —
+which leaves the quota accounting in §2–§5 as the measured answer.
 
 ## 2. The 429 flaps
 
@@ -157,8 +160,11 @@ nine models in one hour found exactly **two** exits with budget, and an
 800-exit completion sweep found 2 serves against 325 refusals.
 
 The 11-04 reset run was launched (`/tmp/zenmidnight.log`) and never produced a
-result: the file holds only `waiting 6h36m36s for 00:00:05 utc ...` and no
+result: the file held only `waiting 6h36m36s for 00:00:05 utc ...` and no
 process survived to the deadline. That measurement is missing, not negative.
+The run has been re-armed (compiled binary under nohup, 03:3x UTC 11-04) for
+the 11-05 00:00:05 UTC reset into the same file — treat its survival as
+best-effort, since the host has killed it once already.
 
 ## 8. The one fact that resists a clean model
 
